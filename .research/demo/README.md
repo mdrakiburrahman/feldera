@@ -27,7 +27,7 @@ GIT_ROOT="$(git rev-parse --show-toplevel)"
 | `up`             | Start pipeline-manager with `--force-recreate --remove-orphans`. Waits for the healthcheck to pass before returning. |
 | `down`           | Stop and destroy all containers, volumes, and orphans with `--timeout 0` (immediate kill).                           |
 | `logs`           | Tail the last 200 lines of pipeline-manager logs and follow new output.                                              |
-| `medallion-up`   | Deploy `sql/medallion.sql` to Feldera, compile, and start the pipeline. Polls every 5s until running.               |
+| `medallion-up`   | Deploy `sql/medallion.sql` to Feldera, compile, start, and poll until all data is ingested (`pipeline_complete`).    |
 | `medallion-down` | Stop and delete the medallion pipeline from Feldera.                                                                 |
 
 ## Environment Variables

@@ -24,11 +24,10 @@ event_id BIGINT NOT NULL PRIMARY KEY,
         "transport": {
             "name": "delta_table_input",
             "config": {
-                "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_clickstream_events",
+                "uri": "abfss://public@rakirahman.dfs.core.windows.net/feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_clickstream_events",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "snapshot"
+                "azure_skip_signature": "true",
+                "transaction_mode": "snapshot"
             }
         }
     }]'
@@ -50,11 +49,10 @@ CREATE TABLE bronze_orders (
         "transport": {
             "name": "delta_table_input",
             "config": {
-                "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_orders",
+                "uri": "abfss://public@rakirahman.dfs.core.windows.net/feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_orders",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "snapshot"
+                "azure_skip_signature": "true",
+                "transaction_mode": "snapshot"
             }
         }
     }]'
@@ -72,11 +70,10 @@ order_item_id BIGINT NOT NULL PRIMARY KEY,
         "transport": {
             "name": "delta_table_input",
             "config": {
-                "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_order_items",
+                "uri": "abfss://public@rakirahman.dfs.core.windows.net/feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_order_items",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "snapshot"
+                "azure_skip_signature": "true",
+                "transaction_mode": "snapshot"
             }
         }
     }]'
@@ -97,11 +94,10 @@ product_id BIGINT NOT NULL PRIMARY KEY,
         "transport": {
             "name": "delta_table_input",
             "config": {
-                "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_products",
+                "uri": "abfss://public@rakirahman.dfs.core.windows.net/feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_products",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "snapshot"
+                "azure_skip_signature": "true",
+                "transaction_mode": "snapshot"
             }
         }
     }]'
@@ -119,11 +115,10 @@ inventory_event_id BIGINT NOT NULL PRIMARY KEY,
         "transport": {
             "name": "delta_table_input",
             "config": {
-                "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_inventory_events",
+                "uri": "abfss://public@rakirahman.dfs.core.windows.net/feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_inventory_events",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "snapshot"
+                "azure_skip_signature": "true",
+                "transaction_mode": "snapshot"
             }
         }
     }]'
@@ -141,11 +136,10 @@ CREATE TABLE bronze_customers (
         "transport": {
             "name": "delta_table_input",
             "config": {
-                "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_customers",
+                "uri": "abfss://public@rakirahman.dfs.core.windows.net/feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_customers",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "snapshot"
+                "azure_skip_signature": "true",
+                "transaction_mode": "snapshot"
             }
         }
     }]'
@@ -161,11 +155,10 @@ CREATE TABLE bronze_suppliers (
         "transport": {
             "name": "delta_table_input",
             "config": {
-                "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_suppliers",
+                "uri": "abfss://public@rakirahman.dfs.core.windows.net/feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_suppliers",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "snapshot"
+                "azure_skip_signature": "true",
+                "transaction_mode": "snapshot"
             }
         }
     }]'

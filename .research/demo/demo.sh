@@ -176,6 +176,42 @@ wait_for_stopped() {
     done
 }
 
+wait_for_pipeline_complete() {
+    echo "Waiting for pipeline to finish ingesting..."
+    local complete status input_rec processed_rec elapsed
+    local start_ts
+    start_ts=$(date +%s)
+    while true; do
+        local stats
+        stats=$(feldera_api GET "/pipelines/${PIPELINE_NAME}/stats" 2>/dev/null) || {
+            echo "  WARNING: stats endpoint unreachable — retrying in ${POLL_INTERVAL}s..."
+            sleep "${POLL_INTERVAL}"
+            continue
+        }
+
+        complete=$(echo "${stats}" | jq -r '.global_metrics.pipeline_complete // false')
+        status=$(echo "${stats}" | jq -r '.global_metrics.state // "Unknown"')
+        input_rec=$(echo "${stats}" | jq -r '.global_metrics.total_input_records // 0')
+        processed_rec=$(echo "${stats}" | jq -r '.global_metrics.total_processed_records // 0')
+        elapsed=$(( $(date +%s) - start_ts ))
+
+        if [[ "${status}" != "Running" ]]; then
+            echo "ERROR: Pipeline is no longer running (state: ${status})."
+            return 1
+        fi
+
+        if [[ "${complete}" == "true" ]]; then
+            printf "Pipeline complete — %s records ingested and processed (%ds elapsed).\n" \
+                "${processed_rec}" "${elapsed}"
+            return 0
+        fi
+
+        printf "  pipeline_complete: false — %s/%s records (%.0fs) — polling in %ss...\n" \
+            "${processed_rec}" "${input_rec}" "${elapsed}" "${POLL_INTERVAL}"
+        sleep "${POLL_INTERVAL}"
+    done
+}
+
 # ---------------------------------------------------------------------------
 # medallion-up: deploy and start the medallion pipeline
 # ---------------------------------------------------------------------------
@@ -213,6 +249,7 @@ cmd_medallion_up() {
 
     wait_for_running
     echo "Medallion pipeline is live at ${FELDERA_BASE}"
+    wait_for_pipeline_complete
 }
 
 # ---------------------------------------------------------------------------
