@@ -6,6 +6,7 @@ A lightweight wrapper for running the Feldera pipeline-manager in Docker.
 
 - Docker with Compose v2 (`docker compose` CLI plugin)
 - Git (for automatic repository-root detection)
+- `jq` (for `medallion-up` / `medallion-down` commands)
 
 ## Quick Start
 
@@ -15,20 +16,19 @@ GIT_ROOT="$(git rev-parse --show-toplevel)"
 # Start pipeline-manager
 "${GIT_ROOT}/.research/demo/demo.sh" up
 
-# Tail logs
-"${GIT_ROOT}/.research/demo/demo.sh" logs
-
-# Tear down everything (volumes, orphans, immediate kill)
-"${GIT_ROOT}/.research/demo/demo.sh" down
+# Deploy and start the medallion pipeline
+"${GIT_ROOT}/.research/demo/demo.sh" medallion-up
 ```
 
 ## Commands
 
-| Command | Description                                                                                                          |
-| ------- | -------------------------------------------------------------------------------------------------------------------- |
-| `up`    | Start pipeline-manager with `--force-recreate --remove-orphans`. Waits for the healthcheck to pass before returning. |
-| `down`  | Stop and destroy all containers, volumes, and orphans with `--timeout 0` (immediate kill).                           |
-| `logs`  | Tail the last 200 lines of pipeline-manager logs and follow new output.                                              |
+| Command          | Description                                                                                                          |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `up`             | Start pipeline-manager with `--force-recreate --remove-orphans`. Waits for the healthcheck to pass before returning. |
+| `down`           | Stop and destroy all containers, volumes, and orphans with `--timeout 0` (immediate kill).                           |
+| `logs`           | Tail the last 200 lines of pipeline-manager logs and follow new output.                                              |
+| `medallion-up`   | Deploy `sql/medallion.sql` to Feldera, compile, and start the pipeline. Polls every 5s until running.               |
+| `medallion-down` | Stop and delete the medallion pipeline from Feldera.                                                                 |
 
 ## Environment Variables
 
@@ -38,6 +38,10 @@ GIT_ROOT="$(git rev-parse --show-toplevel)"
 | `FELDERA_IMAGE` | `images.feldera.com/feldera/pipeline-manager:latest` | Pipeline-manager Docker image.                                    |
 | `FELDERA_PORT`  | `18080`                                              | Host port for the Feldera API.                                    |
 | `RUST_LOG`      | `info`                                               | Rust log level for the pipeline-manager process.                  |
+
+> **DooD note:** In Docker-outside-of-Docker devcontainers, the script
+> auto-detects whether the API is reachable at `localhost` or
+> `host.docker.internal` and uses whichever responds.
 
 ## Example: Custom Image and Port
 
