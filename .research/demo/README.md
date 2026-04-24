@@ -50,6 +50,12 @@ docker exec feldera-demo-pipeline-manager-1 ls /var/feldera/delta/
 docker exec feldera-demo-pipeline-manager-1 ls /var/feldera/delta/gold_order_status_summary/_delta_log/
 ```
 
+Logs:
+
+```bash
+docker logs -f feldera-demo-pipeline-manager-1
+```
+
 ## DuckDB UI
 
 A DuckDB container starts alongside the pipeline-manager and mounts the Delta Lake

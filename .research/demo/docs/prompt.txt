@@ -1,0 +1,572 @@
+I have a demo of Feldera here from Delta Lake to Delta Lake.
+
+```
+/workspaces/feldera/.research/demo
+```
+
+I need you to create a GUIDED deep-dive of what happens in the demo and tie it back to
+the relevant parts of the codebase.
+
+Don't commit the content. Put all research output in `/workspaces/feldera/.research/demo/docs/`.
+
+# ──────────────────────────────────────────────────────────────
+#  FORMATTING & STYLE RULES  (apply to every doc you produce)
+# ──────────────────────────────────────────────────────────────
+
+When you explain a concept, link:
+
+1. **Logs** from the live container (`docker logs feldera-demo-pipeline-manager-1`)
+2. **The demo** (which I'm familiar with — reference the medallion.sql, demo.sh, etc.)
+3. **A crisp diagram** (ASCII or Mermaid — keep it scannable)
+4. **Relevant lines of code** with file path + line number so the reader can jump in
+
+Specially, take the DBSP paper: https://sigmodrecord.org/publications/sigmodRecord/2403/pdfs/20_dbsp-budiu.pdf
+And overlay its concepts across every section below.
+
+# ──────────────────────────────────────────────────────────────
+#  DOCUMENT STRUCTURE
+# ──────────────────────────────────────────────────────────────
+#
+#  /workspaces/feldera/.research/demo/docs/
+#  ├─ 00-end-to-end.md          ← Top-level walkthrough (Sections 1–2)
+#  ├─ 01-zsets-and-dbsp.md      ← Section 3: Z-Set algebra + DBSP theory
+#  ├─ 02-incremental-joins.md   ← Section 4: How multi-way JOINs update
+#  ├─ 03-window-functions.md    ← Section 5: LAG, moving avg, cumulative
+#  ├─ 04-connectors.md          ← Section 6: Delta Lake connector internals
+#  ├─ 05-transactions.md        ← Section 7: Commits, steps, transaction boundary
+#  ├─ 06-state-and-storage.md   ← Section 8: Traces, spines, spill-to-disk, S3-FIFO
+#  ├─ 07-parallelism.md         ← Section 9: Workers, sharding, exchange
+#  ├─ 08-output-buffering.md    ← Section 10: Output buffers, pipeline_complete
+#  └─ 09-fault-tolerance.md     ← Section 11: Checkpointing, recovery
+#
+
+# ══════════════════════════════════════════════════════════════
+#  SECTION 1 — Pipeline Manager: From Binary Start to API Ready
+# ══════════════════════════════════════════════════════════════
+
+Walk through what happens when `demo.sh up` starts the container.
+
+Key code:
+  - Entrypoint binary:       crates/pipeline-manager/src/bin/pipeline-manager.rs
+  - Actix-web HTTP server:    crates/pipeline-manager/src/api/main.rs
+  - Healthcheck endpoint:     the `/healthz` route the docker-compose.yml pings
+
+Tie in:
+  - The Docker healthcheck (`curl --fail ... http://localhost:8080/healthz`)
+  - Show the container log lines from startup → "API is ready"
+  - Explain what services start: REST API, compiler service, local runner
+
+# ══════════════════════════════════════════════════════════════
+#  SECTION 2 — SQL Submission to Running Pipeline
+# ══════════════════════════════════════════════════════════════
+
+When `demo.sh medallion-up` runs, it PUTs the SQL program and starts the pipeline.
+Trace the entire flow:
+
+## 2.1  SQL + Rust Compilation
+
+  demo.sh calls:  PUT /v0/pipelines/medallion  with {program_code: <sql>}
+
+  Pipeline manager compilation flow:
+    - sql_compiler_task()             — crates/pipeline-manager/src/compiler/sql_compiler.rs:66
+    - perform_sql_compilation()       — crates/pipeline-manager/src/compiler/sql_compiler.rs:481
+    - perform_rust_compilation()      — crates/pipeline-manager/src/compiler/rust_compiler.rs:883
+
+  Java SQL compiler:
+    - DBSPCompiler.compileInput()     — sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/DBSPCompiler.java:838
+    - ToRustVisitor                   — sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/backend/rust/ToRustVisitor.java:144
+
+  Show:
+    - The compilation status transitions: Pending → CompilingSql → SqlCompiled → CompilingRust → Success
+    - What the generated Rust code actually looks like (find a snippet in the build artifacts or
+      show the structure: input handles → operators → output handles)
+    - Who runs the compiled binary (LocalRunner spawns it as a child process)
+
+## 2.2  What the Compiled Rust Code Does
+
+  The generated Rust crate links against the DBSP runtime. It defines:
+    - Input tables  → InputHandle<ZSet<...>>
+    - Views         → Operators wired into a Circuit
+    - Output views  → OutputHandle<ZSet<...>>
+
+  Show how the medallion SQL's bronze_orders table becomes an InputHandle,
+  and gold_order_status_summary becomes an OutputHandle with a Delta Lake writer.
+
+## 2.3  Transactions & Commit Boundary
+
+  (Covered in depth in Section 7 — reference it here briefly)
+
+  Key concepts:
+    - A **step** = one clock tick of the root circuit
+    - A **transaction** = a batch of input changes, committed when step() returns true
+    - After commit: all materialized views are consistent with the SQL semantics
+
+  Code:
+    - DBSPHandle::step()                — crates/dbsp/src/circuit/dbsp_handle.rs
+    - DBSPHandle::commit_transaction()  — same file
+    - Controller step loop              — crates/adapters/src/controller.rs
+
+## 2.4  Delta Lake Incremental Pull
+
+  (Covered in depth in Section 6 — reference it here briefly)
+
+  The medallion.sql tables use `delta_table_input` with `"mode": "snapshot"`.
+    - Unit of incremental read = **one Delta version** (an atomic transaction in the Delta log)
+    - Snapshot mode reads the full table as the initial state
+    - Follow mode polls the Delta log for new versions
+
+## 2.5  When Does a Commit Start and End?
+
+  (Covered in depth in Section 7)
+
+  Show the log lines that correspond to:
+    - Input data arriving (records pushed to InputHandle)
+    - Commit starting (start_commit_transaction)
+    - Circuit propagating (step returns false → step returns true)
+    - Output flushed to Delta Lake
+
+## 2.6  State Storage for Aggregations (gold_cancellation_impact)
+
+  (Covered in depth in Section 6/8)
+
+  For gold_cancellation_impact specifically:
+    - The GROUP BY in the inner query maintains a Trace (key=category×week, val=aggregates)
+    - The window functions maintain ordered Traces for PARTITION BY category ORDER BY week_start
+    - State is stored in-memory as Spine batches; spills to disk if memory pressure is high
+
+## 2.7  Incremental Aggregation & Flushing
+
+  (Covered in depth in Sections 3, 4, 8, 10)
+
+  When a new INSERT hits bronze_suppliers:
+    - The change propagates as a Z-set delta: {(supplier_row, +1)}
+    - JOINs use delta-join rules to avoid re-scanning existing data
+    - Aggregations update only affected groups
+    - Output buffers accumulate changes and flush on timer or commit
+
+# ══════════════════════════════════════════════════════════════
+#  SECTION 3 — Z-Set Algebra & DBSP Theory  (sub-doc: 01-zsets-and-dbsp.md)
+# ══════════════════════════════════════════════════════════════
+
+This is THE theoretical centerpiece. Cover:
+
+## 3.1  What is a Z-Set?
+
+  A Z-set is a function from elements to integers (weights).
+    - Weight +1 = insertion, -1 = deletion
+    - Z-sets form a **commutative group**: they support addition and negation
+    - This group structure is what makes incrementality possible
+
+  DBSP Paper reference: §2 "Streams and Z-sets", Definition 2.1
+
+  Code:
+    - ZWeight type (i64):           crates/dbsp/src/algebra/zset.rs:39
+    - IndexedZSetReader trait:      crates/dbsp/src/algebra/zset.rs:129
+    - IndexedZSet trait:            crates/dbsp/src/algebra/zset.rs:145
+    - ZSetReader / ZSet traits:     same file, ~line 180-200
+
+  Concrete types:
+    - OrdIndexedZSet (in-memory, sorted)
+    - FileIndexedZSet (on-disk, sorted)
+    - FallbackIndexedZSet (auto-switches between memory and file)
+
+## 3.2  The Incrementalization Theorem
+
+  Core insight: For a query function Q and input change Δi:
+    Q(i + Δi) = Q(i) + ΔQ(Δi, state)
+
+  Because Z-sets are a group, we can compute ΔQ (the incremental version)
+  without re-reading the entire input i. We only need:
+    - The change Δi
+    - Previously stored state (Traces)
+
+  DBSP Paper reference: §3 "Incremental computation", Theorem 3.3
+
+## 3.3  Traces — The State Behind Incrementality
+
+  A Trace stores the history of changes to a collection over time.
+  Aggregation operators maintain Traces so they can compute incremental updates.
+
+  Code:
+    - Trace trait:                crates/dbsp/src/trace/mod.rs
+    - Spine implementation:       crates/dbsp/src/trace/spine_async.rs
+    - Batches (immutable chunks): crates/dbsp/src/trace/ord/mod.rs
+
+## 3.4  The Circuit Model
+
+  A DBSP circuit is a directed graph of operators connected by streams.
+    - Streams carry Z-sets
+    - Operators transform streams (map, filter, join, aggregate, ...)
+    - The Z1 operator provides 1-cycle delay (stores state between steps)
+    - Nested circuits handle iteration (e.g., recursive queries)
+
+  DBSP Paper reference: §4 "DBSP"
+
+  Code:
+    - Circuit builder:            crates/dbsp/src/circuit/circuit_builder.rs
+    - Z1 delay operator:          crates/dbsp/src/operator/z1.rs (find the Z1 or DelayedFeedback)
+    - Root circuit handle:        crates/dbsp/src/circuit/dbsp_handle.rs
+
+  Diagram: Show the medallion pipeline as a circuit graph — bronze tables as inputs,
+  silver views as intermediate operators, gold views as outputs, with Z1 delays
+  for the stateful operators (GROUP BY, window functions).
+
+# ══════════════════════════════════════════════════════════════
+#  SECTION 4 — Incremental Multi-Way JOINs  (sub-doc: 02-incremental-joins.md)
+# ══════════════════════════════════════════════════════════════
+
+The medallion SQL has multi-way joins, e.g. silver_order_items_enriched joins
+bronze_order_items × bronze_products × bronze_suppliers × bronze_orders × silver_customers.
+
+## 4.1  The Delta-Join Rule
+
+  When only Δ(order_items) arrives, the join doesn't re-scan all of products/suppliers/orders.
+  Instead:
+    Δ(A ⋈ B) = Δ(A) ⋈ B  ∪  A ⋈ Δ(B)
+
+  For N-way joins, this decomposes into N incremental terms.
+
+  DBSP Paper reference: §3.2 "Joins", and the bilinear operator incrementalization
+
+## 4.2  JoinTrace — The Implementation
+
+  Code:
+    - Join operator:              crates/dbsp/src/operator/dynamic/join.rs
+    - dyn_join_incremental:       same file, ~line 481
+    - dyn_join_generic:           same file, ~line 647
+    - JoinTrace struct:           same file, ~line 950
+
+  The JoinTrace operator stores one side's Trace and joins incoming deltas against it.
+  For a 2-way join A ⋈ B:
+    - Left side: new Δ(A) joined with stored Trace(B)
+    - Right side: new Δ(B) joined with stored Trace(A)
+    - Outputs are unioned (they're Z-sets, so union = addition)
+
+  Show: When a new bronze_supplier row arrives, how does it flow through
+  the 4-way join to produce new gold_supplier_performance rows?
+
+# ══════════════════════════════════════════════════════════════
+#  SECTION 5 — Window Functions  (sub-doc: 03-window-functions.md)
+# ══════════════════════════════════════════════════════════════
+
+The medallion SQL uses:
+  - LAG(weekly_net_revenue, 1) OVER (PARTITION BY category ORDER BY week_start)
+  - AVG(...) OVER (... RANGE BETWEEN INTERVAL 3 WEEKS PRECEDING AND CURRENT ROW)
+  - SUM(...) OVER (... RANGE UNBOUNDED PRECEDING)
+
+## 5.1  How LAG Works Incrementally
+
+  Code:
+    - LAG operator:               crates/dbsp/src/operator/group/lag.rs
+    - dyn_lag():                  same file, ~line 88
+    - dyn_lag_custom_order():     same file, ~line 140
+
+  When a new week's data arrives, LAG needs to find the previous week's value.
+  It maintains a Trace indexed by (partition_key, order_key) to look up neighbors.
+
+## 5.2  Moving Averages & Cumulative Sums
+
+  Code:
+    - Window operator:            crates/dbsp/src/operator/time_series/window.rs
+    - window():                   same file, ~line 66
+
+  RANGE BETWEEN 3 WEEKS PRECEDING AND CURRENT ROW:
+    - Maintains a sorted Trace of values per partition
+    - On each delta, recalculates the window aggregate for affected partitions
+    - Emits (old_result, -1) + (new_result, +1) as a Z-set delta
+
+  RANGE UNBOUNDED PRECEDING (cumulative):
+    - Similar but the window never shrinks — only the new row contributes
+
+  Show: When gold_weekly_revenue_trend's inner GROUP BY emits a new (category, week) delta,
+  trace through how LAG and the 4-week moving average update.
+
+# ══════════════════════════════════════════════════════════════
+#  SECTION 6 — Delta Lake Connector  (sub-doc: 04-connectors.md)
+# ══════════════════════════════════════════════════════════════
+
+## 6.1  Architecture: Transport + Format Decoupling
+
+  Feldera separates transport (where data comes from) from format (how it's encoded).
+
+  Code:
+    - Transport traits:           crates/adapterlib/src/transport/mod.rs
+    - Format traits:              crates/adapterlib/src/format/mod.rs
+    - Controller wiring:          crates/adapters/src/controller.rs
+
+## 6.2  DeltaTableInputEndpoint
+
+  Code:
+    - Main endpoint:              crates/adapters/src/integrated/delta_table/input.rs:103
+    - Constructor:                same file, :110
+    - open() method:              same file, :131
+    - Inner reader:               same file, :564
+
+  How it works:
+    1. Opens Delta table (cloud or local) using delta-rs
+    2. In snapshot mode: reads the full table as Parquet files → Z-set of (+1) insertions
+    3. In follow mode: polls the Delta log for new versions
+       - Each version's AddFile/RemoveFile actions produce (+1)/(-1) Z-set entries
+    4. Parses Parquet → internal row format → pushes to InputHandle
+    5. Stores the last-read version number for fault-tolerance resume
+
+  Unit of incremental read: **one Delta version** (= one atomic commit to the Delta table)
+
+## 6.3  DeltaTableWriter (Output)
+
+  The gold views write to Delta Lake via `delta_table_output`.
+  Code:
+    - Output writer:              crates/adapters/src/integrated/delta_table/ (output.rs or writer)
+
+  Each commit:
+    - Accumulates Z-set changes in a buffer
+    - Writes a Parquet file with __feldera_op (i/d/u) and __feldera_ts columns
+    - Commits a new Delta version atomically
+
+  The demo docker-compose mounts a `delta-output` volume at `/var/feldera/delta/`
+  where these Delta tables land.
+
+# ══════════════════════════════════════════════════════════════
+#  SECTION 7 — Transactions & Commits  (sub-doc: 05-transactions.md)
+# ══════════════════════════════════════════════════════════════
+
+## 7.1  Step vs Transaction vs Checkpoint
+
+  - **Step** = one clock tick of the root circuit. All operators fire once.
+  - **Transaction** = a user-visible batch of input changes.
+    - May span multiple steps if the circuit is nested.
+    - Ends when step() returns true (all propagation done).
+  - **Checkpoint** = persisted snapshot of the entire circuit state.
+    - Optional; enables fault-tolerant restart.
+
+  Code:
+    - DBSPHandle::step():                crates/dbsp/src/circuit/dbsp_handle.rs
+    - commit_transaction():              same file
+    - start_commit_transaction():        same file
+    - CommitProgress tracking:           same file, early lines (~line 4+)
+
+## 7.2  The Transaction Lifecycle
+
+  ```
+  push() data to InputHandles
+     ↓
+  start_commit_transaction()
+     ↓
+  loop { step() } until returns true
+     ↓
+  Outputs are ready — views are consistent
+     ↓
+  [optional] checkpoint() → persist state
+  ```
+
+  Code:
+    - Controller step loop:              crates/adapters/src/controller.rs
+    - CheckpointCommitter:               crates/dbsp/src/circuit/dbsp_handle.rs:1618
+    - CheckpointBuilder:                 same file, :1545
+
+## 7.3  What "Consistent" Means
+
+  After a transaction completes, every materialized view reflects the exact result
+  you'd get by running the SQL queries on the full input in a batch system.
+
+  This is Feldera's key guarantee: incremental computation produces identical results
+  to batch recomputation. The DBSP paper proves this (§3, Theorem 3.3).
+
+# ══════════════════════════════════════════════════════════════
+#  SECTION 8 — State & Storage  (sub-doc: 06-state-and-storage.md)
+# ══════════════════════════════════════════════════════════════
+
+## 8.1  Traces and Spines
+
+  Stateful operators (GROUP BY, JOIN, DISTINCT, window functions) maintain Traces.
+  A Trace is implemented as a **Spine** — a tiered merge structure:
+
+    - Level-0: newest batch (small, in-memory)
+    - Level-1: merged level-0 batches (medium)
+    - Level-N: progressively larger merged batches
+    - Background merge tasks compact levels asynchronously
+
+  Code:
+    - Spine implementation:       crates/dbsp/src/trace/spine_async.rs
+    - Batch types:                crates/dbsp/src/trace/ord/mod.rs
+
+## 8.2  Spill-to-Disk
+
+  When memory pressure is high, batches are written to files instead of kept in memory.
+
+  Storage backends:
+    - LocalFS:                    crates/storage/src/backend/local_fs.rs
+    - S3:                         crates/storage/src/ (look for s3 or object_store)
+    - Azure Blob, GCP:            same directory
+
+  File-backed batch types:
+    - FileWSet, FileIndexedZSet:  crates/dbsp/src/trace/ord/file/ (or similar)
+    - FallbackWSet:               auto-switches between memory and file
+
+## 8.3  Buffer Cache (S3-FIFO)
+
+  A novel cache eviction algorithm from SOSP'23. Feldera uses it to manage
+  in-memory pages of on-disk batches.
+
+  Code:
+    - S3FifoCache struct:         crates/buffer-cache/src/s3_fifo.rs:29
+    - insert/get/remove:          same file, ~lines 111-121
+    - Default 256 shards for concurrency
+
+  How it works:
+    - 3 queues: Small (admission filter), Main (frequency-based), Ghost (evicted metadata)
+    - New entries go to Small; promoted to Main if accessed again
+    - Ghost tracks recently evicted keys to prevent re-admission of one-hit wonders
+    - Better hit rate than LRU for database workloads (see SOSP'23 paper)
+
+## 8.4  State for gold_cancellation_impact
+
+  Concrete walkthrough:
+
+  1. Inner GROUP BY (category × week) → Trace stores {(category, week) → aggregate row}
+  2. Window SUM(UNBOUNDED PRECEDING) → Trace stores cumulative sums per partition
+  3. Window SUM(RANGE 3 WEEKS) → Trace stores sliding window state per partition
+  4. Division (cancellation rate) → stateless operator, no Trace needed
+
+  When an order is cancelled (UPDATE bronze_orders SET order_status='cancelled'):
+    - The GROUP BY emits a Z-set delta: {(old_agg, -1), (new_agg, +1)} for that week
+    - Window operators update cumulative and sliding sums for affected weeks
+    - All downstream rows emit their own deltas
+    - Total work proportional to # of affected groups, NOT total table size
+
+# ══════════════════════════════════════════════════════════════
+#  SECTION 9 — Worker Parallelism  (sub-doc: 07-parallelism.md)
+# ══════════════════════════════════════════════════════════════
+
+The demo sets `"workers": 4` in runtime_config.
+
+## 9.1  Sharding Strategy
+
+  Data is hash-partitioned across workers by key.
+    - Each worker owns a shard of each Z-set
+    - Stateless operators (map, filter) run independently per shard
+    - Stateful operators (join, aggregate) require data with the same key on the same worker
+
+  Code:
+    - shard():                    crates/dbsp/src/operator/communication/shard.rs:65
+    - Exchange operator:          crates/dbsp/src/operator/communication/exchange.rs:1536
+    - ExchangeSender:             same file, :1173
+    - ExchangeReceiver:           same file, :1324
+
+## 9.2  Exchange (Shuffle) Operations
+
+  When a GROUP BY key doesn't match the current partition key, an Exchange reshuffles:
+    - Each worker sends records to the worker that owns the target key
+    - Uses hash(key) % num_workers for routing
+    - Implemented with crossbeam channels (lock-free, bounded)
+
+## 9.3  Commit Coordination
+
+  All workers must complete each step before the next step begins.
+  Barrier synchronization between steps ensures consistency.
+
+  Code:
+    - Scheduler trait:            crates/dbsp/src/circuit/schedule.rs:227
+    - DynamicScheduler:           same file (pub use near line 21)
+    - Executor:                   same file, :353
+
+# ══════════════════════════════════════════════════════════════
+#  SECTION 10 — Output Buffering & pipeline_complete
+#  (sub-doc: 08-output-buffering.md)
+# ══════════════════════════════════════════════════════════════
+
+The medallion.sql gold views configure:
+  "enable_output_buffer": true
+  "max_output_buffer_time_millis": 10000
+
+## 10.1  How Buffering Works
+
+  Instead of flushing every Z-set delta to the output transport immediately,
+  the output buffer accumulates changes and flushes:
+    - When the buffer time limit expires (10s in the demo)
+    - When a commit completes
+    - When the buffer is full
+
+  Code:
+    - Output buffer config:       crates/adapters/src/controller.rs (search for enable_output_buffer)
+
+## 10.2  The pipeline_complete Signal
+
+  demo.sh polls `GET /v0/pipelines/medallion/stats` and checks
+  `global_metrics.pipeline_complete`.
+
+  This becomes true when:
+    - All input endpoints have reported they've read everything (no more data)
+    - All buffered data has been processed through the circuit
+    - All output buffers have been flushed
+
+  Code:
+    - pipeline_complete():        crates/adapters/src/controller.rs:1290
+
+  For snapshot-mode Delta tables: "read everything" means the full snapshot has been read.
+  For follow-mode: pipeline_complete stays false (always listening for new versions).
+
+# ══════════════════════════════════════════════════════════════
+#  SECTION 11 — Fault Tolerance & Checkpointing
+#  (sub-doc: 09-fault-tolerance.md)
+# ══════════════════════════════════════════════════════════════
+
+## 11.1  What Gets Checkpointed
+
+  A checkpoint captures:
+    - All Trace state (the accumulated history in every stateful operator)
+    - Input resume metadata (e.g., Delta table version number, Kafka offsets)
+    - Output statistics (for deduplication on replay)
+    - Step number (transaction boundary marker)
+
+  Code:
+    - Checkpointer struct:        crates/dbsp/src/circuit/checkpointer.rs:34
+    - CheckpointBuilder:          crates/dbsp/src/circuit/dbsp_handle.rs:1545
+    - CheckpointCommitter:        same file, :1618
+
+## 11.2  Recovery Flow
+
+  On restart after a crash:
+    1. Load latest checkpoint
+    2. Restore Trace state into all stateful operators
+    3. Resume input endpoints from stored metadata (e.g., Delta version N)
+    4. Output endpoints skip already-committed data using step numbers
+    5. Processing continues from exactly where it left off — no duplicates, no gaps
+
+## 11.3  Limitations
+
+  Fault tolerance is a preview feature. It requires:
+    - Input connectors that support replay (Delta Lake, Kafka — yes; HTTP push — no)
+    - Output connectors that support idempotent writes or deduplication
+    - Checkpoint storage (local disk or cloud backend)
+
+# ══════════════════════════════════════════════════════════════
+#  CROSS-CUTTING: DBSP PAPER MAPPING
+# ══════════════════════════════════════════════════════════════
+
+Map these DBSP paper sections to the corresponding code & demo behavior:
+
+  Paper §2  "Streams and Z-sets"     → Section 3 (Z-Set algebra)
+  Paper §3  "Incremental computation"→ Sections 3.2, 4 (incrementalization theorem, joins)
+  Paper §3.2 "Bilinear operators"    → Section 4 (delta-join rule)
+  Paper §4  "DBSP"                   → Section 3.4 (circuit model)
+  Paper §5  "Extensions"             → Sections 5, 7 (windows, nested circuits)
+  Paper §6  "Implementation"         → Section 8 (traces, spines, storage)
+
+For each paper section, show:
+  1. The formal definition from the paper
+  2. The concrete Rust type/operator that implements it
+  3. A log line or demo behavior that demonstrates it running
+
+# ══════════════════════════════════════════════════════════════
+#  TIPS FOR THE RESEARCH SESSION
+# ══════════════════════════════════════════════════════════════
+
+- The demo should be running: `docker logs feldera-demo-pipeline-manager-1`
+- If it's not running, start it: `.research/demo/demo.sh up && .research/demo/demo.sh medallion-up`
+- To trigger incremental updates after initial load:
+    INSERT INTO bronze_suppliers VALUES (7, 'Blake and Sons', 'DE', 10000, now())
+  Then observe how gold views change.
+- The medallion.sql has 7 bronze tables, ~6 silver views, 6 gold materialized views.
+  The gold views use JOINs, GROUP BY, window functions (LAG, AVG OVER, SUM OVER).
+- The pipeline runs with 4 workers (`runtime_config: {workers: 4}`).
