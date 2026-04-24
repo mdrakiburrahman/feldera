@@ -30,6 +30,26 @@ GIT_ROOT="$(git rev-parse --show-toplevel)"
 | `medallion-up`   | Deploy `sql/medallion.sql` to Feldera, compile, start, and poll until all data is ingested (`pipeline_complete`).    |
 | `medallion-down` | Stop and delete the medallion pipeline from Feldera.                                                                 |
 
+## Delta Lake Output
+
+The six gold-layer materialized views write Delta Lake tables to `/var/feldera/delta/`
+inside the pipeline-manager container. The data is stored on a named Docker volume
+(`feldera-demo_delta-output`).
+
+Each table includes two metadata columns added by Feldera:
+- `__feldera_op` — Operation type: `i` (insert), `d` (delete), `u` (update)
+- `__feldera_ts` — Logical timestamp for ordering updates
+
+**Inspect from the host:**
+
+```bash
+# List Delta tables
+docker exec feldera-demo-pipeline-manager-1 ls /var/feldera/delta/
+
+# Check a specific table's Delta log
+docker exec feldera-demo-pipeline-manager-1 ls /var/feldera/delta/gold_order_status_summary/_delta_log/
+```
+
 ## Environment Variables
 
 | Variable        | Default                                              | Description                                                       |

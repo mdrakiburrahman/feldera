@@ -352,7 +352,21 @@ GROUP BY supplier_name;
 -- gold_supplier_performance
 -- Supplier-level metrics combining order revenue/margin with inventory.
 -- ----------------------------------------------------------------------------
-CREATE MATERIALIZED VIEW gold_supplier_performance AS with orders_by_supplier as (
+CREATE MATERIALIZED VIEW gold_supplier_performance
+WITH (
+    'connectors' = '[{
+        "transport": {
+            "name": "delta_table_output",
+            "config": {
+                "uri": "file:///var/feldera/delta/gold_supplier_performance",
+                "mode": "truncate"
+            }
+        },
+        "enable_output_buffer": true,
+        "max_output_buffer_time_millis": 10000
+    }]'
+)
+AS with orders_by_supplier as (
     select oi.supplier_name,
         oi.supplier_country,
         oi.lead_time_days,
@@ -398,7 +412,21 @@ FROM orders_by_supplier oi
 -- Stock risk scoring: compares days of stock remaining against supplier
 -- lead time to flag CRITICAL / WARNING / OK products.
 -- ----------------------------------------------------------------------------
-CREATE MATERIALIZED VIEW gold_inventory_risk AS
+CREATE MATERIALIZED VIEW gold_inventory_risk
+WITH (
+    'connectors' = '[{
+        "transport": {
+            "name": "delta_table_output",
+            "config": {
+                "uri": "file:///var/feldera/delta/gold_inventory_risk",
+                "mode": "truncate"
+            }
+        },
+        "enable_output_buffer": true,
+        "max_output_buffer_time_millis": 10000
+    }]'
+)
+AS
 SELECT inv.product_id,
     inv.product_name,
     inv.category,
@@ -455,7 +483,21 @@ FROM (
 -- Status distribution across all orders. Changes visibly with every MERGE
 -- commit that transitions order statuses (the core incremental demo).
 -- ----------------------------------------------------------------------------
-CREATE MATERIALIZED VIEW gold_order_status_summary AS
+CREATE MATERIALIZED VIEW gold_order_status_summary
+WITH (
+    'connectors' = '[{
+        "transport": {
+            "name": "delta_table_output",
+            "config": {
+                "uri": "file:///var/feldera/delta/gold_order_status_summary",
+                "mode": "truncate"
+            }
+        },
+        "enable_output_buffer": true,
+        "max_output_buffer_time_millis": 10000
+    }]'
+)
+AS
 SELECT o.order_status,
     COUNT(DISTINCT o.order_id) AS order_count,
     COALESCE(SUM(o.order_total), 0) AS total_revenue,
@@ -469,7 +511,21 @@ GROUP BY o.order_status;
 -- moving average, and cumulative YTD. When orders are cancelled via MERGE,
 -- historical weeks' revenue decreases and all window computations cascade.
 -- ----------------------------------------------------------------------------
-CREATE MATERIALIZED VIEW gold_weekly_revenue_trend AS
+CREATE MATERIALIZED VIEW gold_weekly_revenue_trend
+WITH (
+    'connectors' = '[{
+        "transport": {
+            "name": "delta_table_output",
+            "config": {
+                "uri": "file:///var/feldera/delta/gold_weekly_revenue_trend",
+                "mode": "truncate"
+            }
+        },
+        "enable_output_buffer": true,
+        "max_output_buffer_time_millis": 10000
+    }]'
+)
+AS
 SELECT week_start,
     category,
     weekly_net_revenue,
@@ -526,7 +582,21 @@ FROM (
 -- Cancellation rates with cumulative and 4-week moving windows. Each MERGE
 -- that moves orders to cancelled shifts the running totals incrementally.
 -- ----------------------------------------------------------------------------
-CREATE MATERIALIZED VIEW gold_cancellation_impact AS
+CREATE MATERIALIZED VIEW gold_cancellation_impact
+WITH (
+    'connectors' = '[{
+        "transport": {
+            "name": "delta_table_output",
+            "config": {
+                "uri": "file:///var/feldera/delta/gold_cancellation_impact",
+                "mode": "truncate"
+            }
+        },
+        "enable_output_buffer": true,
+        "max_output_buffer_time_millis": 10000
+    }]'
+)
+AS
 SELECT category,
     week_start,
     weekly_cancelled_orders,
@@ -593,7 +663,21 @@ FROM (
 -- Filtered view of CRITICAL inventory items. Products enter and leave this
 -- view as stock is reserved (sale_reserve) or restored (cancellation_restock).
 -- ----------------------------------------------------------------------------
-CREATE MATERIALIZED VIEW gold_realtime_inventory_alerts AS
+CREATE MATERIALIZED VIEW gold_realtime_inventory_alerts
+WITH (
+    'connectors' = '[{
+        "transport": {
+            "name": "delta_table_output",
+            "config": {
+                "uri": "file:///var/feldera/delta/gold_realtime_inventory_alerts",
+                "mode": "truncate"
+            }
+        },
+        "enable_output_buffer": true,
+        "max_output_buffer_time_millis": 10000
+    }]'
+)
+AS
 SELECT *
 FROM gold_inventory_risk
 WHERE stock_risk_level = 'CRITICAL';

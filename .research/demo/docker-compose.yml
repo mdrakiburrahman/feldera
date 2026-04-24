@@ -1,7 +1,16 @@
 name: feldera-demo
 services:
+  init-delta-perms:
+    image: "${FELDERA_IMAGE:-images.feldera.com/feldera/pipeline-manager:latest}"
+    user: "0:0"
+    entrypoint: ["sh", "-c", "chown -R 1000:1000 /var/feldera/delta"]
+    volumes:
+      - delta-output:/var/feldera/delta
   pipeline-manager:
     image: "${FELDERA_IMAGE:-images.feldera.com/feldera/pipeline-manager:latest}"
+    depends_on:
+      init-delta-perms:
+        condition: service_completed_successfully
     ports:
       - "${FELDERA_PORT:-18080}:8080"
     tty: true
@@ -9,9 +18,13 @@ services:
     environment:
       - RUST_LOG=${RUST_LOG:-info}
       - RUST_BACKTRACE=1
+    volumes:
+      - delta-output:/var/feldera/delta
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent --request GET --url http://localhost:8080/healthz"]
       interval: 10s
       timeout: 5s
       retries: 30
       start_period: 30s
+volumes:
+  delta-output:
