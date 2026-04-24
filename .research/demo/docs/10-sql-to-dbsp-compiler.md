@@ -822,7 +822,96 @@ The `sql_compiler_task()` (line 66[^45]) runs a periodic loop:
 
 ---
 
-## 10.14 Summary — The Full Pipeline for the Demo
+## 10.14 Primary Key and Foreign Key Handling
+
+### Primary Keys — Parsing and Validation
+
+Primary keys are declared via standard SQL syntax and parsed by `SqlPrimaryKey`
+(`parser/SqlPrimaryKey.java:20-61`[^46]). During table compilation, `SqlToRelCompiler`
+(lines 1161-1297[^47]) enforces several compile-time constraints:
+
+| Constraint | What Happens | Source |
+|---|---|---|
+| PK columns must be **NOT NULL** | Compile error if nullable | `SqlToRelCompiler.java:1258-1268` |
+| PK columns must be scalar types | `ARRAY`, `MAP`, `ROW`, `MULTISET`, `VARIANT` rejected | `SqlToRelCompiler.java:1258-1268` |
+| No duplicate PK declarations | Error if table has two `PRIMARY KEY` clauses | `SqlToRelCompiler.java:1164-1196` |
+| No duplicate PK column names | Error if same column listed twice in PK | `SqlToRelCompiler.java:1164-1196` |
+| PK column must exist | Error if named column doesn't exist in table | `SqlToRelCompiler.java:1161-1297` |
+
+### How PKs Affect the DBSP Circuit
+
+Tables **with** a primary key use `DBSPSourceMapOperator` — an **indexed** input that
+represents data as an `IndexedZSet<Key, Value>` where the key is the PK tuple
+(`circuit/operator/DBSPSourceMapOperator.java:24-49`[^48]).
+
+Tables **without** a primary key use `DBSPSourceMultisetOperator` — an unkeyed input that
+represents data as a `ZSet<Row>`.
+
+This distinction matters for:
+- **Joins**: keyed tables can skip the `MapIndex` operator (the key is already extracted)
+- **Upsert semantics**: keyed tables support `DBSPUpsertFeedbackOperator`
+  (`circuit/operator/DBSPUpsertFeedbackOperator.java`[^49]) for insert-or-update behavior
+- **Connectors**: output connectors use PK info for keyed serialization
+
+### Does Feldera Enforce PK Uniqueness at Runtime?
+
+**No.** Feldera does **not** enforce uniqueness as a database constraint. It is the user's
+responsibility to ensure that input data respects the declared primary key. The PK declaration
+is used for:
+
+1. **Circuit optimization** — choosing `SourceMapOperator` vs `SourceMultisetOperator`
+2. **Connector behavior** — output connectors use PKs for keyed output formats
+3. **Monotonicity analysis** — `KeyPropagation` tracks PK/FK usage through joins
+
+If duplicate keys are inserted, the behavior is **upsert-like**: the latest value for a given
+key replaces the previous one in the indexed Z-set. This is not enforced by a constraint
+check — it's a consequence of the data structure semantics.
+
+### PK Impact on Connectors
+
+| Connector | Effect of PK |
+|---|---|
+| **Postgres output** | Upsert with `ON CONFLICT DO UPDATE`; optional `on_conflict_do_nothing` (`transport/postgres.rs:144-158`[^50]) |
+| **Avro output** | PK triggers keyed output with separate key schema (`format/avro/output.rs:406-489`[^51]) |
+| **Delta Lake output** | Requires unique key for parallel writes; errors on non-unique keys (`integrated/delta_table/output.rs:437-450`[^52]) |
+| **JSON output** | `key_fields` config-driven; PK is advisory (`format/json/output.rs:132-157`[^53]) |
+
+### PK in the Demo
+
+All seven bronze tables in `medallion.sql` declare primary keys:
+
+| Table | Primary Key Column |
+|---|---|
+| `bronze_events` | `event_id` |
+| `bronze_orders` | `order_id` |
+| `bronze_order_items` | `order_item_id` |
+| `bronze_products` | `product_id` |
+| `bronze_customers` | `customer_id` |
+| `bronze_inventory` | `inventory_id` |
+| `bronze_shipping` | `shipping_id` |
+
+These are used as `SourceMapOperator` inputs, meaning the Delta Lake connector delivers data
+as keyed `IndexedZSet`s with upsert semantics.
+
+### Foreign Keys — Compile-Time Only
+
+Foreign keys are parsed by `SqlForeignKey` (`parser/SqlForeignKey.java:19-79`[^54]) and
+validated by `DBSPCompiler` (lines 361-445[^55]):
+
+| Validation | Rule |
+|---|---|
+| Referenced table must exist | Compile error otherwise |
+| Column count must match | FK and referenced PK must have same number of columns |
+| Referenced columns must be PK | FK must reference the primary key of the other table |
+| Types must match | FK column types must be compatible with referenced PK types |
+
+**Foreign keys are NOT enforced at runtime.** They are advisory and used by the optimizer for:
+- `KeyPropagation` in monotonicity analysis
+- Potential future join optimizations (star-join detection)
+
+---
+
+## 10.15 Summary — The Full Pipeline for the Demo
 
 ```
 medallion.sql (683 lines)
@@ -927,3 +1016,13 @@ medallion.sql (683 lines)
 [^43]: `sql-to-dbsp-compiler/calcite_version.env:1-8`
 [^44]: `sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/CompilerOptions.java:41-334`
 [^45]: `crates/pipeline-manager/src/compiler/sql_compiler.rs:66`
+[^46]: `sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/frontend/parser/SqlPrimaryKey.java:20-61`
+[^47]: `sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/frontend/calciteCompiler/SqlToRelCompiler.java:1161-1297`
+[^48]: `sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/circuit/operator/DBSPSourceMapOperator.java:24-49`
+[^49]: `sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/circuit/operator/DBSPUpsertFeedbackOperator.java`
+[^50]: `crates/feldera-types/src/transport/postgres.rs:144-158`
+[^51]: `crates/adapters/src/format/avro/output.rs:406-489`
+[^52]: `crates/adapters/src/integrated/delta_table/output.rs:437-450`
+[^53]: `crates/adapters/src/format/json/output.rs:132-157`
+[^54]: `sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/frontend/parser/SqlForeignKey.java:19-79`
+[^55]: `sql-to-dbsp-compiler/SQL-compiler/src/main/java/org/dbsp/sqlCompiler/compiler/DBSPCompiler.java:361-445`
