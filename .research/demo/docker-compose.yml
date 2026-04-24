@@ -26,5 +26,23 @@ services:
       timeout: 5s
       retries: 30
       start_period: 30s
+  duckdb:
+    build:
+      context: .
+      dockerfile: Dockerfile.duckdb
+    depends_on:
+      pipeline-manager:
+        condition: service_healthy
+    ports:
+      - "${DUCKDB_PORT:-4213}:14213"
+    stdin_open: true
+    stop_grace_period: 0s
+    command: >
+      /bin/sh -ec '
+        socat TCP-LISTEN:14213,fork,reuseaddr TCP6:[::1]:4213 &
+        exec duckdb -interactive -cmd "INSTALL delta; LOAD delta;" -ui
+      '
+    volumes:
+      - delta-output:/delta:ro
 volumes:
   delta-output:

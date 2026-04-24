@@ -50,6 +50,21 @@ docker exec feldera-demo-pipeline-manager-1 ls /var/feldera/delta/
 docker exec feldera-demo-pipeline-manager-1 ls /var/feldera/delta/gold_order_status_summary/_delta_log/
 ```
 
+## DuckDB UI
+
+A DuckDB container starts alongside the pipeline-manager and mounts the Delta Lake
+volume read-only at `/delta/`. It exposes a web UI for interactive SQL analysis.
+
+**Access the UI:** <http://localhost:4213> (or your custom `DUCKDB_PORT`).
+
+The Delta Lake extension is pre-installed on startup. Open the UI, then paste
+(or run block-by-block) the reference queries from
+[sql/duckdb-read-medallion.sql](sql/duckdb-read-medallion.sql).
+
+> **Note:** The DuckDB UI extension binds to `localhost` inside its container.
+> A `socat` forwarder bridges external access — this is why a custom
+> [Dockerfile.duckdb](Dockerfile.duckdb) is used instead of the stock image.
+
 ## Environment Variables
 
 | Variable        | Default                                              | Description                                                       |
@@ -57,6 +72,7 @@ docker exec feldera-demo-pipeline-manager-1 ls /var/feldera/delta/gold_order_sta
 | `GIT_ROOT`      | Auto-detected via `git rev-parse --show-toplevel`    | Repository root. Override only if running outside a git checkout. |
 | `FELDERA_IMAGE` | `images.feldera.com/feldera/pipeline-manager:latest` | Pipeline-manager Docker image.                                    |
 | `FELDERA_PORT`  | `18080`                                              | Host port for the Feldera API.                                    |
+| `DUCKDB_PORT`   | `4213`                                               | Host port for the DuckDB web UI.                                  |
 | `RUST_LOG`      | `info`                                               | Rust log level for the pipeline-manager process.                  |
 
 > **DooD note:** In Docker-outside-of-Docker devcontainers, the script
