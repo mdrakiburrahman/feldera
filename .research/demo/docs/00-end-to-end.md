@@ -515,11 +515,70 @@ Trace (Spine)
   └── Batch 3  (version 151, current)
 ```
 
-All state lives **in memory**. There is no disk-based state backend in the
-default configuration. This means:
+**Where state lives — memory, disk, or both:**
 
-- ✅ Extremely fast random access and updates.
-- ⚠️ Pipeline memory usage grows with the size of stateful operators.
+Feldera uses **`FallbackIndexedWSet`** (aliased as `OrdIndexedZSet`) for Spine
+batches.  Each batch is placed in memory *or* on-disk storage depending on its
+size and current memory pressure[^fallback]:
+
+```
+if batch.approximate_byte_size() >= min_insert_storage_bytes {
+    → write to storage (file-backed batch)
+} else {
+    → keep in memory
+}
+```
+
+When storage is configured (the `LocalRunner` creates a per-pipeline directory
+at `<working-directory>/pipeline-<id>/storage`[^lr-storage]), large batches
+spill to disk automatically.  Smaller, hot batches stay in memory and are
+served through the **S3-FIFO buffer cache** (see
+[06-state-and-storage.md](06-state-and-storage.md#83-buffer-cache-s3-fifo)).
+
+> [^fallback]: `crates/dbsp/src/trace/ord/fallback/utils.rs:111-126` —
+> `pick_insert_destination()`
+>
+> [^lr-storage]: `crates/pipeline-manager/src/runner/local_runner.rs:407-412` —
+> `generate_storage_config()`
+
+**What happens on crash — with and without fault tolerance:**
+
+| Scenario | Aggregation state after restart |
+|----------|-------------------------------|
+| **No fault tolerance** (the demo's default) | All Trace state is **lost**. The pipeline starts fresh: inputs are re-read from the beginning (Delta snapshot mode re-scans the full table), the circuit rebuilds all aggregation state from scratch. This is safe because the demo's inputs are idempotent snapshots, and the gold outputs use `"mode": "truncate"`, so stale output is overwritten. |
+| **Fault tolerance enabled** (`fault_tolerance.model` ≠ `None`) | The pipeline resumes from the **latest checkpoint**. Checkpoints persist all Trace state (Spine batches on the storage backend), input resume metadata (e.g., Delta table version number), and output statistics. On restart, Traces are restored into every stateful operator, inputs resume from their checkpointed position, and outputs skip already-committed data[^ft-resume]. No recomputation is needed — the pipeline continues from exactly where it left off. |
+
+The controller makes this decision at startup[^ctrl-init]:
+
+```
+if checkpoint exists on storage backend:
+    → ControllerInit::with_checkpoint(checkpoint_uuid)
+    → restore Traces, resume inputs, skip committed outputs
+else:
+    → ControllerInit::without_checkpoint()
+    → start fresh, re-read all inputs
+```
+
+Without storage configured, the controller logs[^no-storage]:
+```
+"storage not configured, so suspend-and-resume and fault tolerance will not be available"
+```
+
+> [^ft-resume]: `crates/adapters/src/controller.rs:4355-4372` —
+> `with_checkpoint_inner()` restores step, processed_records, input_metadata,
+> input/output_statistics from the checkpoint.
+>
+> [^ctrl-init]: `crates/adapters/src/controller.rs:4335-4352` —
+> `with_latest_checkpoint()`: tries to read a checkpoint; falls back to
+> `without_checkpoint()` if not found.
+>
+> [^no-storage]: `crates/adapters/src/controller.rs:261-263`
+
+**For this demo specifically**: fault tolerance is not configured (`runtime_config`
+only sets `workers: 4`). If the container crashes, `demo.sh medallion-up` simply
+re-creates the pipeline, re-reads all seven Bronze snapshots from Azure, and
+recomputes every Silver and Gold view from scratch. The Delta Lake snapshot inputs
+are fully deterministic, so the result is identical.
 
 ### 2.7 Incremental Aggregation & Flushing
 

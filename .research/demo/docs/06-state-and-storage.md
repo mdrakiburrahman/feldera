@@ -284,7 +284,173 @@ touched only once during a merge never reach the Main queue.
 
 ---
 
-## 6.5 Concrete State Walkthrough — `gold_cancellation_impact`
+## 6.5 Physical Storage Layout"
+
+Similar to Spark and RocksDB for aggregation state, Feldera has its own storage engine built from
+scratch, purpose-designed for the DBSP model. Here is how it maps to familiar
+concepts from Spark Structured Streaming:
+
+| Spark Structured Streaming | Feldera Equivalent |
+|---|---|
+| RocksDB state store | **Spine** — LSM-like tiered merge tree of sorted batches |
+| RocksDB SST files | **`.feldera` batch files** — sorted `(key, value, weight)` runs |
+| RocksDB checkpoint | **Checkpoint directory** — serialized `CommittedSpine` + batch file references |
+| RocksDB WAL | **Journal** — fault-tolerance log for step replay |
+
+### Per-Pipeline Storage Directory
+
+The `LocalRunner` creates a per-pipeline directory on the host filesystem
+(`crates/pipeline-manager/src/runner/local_runner.rs:407-412`):
+
+```
+<working-directory>/pipeline-<pipeline_id>/storage/
+```
+
+### On-Disk Layout
+
+```
+storage/
+├── checkpoints.json                ← list of available checkpoints
+├── state.json                      ← latest checkpoint metadata (step, inputs, outputs)
+├── <uuid>/                         ← one directory per checkpoint
+│   ├── CHECKPOINT                  ← marker file
+│   ├── pspine-<op_id>.dat          ← serialized CommittedSpine (rkyv binary format)
+│   ├── pspine-batches-<op_id>.dat  ← batch file list (JSON, for GC discovery)
+│   └── deps.json                   ← batch file dependency graph
+├── <uuid>.feldera                  ← batch data file (sorted run of (key, val, weight))
+├── <uuid>.feldera                  ← ...more batch files shared across checkpoints
+└── ...
+```
+
+Key observations:
+
+- **Batch files are named by UUID** with a `.feldera` extension
+  (`crates/storage/src/lib.rs:70` — `CREATE_FILE_EXTENSION`).
+- **Batch files are shared across checkpoints.** A batch written during step 5
+  may be referenced by checkpoint-at-step-10 and checkpoint-at-step-20. The
+  `Checkpointer` tracks dependencies (`deps.json`) and only deletes a batch
+  file once no checkpoint references it
+  (`crates/dbsp/src/circuit/checkpointer.rs:95-100` —
+  `gather_batches_for_checkpoint`).
+- **Checkpoint metadata uses rkyv** (zero-copy deserialization), while batch
+  lists and state files use JSON for debuggability.
+
+### How Spine Persists State (Checkpoint Save Path)
+
+When a checkpoint is requested, each Spine's `save()` method runs
+(`crates/dbsp/src/trace/spine_async.rs:1744-1804`):
+
+```
+save(base, persistent_id, files)
+    │
+    ├─ 1. Pause new merges, split batches into (not_merging, merging)
+    │
+    ├─ 2. persist_batches():
+    │     for each batch:
+    │       if batch is in-memory → batch.persisted() → write to .feldera file
+    │       if batch is already file-backed → no-op (already on disk)
+    │
+    ├─ 3. Collect file paths from all persisted batches
+    │
+    ├─ 4. Serialize CommittedSpine (batch paths + dirty flag) via rkyv
+    │     → write to pspine-<op_id>.dat
+    │
+    ├─ 5. Write PSpineBatches JSON (batch paths only)
+    │     → write to pspine-batches-<op_id>.dat
+    │
+    └─ 6. Resume merges, return persisted batches to merger
+         (so they don't need re-persisting on the next checkpoint)
+```
+
+### How Spine Restores State (Checkpoint Load Path)
+
+On recovery, `restore()` runs (`crates/dbsp/src/trace/spine_async.rs:1807-1826`):
+
+```
+restore(base, persistent_id)
+    │
+    ├─ 1. Read pspine-<op_id>.dat from storage backend
+    │
+    ├─ 2. Deserialize CommittedSpine via rkyv (zero-copy)
+    │
+    ├─ 3. For each batch path in committed.batches:
+    │       B::from_path(factories, path)
+    │       → opens the .feldera file as a FileIndexedWSet
+    │       → inserts into the Spine
+    │
+    └─ 4. Spine is fully reconstructed — operator resumes from pre-crash state
+```
+
+### The Fallback Threshold: When Batches Go to Disk
+
+Even without fault tolerance, batches may live on disk during normal operation.
+The `FallbackIndexedWSet` type decides per-batch based on
+`min_storage_bytes` (`crates/feldera-types/src/config.rs:280-290`):
+
+| `min_storage_bytes` | Behavior |
+|---|---|
+| `0` | Everything goes to disk (useful for testing, large state) |
+| **`10,485,760`** (10 MiB, default) | Batches ≥ 10 MiB spill to disk; smaller stay in memory |
+| `usize::MAX` | Everything stays in memory (pure in-memory mode) |
+
+The decision is made per-batch at insert time
+(`crates/dbsp/src/trace/ord/fallback/utils.rs:111-126`):
+
+```rust
+pub fn pick_insert_destination<B>(batch: &B) -> BatchLocation {
+    match Runtime::min_insert_storage_bytes().unwrap_or(usize::MAX) {
+        0 => BatchLocation::Storage,
+        usize::MAX => BatchLocation::Memory,
+        min_storage_bytes => {
+            if batch.approximate_byte_size() >= min_storage_bytes {
+                BatchLocation::Storage
+            } else {
+                BatchLocation::Memory
+            }
+        }
+    }
+}
+```
+
+### Backend Configuration
+
+The storage backend is selected via `StorageBackendConfig`
+(`crates/feldera-types/src/config.rs:318-335`):
+
+| Backend | Config variant | Where data goes |
+|---|---|---|
+| **Default** / **File** | `StorageBackendConfig::Default` | `StorageConfig.path` directory on local filesystem |
+| **Object** | `StorageBackendConfig::Object(...)` | S3, Azure Blob, GCS via object store API |
+
+### What Happens on Crash — With and Without Fault Tolerance
+
+| Scenario | Aggregation state after restart |
+|---|---|
+| **No FT** (demo default) | All Trace state is **lost**. Pipeline starts fresh: inputs re-read from the beginning, circuit rebuilds all state from scratch. Safe when inputs are idempotent (Delta snapshots) and outputs use `"mode": "truncate"`. |
+| **FT enabled** (`fault_tolerance.model` ≠ `None`) | Pipeline resumes from **latest checkpoint**. Traces restored from `.feldera` batch files, inputs resume from checkpointed position, outputs skip already-committed data. No recomputation needed. |
+
+The controller decides at startup
+(`crates/adapters/src/controller.rs:4335-4352`):
+
+```
+if checkpoint exists on storage backend:
+    → ControllerInit::with_checkpoint(uuid)
+    → Spine::restore() for each operator, resume inputs, skip outputs
+else:
+    → ControllerInit::without_checkpoint()
+    → empty Spines, re-read all inputs from beginning
+```
+
+Without storage configured, the controller logs
+(`crates/adapters/src/controller.rs:261-263`):
+
+```
+"storage not configured, so suspend-and-resume and fault tolerance will not be available"
+```
+
+---
+
+## 6.6 Concrete State Walkthrough — `gold_cancellation_impact`
 
 Recall the query from previous documents. It computes weekly cancellation
 rates by category with cumulative and 3-week rolling windows. Here is where
@@ -416,7 +582,7 @@ handful of Trace lookups and a small Z-set delta at each stage.
 
 ---
 
-## 6.6 Putting It All Together
+## 6.7 Putting It All Together
 
 ```
   ┌─────────────────────────────────────────────────────────────────┐
