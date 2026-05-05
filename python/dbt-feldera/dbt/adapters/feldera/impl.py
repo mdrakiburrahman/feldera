@@ -490,6 +490,66 @@ class FelderaAdapter(BaseAdapter):
         return ""
 
     @available
+    def pause_pipeline(self, pipeline_name: str) -> str:
+        """
+        Pause a running pipeline so it stops ingesting new data.
+
+        The pipeline remains in memory and can be resumed without
+        recompilation.
+
+        :param pipeline_name: The pipeline (schema) name.
+        :return: An empty string.
+        """
+        client = self._get_client()
+        _pipeline_state.pause(client, pipeline_name)
+        return ""
+
+    @available
+    def resume_pipeline(self, pipeline_name: str) -> str:
+        """
+        Resume a paused pipeline so it begins ingesting data again.
+
+        :param pipeline_name: The pipeline (schema) name.
+        :return: An empty string.
+        """
+        client = self._get_client()
+        _pipeline_state.resume(client, pipeline_name)
+        return ""
+
+    @available
+    def get_compile_time(self, pipeline_name: str) -> str:
+        """
+        Return the last recorded compile time for a pipeline as a string.
+
+        :param pipeline_name: The pipeline (schema) name.
+        :return: Compile time in seconds (string), or empty string if unavailable.
+        """
+        t = _pipeline_state.get_compile_time(pipeline_name)
+        return str(round(t, 2)) if t is not None else ""
+
+    @available
+    def get_pipeline_stats(self, pipeline_name: str) -> str:
+        """
+        Return current pipeline statistics as a JSON string.
+
+        Fetches the ``/stats`` endpoint via the Feldera SDK and returns
+        the raw JSON. Used by the benchmark harness to poll per-output
+        completion progress.
+
+        :param pipeline_name: The pipeline (schema) name.
+        :return: JSON-encoded stats dict, or empty string on failure.
+        """
+        import json as _json
+
+        client = self._get_client()
+        try:
+            stats = client.get_pipeline_stats(pipeline_name)
+            return _json.dumps(stats)
+        except Exception as exc:
+            logger.warning("Failed to get stats for '%s': %s", pipeline_name, exc)
+            return ""
+
+    @available
     def push_seed_data(self, pipeline_name: str, table_name: str, data: list) -> str:
         """
         Push seed data into a pipeline table via HTTP ingress.

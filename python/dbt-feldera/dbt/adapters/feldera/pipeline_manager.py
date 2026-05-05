@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -13,6 +15,12 @@ from feldera.rest.feldera_client import FelderaClient
 from feldera.runtime_config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
+
+# Well-known path where compile time is persisted for the benchmark harness.
+# The dbt-server reads this file via its /compile-time/feldera endpoint.
+_COMPILE_TIME_PATH = os.environ.get(
+    "FELDERA_COMPILE_TIME_PATH", "/tmp/feldera_compile_time.json"
+)
 
 
 class PipelineStateManager:
@@ -38,6 +46,8 @@ class PipelineStateManager:
         """``{pipeline_name: Pipeline SDK object}``"""
         self._pending_seeds: Dict[str, List[Tuple[str, agate.Table, dict]]] = {}
         """``{pipeline_name: [(table_name, agate_table, {col: sql_type})]}``"""
+        self._compile_times: Dict[str, float] = {}
+        """``{pipeline_name: compile_duration_seconds}``"""
 
     def register_table(self, pipeline: str, name: str, ddl: str) -> None:
         """
@@ -252,12 +262,20 @@ class PipelineStateManager:
                 runtime_config=runtime_config,
             )
 
+            compile_start = time.monotonic()
             p = builder.create_or_replace(wait=True)
-            logger.info("Pipeline '%s' compiled successfully, starting...", pipeline)
+            compile_elapsed = time.monotonic() - compile_start
+            self._compile_times[pipeline] = compile_elapsed
+            self._persist_compile_time(pipeline, compile_elapsed)
+            logger.info(
+                "Pipeline '%s' compiled in %.1fs, starting paused...",
+                pipeline, compile_elapsed,
+            )
 
-            p.start()
-            p.wait_for_status(PipelineStatus.RUNNING, timeout=timeout)
-            logger.info("Pipeline '%s' is running", pipeline)
+            # Start in paused state so no data is ingested before the
+            # benchmark harness explicitly resumes.
+            p.start_paused(wait=True)
+            logger.info("Pipeline '%s' started in paused state (ready for benchmark)", pipeline)
 
             self._deployed_sql[pipeline] = sql
             self._pipelines[pipeline] = p
@@ -361,14 +379,22 @@ class PipelineStateManager:
                     logger.warning("Failed to clear storage for pipeline '%s': %s", pipeline, exc)
 
             # Update SQL and wait for recompilation
+            compile_start = time.monotonic()
             p.modify(sql=full_sql)
             self._wait_for_compilation(p, timeout)
+            compile_elapsed = time.monotonic() - compile_start
+            self._compile_times[pipeline] = compile_elapsed
+            self._persist_compile_time(pipeline, compile_elapsed)
 
-            logger.info("Pipeline '%s' recompiled with views, starting...", pipeline)
+            logger.info(
+                "Pipeline '%s' recompiled with views in %.1fs, starting paused...",
+                pipeline, compile_elapsed,
+            )
 
-            p.start()
-            p.wait_for_status(PipelineStatus.RUNNING, timeout=timeout)
-            logger.info("Pipeline '%s' is running with views", pipeline)
+            # Start in paused state so no data is ingested before the
+            # benchmark harness explicitly resumes.
+            p.start_paused(wait=True)
+            logger.info("Pipeline '%s' started in paused state with views (ready for benchmark)", pipeline)
 
             self._deployed_sql[pipeline] = full_sql
             self._pipelines[pipeline] = p
@@ -511,6 +537,74 @@ class PipelineStateManager:
                     logger.info("Pipeline '%s' stopped", pipeline)
                 except FelderaAPIError:
                     logger.debug("Pipeline '%s' not found, nothing to stop", pipeline)
+
+    def pause(self, client: FelderaClient, pipeline: str) -> None:
+        """
+        Pause a running pipeline so it stops ingesting new data.
+
+        The pipeline remains in memory and can be resumed without
+        recompilation.
+
+        :param client: The Feldera REST client.
+        :param pipeline: The pipeline (schema) name.
+        """
+        with self._lock:
+            p = self._resolve_pipeline(client, pipeline)
+            if p is None:
+                logger.warning("Pipeline '%s' not found, cannot pause", pipeline)
+                return
+            p.pause(wait=True)
+            logger.info("Pipeline '%s' paused", pipeline)
+
+    def resume(self, client: FelderaClient, pipeline: str) -> None:
+        """
+        Resume a paused pipeline so it begins ingesting data again.
+
+        :param client: The Feldera REST client.
+        :param pipeline: The pipeline (schema) name.
+        """
+        with self._lock:
+            p = self._resolve_pipeline(client, pipeline)
+            if p is None:
+                logger.warning("Pipeline '%s' not found, cannot resume", pipeline)
+                return
+            p.resume(wait=True)
+            logger.info("Pipeline '%s' resumed", pipeline)
+
+    def get_compile_time(self, pipeline: str) -> Optional[float]:
+        """
+        Return the last recorded compile time for a pipeline.
+
+        :param pipeline: The pipeline (schema) name.
+        :return: Compile duration in seconds, or None if not recorded.
+        """
+        with self._lock:
+            return self._compile_times.get(pipeline)
+
+    def _resolve_pipeline(self, client: FelderaClient, pipeline: str) -> Optional[Pipeline]:
+        """Look up a pipeline from cache or the server."""
+        if pipeline in self._pipelines:
+            return self._pipelines[pipeline]
+        try:
+            p = Pipeline.get(pipeline, client)
+            self._pipelines[pipeline] = p
+            return p
+        except FelderaAPIError:
+            return None
+
+    @staticmethod
+    def _persist_compile_time(pipeline: str, elapsed: float) -> None:
+        """Write compile time to a well-known file for the benchmark harness."""
+        try:
+            data = {}
+            if os.path.exists(_COMPILE_TIME_PATH):
+                with open(_COMPILE_TIME_PATH) as f:
+                    data = json.load(f)
+            data[pipeline] = round(elapsed, 2)
+            with open(_COMPILE_TIME_PATH, "w") as f:
+                json.dump(data, f)
+        except Exception as exc:
+            logger.warning("Failed to persist compile time: %s", exc)
 
     def clear_storage(self, client: FelderaClient, pipeline: str) -> None:
         """
