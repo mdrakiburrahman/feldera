@@ -27,6 +27,7 @@ class FelderaCredentials(Credentials):
               compilation_profile: dev
               workers: 4
               timeout: 300
+              max_rss_mb: 98304
     """
 
     host: str = "http://localhost:8080"
@@ -35,6 +36,15 @@ class FelderaCredentials(Credentials):
     compilation_profile: str = "dev"
     workers: int = 4
     timeout: int = 300
+    max_rss_mb: Optional[int] = None
+    """Pipeline-wide resident-set-size cap in megabytes.
+
+    Mirrors Feldera's ``runtime_config.max_rss_mb`` setting (see
+    https://docs.feldera.com/operations/memory). When set, the pipeline
+    applies backpressure to keep total memory usage at or below this
+    value, spilling state to storage as needed. Leave unset (or zero) to
+    let Feldera auto-derive the cap from container resources.
+    """
 
     @property
     def type(self) -> str:
@@ -52,4 +62,5 @@ class FelderaCredentials(Credentials):
             "schema",
             "compilation_profile",
             "workers",
+            "max_rss_mb",
         )

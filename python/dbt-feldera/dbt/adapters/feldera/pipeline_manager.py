@@ -222,6 +222,7 @@ class PipelineStateManager:
         compilation_profile: str = "dev",
         workers: int = 4,
         timeout: int = 300,
+        max_rss_mb: Optional[int] = None,
     ) -> Pipeline:
         """
         Deploy the assembled pipeline to Feldera.
@@ -236,6 +237,10 @@ class PipelineStateManager:
         :param compilation_profile: The compilation profile to use.
         :param workers: Number of worker threads for the pipeline.
         :param timeout: Compilation timeout in seconds.
+        :param max_rss_mb: Optional pipeline-wide memory cap in megabytes,
+            forwarded to ``runtime_config.max_rss_mb``. ``None`` or a
+            non-positive value leaves the field unset so Feldera derives
+            the cap from container resources.
         :return: The deployed Pipeline object.
         """
         with self._lock:
@@ -253,6 +258,15 @@ class PipelineStateManager:
 
             runtime_config = RuntimeConfig.default()
             runtime_config.workers = workers
+            if max_rss_mb is not None and max_rss_mb > 0:
+                # ``RuntimeConfig.to_dict()`` serializes any attribute on
+                # ``__dict__``; setting it directly is the supported way to
+                # pass fields the Python SDK doesn't expose explicitly.
+                runtime_config.max_rss_mb = max_rss_mb
+                logger.info(
+                    "Pipeline '%s' runtime_config.max_rss_mb=%d MB",
+                    pipeline, max_rss_mb,
+                )
 
             builder = PipelineBuilder(
                 client,
@@ -289,6 +303,7 @@ class PipelineStateManager:
         workers: int = 4,
         timeout: int = 300,
         full_refresh: bool = False,
+        max_rss_mb: Optional[int] = None,
     ) -> Pipeline:
         """
         Update and redeploy an existing pipeline with new views.
@@ -315,6 +330,8 @@ class PipelineStateManager:
         :param timeout: Compilation timeout in seconds.
         :param full_refresh: If True, clear all pipeline storage before
             restarting so state is recomputed from scratch.
+        :param max_rss_mb: Optional pipeline-wide memory cap in megabytes,
+            forwarded to ``runtime_config.max_rss_mb`` when redeploying.
         :return: The updated Pipeline object.
         """
         with self._lock:
@@ -332,7 +349,14 @@ class PipelineStateManager:
             except FelderaAPIError:
                 # Pipeline doesn't exist yet — fall back to full deploy
                 logger.info("Pipeline '%s' not found, falling back to full deploy", pipeline)
-                return self.deploy(client, pipeline, compilation_profile, workers, timeout)
+                return self.deploy(
+                    client,
+                    pipeline,
+                    compilation_profile,
+                    workers,
+                    timeout,
+                    max_rss_mb=max_rss_mb,
+                )
 
             # Extract only CREATE TABLE statements from existing SQL
             # (discard existing CREATE VIEW statements to avoid duplicates)
@@ -378,7 +402,11 @@ class PipelineStateManager:
                 except Exception as exc:
                     logger.warning("Failed to clear storage for pipeline '%s': %s", pipeline, exc)
 
-            # Update SQL and wait for recompilation
+            # Update SQL and wait for recompilation. We deliberately don't
+            # touch runtime_config here: max_rss_mb was set at deploy() and
+            # the pipeline-manager persists it across stop/start. PATCHing
+            # a partial runtime_config could replace (not merge) the whole
+            # dict.
             compile_start = time.monotonic()
             p.modify(sql=full_sql)
             self._wait_for_compilation(p, timeout)

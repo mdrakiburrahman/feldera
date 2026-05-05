@@ -455,6 +455,7 @@ class FelderaAdapter(BaseAdapter):
             compilation_profile=creds.compilation_profile,
             workers=creds.workers,
             timeout=creds.timeout,
+            max_rss_mb=creds.max_rss_mb,
         )
         return ""
 
@@ -633,6 +634,7 @@ class FelderaAdapter(BaseAdapter):
                 compilation_profile=creds.compilation_profile,
                 workers=creds.workers,
                 timeout=creds.timeout,
+                max_rss_mb=creds.max_rss_mb,
             )
 
             for table_name, agate_table, column_types in _pipeline_state.pop_pending_seeds(pipeline_name):
@@ -660,6 +662,7 @@ class FelderaAdapter(BaseAdapter):
                 workers=creds.workers,
                 timeout=creds.timeout,
                 full_refresh=full_refresh,
+                max_rss_mb=creds.max_rss_mb,
             )
 
         return ""
