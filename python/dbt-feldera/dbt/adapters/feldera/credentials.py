@@ -28,6 +28,8 @@ class FelderaCredentials(Credentials):
               workers: 4
               timeout: 300
               max_rss_mb: 98304
+              dev_tweaks:
+                adaptive_joins: true
     """
 
     host: str = "http://localhost:8080"
@@ -44,6 +46,16 @@ class FelderaCredentials(Credentials):
     applies backpressure to keep total memory usage at or below this
     value, spilling state to storage as needed. Leave unset (or zero) to
     let Feldera auto-derive the cap from container resources.
+    """
+    dev_tweaks: Optional[dict] = None
+    """Free-form ``runtime_config.dev_tweaks`` overrides.
+
+    Forwarded verbatim to ``runtime_config.dev_tweaks`` when set. Useful
+    for opt-in features that aren't first-class fields on the Python
+    ``RuntimeConfig`` dataclass — e.g. ``{"adaptive_joins": true}`` to
+    enable the adaptive-join operator on skewed workloads. See
+    https://docs.feldera.com/pipelines/configuration/ for the full list
+    of recognised keys.
     """
 
     @property
@@ -63,4 +75,5 @@ class FelderaCredentials(Credentials):
             "compilation_profile",
             "workers",
             "max_rss_mb",
+            "dev_tweaks",
         )

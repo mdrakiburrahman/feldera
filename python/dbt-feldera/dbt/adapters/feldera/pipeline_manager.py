@@ -223,6 +223,7 @@ class PipelineStateManager:
         workers: int = 4,
         timeout: int = 300,
         max_rss_mb: Optional[int] = None,
+        dev_tweaks: Optional[dict] = None,
     ) -> Pipeline:
         """
         Deploy the assembled pipeline to Feldera.
@@ -241,6 +242,11 @@ class PipelineStateManager:
             forwarded to ``runtime_config.max_rss_mb``. ``None`` or a
             non-positive value leaves the field unset so Feldera derives
             the cap from container resources.
+        :param dev_tweaks: Optional dict forwarded verbatim to
+            ``runtime_config.dev_tweaks`` — useful for opt-in features
+            that aren't first-class on the Python ``RuntimeConfig``
+            dataclass (for example ``{"adaptive_joins": True}``).
+            ``None`` or empty leaves the field unset.
         :return: The deployed Pipeline object.
         """
         with self._lock:
@@ -266,6 +272,19 @@ class PipelineStateManager:
                 logger.info(
                     "Pipeline '%s' runtime_config.max_rss_mb=%d MB",
                     pipeline, max_rss_mb,
+                )
+            if dev_tweaks:
+                # Same trick as max_rss_mb above: dev_tweaks is part of
+                # Feldera's ``RuntimeConfig`` (see crates/feldera-types
+                # ``DevTweaks``) but the Python SDK exposes it only via
+                # ``RuntimeConfig.__init__(dev_tweaks=...)``. Setting on
+                # the instance after ``RuntimeConfig.default()`` works
+                # because ``to_dict()`` serializes any attribute on
+                # ``__dict__``.
+                runtime_config.dev_tweaks = dict(dev_tweaks)
+                logger.info(
+                    "Pipeline '%s' runtime_config.dev_tweaks=%s",
+                    pipeline, runtime_config.dev_tweaks,
                 )
 
             builder = PipelineBuilder(
@@ -304,6 +323,7 @@ class PipelineStateManager:
         timeout: int = 300,
         full_refresh: bool = False,
         max_rss_mb: Optional[int] = None,
+        dev_tweaks: Optional[dict] = None,
     ) -> Pipeline:
         """
         Update and redeploy an existing pipeline with new views.
@@ -332,6 +352,8 @@ class PipelineStateManager:
             restarting so state is recomputed from scratch.
         :param max_rss_mb: Optional pipeline-wide memory cap in megabytes,
             forwarded to ``runtime_config.max_rss_mb`` when redeploying.
+        :param dev_tweaks: Optional ``runtime_config.dev_tweaks`` overrides,
+            forwarded when the not-found fall-back triggers a full deploy.
         :return: The updated Pipeline object.
         """
         with self._lock:
@@ -356,6 +378,7 @@ class PipelineStateManager:
                     workers,
                     timeout,
                     max_rss_mb=max_rss_mb,
+                    dev_tweaks=dev_tweaks,
                 )
 
             # Extract only CREATE TABLE statements from existing SQL
