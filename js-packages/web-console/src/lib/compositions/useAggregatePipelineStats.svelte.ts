@@ -13,14 +13,14 @@ const metrics: Record<string, PipelineMetrics> = {} // Disable reactivity for me
 let getMetrics = $state<() => typeof metrics>(() => metrics)
 
 export const useAggregatePipelineStats = (
-  pipeline: { current: ExtendedPipeline },
+  pipeline: { current: ExtendedPipeline | undefined },
   refetchMs: number,
   keepMs?: number,
   options?: { getDeleted?: () => boolean }
 ) => {
-  const pipelineStatus = $derived(pipeline.current.status)
+  const pipelineStatus = $derived(pipeline.current?.status)
 
-  const metricsAvailable = $derived(isMetricsAvailable(pipelineStatus))
+  const metricsAvailable = $derived(pipelineStatus ? isMetricsAvailable(pipelineStatus) : 'no')
   const api = usePipelineManager()
 
   const doFetch = async (pipelineName: string) => {
@@ -56,11 +56,15 @@ export const useAggregatePipelineStats = (
     getMetrics = () => metrics
   }
 
-  const pipelineName = $derived(pipeline.current.name)
+  const pipelineName = $derived(pipeline.current?.name)
   $effect(() => {
-    pipelineName
+    if (!pipelineName) {
+      return
+    }
     metricsAvailable
-    if (options?.getDeleted?.()) return
+    if (options?.getDeleted?.()) {
+      return
+    }
     const cancel = untrack(() => closedIntervalAction(() => doFetch(pipelineName), refetchMs))
     return () => {
       cancel()
@@ -68,7 +72,7 @@ export const useAggregatePipelineStats = (
   })
   return {
     get current() {
-      return getMetrics()[pipelineName] ?? emptyPipelineMetrics
+      return pipelineName ? (getMetrics()[pipelineName] ?? emptyPipelineMetrics) : undefined
     }
   }
 }

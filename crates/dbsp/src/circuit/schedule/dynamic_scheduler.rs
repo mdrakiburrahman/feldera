@@ -57,7 +57,7 @@ use crate::{
     Position,
     circuit::{
         Circuit, GlobalNodeId, NodeId,
-        circuit_builder::CircuitMetadata,
+        circuit_builder::{CircuitMetadata, Node},
         runtime::{Broadcast, Runtime},
         schedule::{
             CommitProgress, Error, Scheduler,
@@ -147,9 +147,6 @@ impl Notifications {
 }
 
 enum TransactionPhase {
-    /// Not started
-    Idle,
-
     /// Started, but not yet committing.
     Started,
 
@@ -270,11 +267,11 @@ impl Inner {
         }
     }
 
-    fn prepare<C>(circuit: &C, nodes: Option<&BTreeSet<NodeId>>) -> Result<Self, Error>
+    fn prepare<C>(circuit: &C, active_nodes: Option<&BTreeSet<NodeId>>) -> Result<Self, Error>
     where
         C: Circuit,
     {
-        let nodes = nodes
+        let nodes = active_nodes
             .map(|nodes| nodes.iter().cloned().collect::<BTreeSet<_>>())
             .unwrap_or_else(|| BTreeSet::from_iter(circuit.node_ids()));
 
@@ -360,7 +357,7 @@ impl Inner {
             notifications: Notifications::new(num_async_nodes),
             handles: JoinSet::new(),
             waiting: false,
-            transaction_phase: TransactionPhase::Idle,
+            transaction_phase: TransactionPhase::CommitComplete,
             global_commit_consensus: Broadcast::new(),
             metadata_broadcast: Broadcast::new(),
             before_first_step: true,
@@ -385,7 +382,7 @@ impl Inner {
         }
 
         if circuit.root_scope() == 0 {
-            circuit.balancer().prepare(circuit);
+            circuit.balancer().prepare(circuit, active_nodes);
         }
 
         Ok(scheduler)
@@ -457,7 +454,11 @@ impl Inner {
         }
         self.transaction_phase = TransactionPhase::Started;
 
-        circuit.notify_start_transaction();
+        for node_id in self.tasks.keys() {
+            circuit.map_local_node_mut(*node_id, &mut |node: &mut dyn Node| {
+                node.start_transaction()
+            });
+        }
 
         if circuit.root_scope() == 0 {
             circuit.balancer().start_transaction();

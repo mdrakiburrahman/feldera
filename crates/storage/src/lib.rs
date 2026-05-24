@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 
-use feldera_types::checkpoint::{CheckpointMetadata, PSpineBatches};
+use feldera_types::checkpoint::{CheckpointDependencies, CheckpointMetadata, PSpineBatches};
 use feldera_types::config::{StorageBackendConfig, StorageConfig, StorageOptions};
-use feldera_types::constants::CREATE_FILE_EXTENSION;
+use feldera_types::constants::{CHECKPOINT_DEPENDENCIES, CREATE_FILE_EXTENSION};
 use serde::de::DeserializeOwned;
 use tracing::warn;
 use uuid::Uuid;
@@ -133,6 +133,20 @@ pub trait StorageBackend: Send + Sync {
         Ok(reader)
     }
 
+    /// Flushes the directory entry metadata for `dir` to stable storage.
+    ///
+    /// POSIX `fsync(file)` guarantees the file's data is durable but says
+    /// nothing about whether the file's name in its parent directory is
+    /// durable. After renaming files into a directory or creating new
+    /// subdirectories, the caller can use this barrier to make those
+    /// directory entries durable in one syscall.
+    ///
+    /// Backends that do not have a meaningful notion of directory
+    /// durability (e.g. object stores) may treat this as a no-op.
+    fn fsync_dir(&self, _dir: &StoragePath) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Returns a value that represents the number of bytes of storage in use.
     /// The storage backend updates this value when its own functions cause more
     /// or less storage to be used:
@@ -199,8 +213,36 @@ impl dyn StorageBackend {
     ) -> Result<HashSet<StoragePath>, StorageError> {
         assert!(!cpm.is_nil());
 
+        let checkpoint_dir: StoragePath = cpm.to_string().into();
+
+        // `dependencies.json` holds the authoritative snapshot of every
+        // batch referenced by the checkpoint at commit time. Prefer it
+        // over the per-spine `pspine-batches-*.dat` scan below: a valid
+        // commit always writes it, and it captures the full list in one
+        // place so a single read suffices. See `CheckpointDependencies`
+        // for the accepted JSON forms.
+        let deps_path = checkpoint_dir.child(CHECKPOINT_DEPENDENCIES);
+        match self.read_json::<CheckpointDependencies>(&deps_path) {
+            Ok(deps) => {
+                return Ok(deps
+                    .batches()
+                    .iter()
+                    .map(|b| StoragePath::from(b.as_str()))
+                    .collect());
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // Fall back to scanning per-spine sidecars. Predates the
+                // `dependencies.json` snapshot entirely.
+            }
+            Err(error) => return Err(error),
+        }
+
+        // Legacy fallback. New checkpoints always carry a
+        // `dependencies.json` (the early-return above), so this scan only
+        // runs for checkpoints written before that file existed.
+        // TODO: remove once no such old checkpoints remain in use.
         let mut spines = Vec::new();
-        self.list(&cpm.to_string().into(), &mut |path, _file_type| {
+        self.list(&checkpoint_dir, &mut |path, _file_type| {
             if path
                 .filename()
                 .is_some_and(|filename| filename.starts_with("pspine-batches"))

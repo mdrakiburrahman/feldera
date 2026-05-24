@@ -1,6 +1,6 @@
-use crate::Runtime;
 use crate::circuit::circuit_builder::{StreamId, register_replay_stream};
 use crate::circuit::metadata::{INPUT_RECORDS_COUNT, MEMORY_ALLOCATIONS_COUNT, RETAINMENT_BOUNDS};
+use crate::circuit::splitter_output_chunk_size;
 use crate::dynamic::{Factory, Weight, WeightTrait};
 use crate::operator::require_persistent_id;
 use crate::trace::spine_async::WithSnapshot;
@@ -800,7 +800,7 @@ where
 
     async fn eval_owned_and_ref(&mut self, mut trace: T, batch: &T::Batch) -> T {
         self.num_inputs += batch.len();
-        trace.insert(batch.clone());
+        trace.insert(batch.clone()).await;
         trace
     }
 
@@ -813,7 +813,7 @@ where
     async fn eval_owned(&mut self, mut trace: T, batch: T::Batch) -> T {
         self.num_inputs += batch.len();
 
-        trace.insert(batch);
+        trace.insert(batch).await;
         trace
     }
 
@@ -882,11 +882,13 @@ where
         // TODO: extend `trace` type to feed untimed batches directly
         // (adding fixed timestamp on the fly).
         self.num_inputs += batch.len();
-        trace.insert(T::Batch::from_batch(
-            batch,
-            &self.clock.time(),
-            &self.output_factories,
-        ));
+        trace
+            .insert(T::Batch::from_batch(
+                batch,
+                &self.clock.time(),
+                &self.output_factories,
+            ))
+            .await;
         trace
     }
 
@@ -902,13 +904,15 @@ where
         if TypeId::of::<B>() == TypeId::of::<T::Batch>() {
             let mut batch = Some(batch);
             let batch = unsafe { transmute::<&mut Option<B>, &mut Option<T::Batch>>(&mut batch) };
-            trace.insert(batch.take().unwrap());
+            trace.insert(batch.take().unwrap()).await;
         } else {
-            trace.insert(T::Batch::from_batch(
-                &batch,
-                &self.clock.time(),
-                &self.output_factories,
-            ));
+            trace
+                .insert(T::Batch::from_batch(
+                    &batch,
+                    &self.clock.time(),
+                    &self.output_factories,
+                ))
+                .await;
         }
         trace
     }
@@ -958,7 +962,8 @@ pub struct Z1Trace<C: Circuit, B: Batch, T: Trace> {
     batch_factories: B::Factories,
     // Stream whose integral this Z1 operator stores, if any.
     delta_stream: Option<Stream<C, B>>,
-    flush: bool,
+    flush_output: bool,
+    flush_input: bool,
 }
 
 impl<C, B, T> Z1Trace<C, B, T>
@@ -987,7 +992,8 @@ where
             reset_on_clock_start,
             bounds,
             delta_stream: None,
-            flush: false,
+            flush_output: false,
+            flush_input: false,
         }
     }
 
@@ -1156,7 +1162,17 @@ where
     }
 
     fn flush(&mut self) {
-        self.flush = true;
+        self.flush_output = true;
+    }
+
+    fn is_flush_complete(&self) -> bool {
+        !self.flush_output
+    }
+
+    fn start_compaction(&mut self) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.initiate_compaction()
+        }
     }
 }
 
@@ -1168,10 +1184,13 @@ where
 {
     fn get_output(&mut self) -> T {
         //println!("Z1-{}::get_output", &self.global_id);
-        let replay_step_size = Runtime::replay_step_size();
+        let replay_step_size = splitter_output_chunk_size();
 
         if self.replay_mode {
-            if let Some(replay) = &mut self.replay_state {
+            // One output per transaction.
+            if self.flush_output
+                && let Some(replay) = &mut self.replay_state
+            {
                 //println!("Z1-{}::get_output: replaying", &self.global_id);
                 let mut builder = <B::Builder as Builder<B>>::with_capacity(
                     &self.batch_factories,
@@ -1209,6 +1228,7 @@ where
                 self.delta_stream.as_ref().unwrap().value().put(batch);
                 if !replay.borrow_cursor().key_valid() {
                     self.replay_state = None;
+                    self.flush_output = false;
                 }
             } else {
                 // Continue producing empty outputs as long as the circuit is in the replay mode.
@@ -1217,7 +1237,10 @@ where
                     .unwrap()
                     .value()
                     .put(B::dyn_empty(&self.batch_factories));
+                self.flush_output = false;
             }
+        } else {
+            self.flush_output = false;
         }
 
         let mut result = self.trace.take().unwrap();
@@ -1240,6 +1263,14 @@ where
     B: Batch<Key = T::Key, Val = T::Val, Time = (), R = T::R>,
     T: Trace,
 {
+    fn flush_input(&mut self) {
+        self.flush_input = true;
+    }
+
+    fn is_flush_input_complete(&self) -> bool {
+        !self.flush_input
+    }
+
     async fn eval_strict(&mut self, _i: &T) {
         unimplemented!()
     }
@@ -1247,9 +1278,9 @@ where
     async fn eval_strict_owned(&mut self, mut i: T) {
         // println!("Z1-{}::eval_strict_owned", &self.global_id);
 
-        if self.flush {
+        if self.flush_input {
             self.time = self.time.advance(0);
-            self.flush = false;
+            self.flush_input = false;
         }
 
         let dirty = i.dirty();
@@ -1280,12 +1311,18 @@ mod test {
     use std::{
         cmp::max,
         collections::{BTreeMap, BTreeSet},
+        thread,
+        time::{Duration, Instant},
     };
 
     use crate::{
         OrdIndexedZSet, Runtime, Stream, TypedBox, ZWeight,
+        circuit::{
+            CircuitConfig, GlobalNodeId,
+            metadata::{MetaItem, SPINE_BATCHES_COUNT},
+        },
         dynamic::DynData,
-        typed_batch::{self, Spine},
+        typed_batch::{self, IndexedZSetReader, Spine},
         utils::Tup2,
     };
     use proptest::{collection::vec, prelude::*};
@@ -1618,6 +1655,196 @@ mod test {
         }
 
         test_integrate_trace_retain(batches, 10, 10);
+    }
+
+    fn spine_batches_count_values(profile: &crate::profile::DbspProfile) -> Vec<(String, usize)> {
+        let root = GlobalNodeId::root();
+        let operator_names = spine_operator_names(profile);
+
+        // The root profile entry merges child metrics, so only inspect individual operators.
+        let mut counts = profile
+            .worker_profiles
+            .iter()
+            .flat_map(|profile| profile.attribute_profile(&SPINE_BATCHES_COUNT))
+            .filter_map(|(node_id, value)| {
+                (node_id != root).then(|| match value {
+                    MetaItem::Count(count) => {
+                        let operator_name = operator_names
+                            .get(&node_id.node_identifier().to_string())
+                            .cloned()
+                            .unwrap_or_else(|| node_id.to_string());
+                        (operator_name, count)
+                    }
+                    value => panic!("spine_batches_count must be serialized as a count: {value:?}"),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        counts.sort();
+        counts
+    }
+
+    fn spine_operator_names(profile: &crate::profile::DbspProfile) -> BTreeMap<String, String> {
+        let mut operator_names = BTreeMap::new();
+
+        if let Some(graph) = &profile.graph {
+            let graph_json: serde_json::Value = serde_json::from_str(&graph.to_json()).unwrap();
+            collect_operator_names(&graph_json, &mut operator_names);
+        }
+
+        operator_names
+    }
+
+    fn collect_operator_names(
+        value: &serde_json::Value,
+        operator_names: &mut BTreeMap<String, String>,
+    ) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let (Some(id), Some(label)) = (
+                    object.get("id").and_then(serde_json::Value::as_str),
+                    object.get("label").and_then(serde_json::Value::as_str),
+                ) {
+                    let name = label
+                        .split("\\l")
+                        .next()
+                        .unwrap_or(label)
+                        .split(" @ ")
+                        .next()
+                        .unwrap_or(label);
+                    operator_names.insert(id.to_owned(), name.to_owned());
+                }
+
+                for value in object.values() {
+                    collect_operator_names(value, operator_names);
+                }
+            }
+            serde_json::Value::Array(array) => {
+                for value in array {
+                    collect_operator_names(value, operator_names);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_start_compaction_accumulate_integrate_trace() {
+        const NUM_TRACES: usize = 3;
+        const ITERATIONS: usize = 3;
+        const BATCHES_PER_ITERATION: usize = 20;
+        const TOTAL_BATCHES: usize = BATCHES_PER_ITERATION * ITERATIONS * (ITERATIONS + 1) / 2;
+        const RECORDS_PER_BATCH: usize = 2000;
+
+        let storage_dir = tempfile::tempdir().unwrap();
+        let circuit_config =
+            CircuitConfig::with_workers(2).with_temporary_storage(storage_dir.path());
+        let (mut dbsp, (input_handles, trace_outputs)) =
+            Runtime::init_circuit(circuit_config, move |circuit| {
+                // Build several independent trace integrals so one compaction request has to visit
+                // multiple `accumulate_integrate_trace` operators in a storage-enabled circuit.
+                let mut input_handles = Vec::new();
+                let mut trace_outputs = Vec::new();
+
+                for _ in 0..NUM_TRACES {
+                    let (stream, handle) = circuit.add_input_indexed_zset::<i32, i32>();
+                    let trace = stream.shard().accumulate_integrate_trace();
+                    let output = trace
+                        .apply(|trace| trace.ro_snapshot().consolidate())
+                        .output();
+                    input_handles.push(handle);
+                    trace_outputs.push(output);
+                }
+
+                Ok((input_handles, trace_outputs))
+            })
+            .unwrap();
+
+        let mut next_batch = 0;
+        for iteration in 0..ITERATIONS {
+            // Each iteration appends more batches than the previous one.  This exercises
+            // repeated compaction on traces that keep receiving additional input.
+            let batches_this_iteration = (iteration + 1) * BATCHES_PER_ITERATION;
+            let end_batch = next_batch + batches_this_iteration;
+
+            for batch in next_batch..end_batch {
+                for (trace, input_handle) in input_handles.iter().enumerate() {
+                    let mut tuples = Vec::with_capacity(RECORDS_PER_BATCH);
+                    for record in 0..RECORDS_PER_BATCH {
+                        // Use disjoint key ranges per trace so the output validation can
+                        // reconstruct the expected integral exactly.
+                        let key = (trace * TOTAL_BATCHES * RECORDS_PER_BATCH
+                            + batch * RECORDS_PER_BATCH
+                            + record) as i32;
+                        tuples.push(Tup2(key, Tup2(record as i32, 1)));
+                    }
+
+                    input_handle.append(&mut tuples);
+                }
+
+                dbsp.transaction().unwrap();
+            }
+
+            next_batch = end_batch;
+
+            let profile = dbsp.retrieve_profile().unwrap();
+            let counts = spine_batches_count_values(&profile);
+            println!(
+                "SPINE_BATCHES_COUNT values before compaction iteration {iteration}: {counts:?}"
+            );
+            assert!(
+                !counts.is_empty(),
+                "profile should contain at least one SPINE_BATCHES_COUNT metric"
+            );
+
+            dbsp.start_compaction().unwrap();
+            thread::sleep(Duration::from_millis(100));
+            // Starting compaction again while the previous request is still making progress
+            // should be idempotent.
+            dbsp.start_compaction().unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let profile = dbsp.retrieve_profile().unwrap();
+                let counts = spine_batches_count_values(&profile);
+                println!(
+                    "SPINE_BATCHES_COUNT values after compaction request iteration {iteration}: {counts:?}"
+                );
+                assert!(
+                    !counts.is_empty(),
+                    "profile should contain at least one SPINE_BATCHES_COUNT metric"
+                );
+
+                if counts.iter().all(|(_, count)| *count <= 1) {
+                    break;
+                }
+
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for all SPINE_BATCHES_COUNT values to be <= 1: {counts:?}"
+                );
+                thread::sleep(Duration::from_secs(5));
+            }
+
+            // After all spines report at most one batch, run one more logical step to
+            // materialize the trace outputs and verify compaction preserved every record.
+            dbsp.transaction().unwrap();
+            for (trace, output) in trace_outputs.iter().enumerate() {
+                let output = output.consolidate();
+                let mut actual_tuples = output.iter();
+
+                for batch in 0..next_batch {
+                    for record in 0..RECORDS_PER_BATCH {
+                        let key = (trace * TOTAL_BATCHES * RECORDS_PER_BATCH
+                            + batch * RECORDS_PER_BATCH
+                            + record) as i32;
+                        assert_eq!(actual_tuples.next(), Some((key, record as i32, 1)));
+                    }
+                }
+
+                assert_eq!(actual_tuples.next(), None);
+            }
+        }
     }
 
     proptest! {

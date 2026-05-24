@@ -33,7 +33,7 @@ use termbg::{theme, Theme};
 use tokio::signal;
 use tokio::sync::watch;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info, trace, Level};
+use tracing::{error, info, Level};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
@@ -197,6 +197,8 @@ It contains the following fields:
         endpoints::pipeline_management::post_pipeline_dismiss_error,
         endpoints::pipeline_management::post_pipeline_clear,
         endpoints::pipeline_management::get_pipeline_logs,
+        endpoints::pipeline_management::pipeline_events::list_pipeline_events,
+        endpoints::pipeline_management::pipeline_events::get_pipeline_event,
 
         // Pipeline interaction endpoints
         endpoints::pipeline_interaction::http_input,
@@ -204,8 +206,6 @@ It contains the following fields:
         endpoints::pipeline_interaction::post_pipeline_input_connector_action,
         endpoints::pipeline_interaction::get_pipeline_input_connector_status,
         endpoints::pipeline_interaction::get_pipeline_output_connector_status,
-        endpoints::pipeline_interaction::post_pipeline_output_connector_reset,
-        endpoints::pipeline_interaction::reset_status,
         endpoints::pipeline_interaction::get_pipeline_stats,
         endpoints::pipeline_interaction::get_pipeline_metrics,
         endpoints::pipeline_interaction::get_pipeline_circuit_profile,
@@ -229,9 +229,11 @@ It contains the following fields:
         endpoints::pipeline_interaction::completion_status,
         endpoints::pipeline_interaction::start_transaction,
         endpoints::pipeline_interaction::commit_transaction,
+        endpoints::pipeline_interaction::clock_advance,
         endpoints::pipeline_interaction::get_pipeline_time_series,
         endpoints::pipeline_interaction::get_pipeline_time_series_stream,
         endpoints::pipeline_interaction::post_pipeline_rebalance,
+        endpoints::pipeline_interaction::post_pipeline_start_compaction,
 
         // API keys
         endpoints::api_key::list_api_keys,
@@ -287,6 +289,10 @@ It contains the following fields:
         crate::api::endpoints::pipeline_management::PostPutPipeline,
         crate::api::endpoints::pipeline_management::PatchPipeline,
         crate::api::endpoints::pipeline_management::PostStopPipelineParameters,
+        crate::db::types::monitor::PipelineMonitorEventId,
+        crate::api::endpoints::pipeline_management::pipeline_events::PipelineMonitorEventSelectedInfo,
+        crate::api::endpoints::pipeline_management::pipeline_events::PipelineMonitorEventFieldSelector,
+        crate::api::endpoints::pipeline_management::pipeline_events::GetPipelineEventParameters,
 
         // Dataflow IR
         feldera_ir::Dataflow,
@@ -367,6 +373,7 @@ It contains the following fields:
         feldera_types::transport::file::FileInputConfig,
         feldera_types::transport::file::FileOutputConfig,
         feldera_types::transport::http::HttpInputConfig,
+        feldera_types::transport::http::HttpOutputConfig,
         feldera_types::transport::url::UrlInputConfig,
         feldera_types::transport::kafka::KafkaHeader,
         feldera_types::transport::kafka::KafkaHeaderValue,
@@ -403,6 +410,7 @@ It contains the following fields:
         feldera_types::transport::iceberg::RestCatalogConfig,
         feldera_types::transport::iceberg::GlueCatalogConfig,
         feldera_types::transport::postgres::PostgresReaderConfig,
+        feldera_types::transport::postgres::PostgresCdcReaderConfig,
         feldera_types::transport::postgres::PostgresWriterConfig,
         feldera_types::transport::postgres::PostgresWriteMode,
         feldera_types::transport::postgres::PostgresTlsConfig,
@@ -440,6 +448,8 @@ It contains the following fields:
         feldera_types::preprocess::PreprocessorConfig,
         feldera_types::transaction::StartTransactionResponse,
         feldera_types::transaction::CommitProgressSummary,
+        feldera_types::transport::clock::ClockAdvanceRequest,
+        feldera_types::transport::clock::ClockAdvanceResponse,
         feldera_types::time_series::TimeSeries,
         feldera_types::time_series::SampleStatistics,
         feldera_types::suspend::SuspendError,
@@ -508,6 +518,16 @@ async fn add_cache_headers(
             // well beyond any reasonable cache lifetime but before Y2038 issues.
             header::HeaderValue::from_static("Thu, 31 Dec 2037 23:55:55 GMT"),
         );
+        // SvelteKit emits `<script type="module" crossorigin>` for module
+        // entries, putting the same-origin fetch into CORS mode. Without an
+        // ACAO header Firefox refuses to serve the response from cache on
+        // subsequent CORS-mode requests, even though the script executes.
+        // `*` (no credentials, no `Vary: Origin`) satisfies the CORS check
+        // for these public hashed assets and unblocks the disk cache.
+        res.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            header::HeaderValue::from_static("*"),
+        );
     } else if path.ends_with(".js")
         || path.ends_with(".css")
         || path.ends_with(".woff2")
@@ -524,19 +544,83 @@ async fn add_cache_headers(
     Ok(res)
 }
 
-// The scope for all unauthenticated API endpoints
-fn public_scope() -> Scope {
+/// Build the App that `run()` serves. Extracted as a free function so tests
+/// can drive the exact same wrap/service composition that ships in production
+/// rather than a hand-rolled stand-in. The caller chains `.app_data(...)` for
+/// `ServerState` and the awc client; tests that don't need handler success
+/// can skip those.
+fn build_app(
+    api_config: &ApiServerConfig,
+    auth_configuration: &Option<crate::auth::AuthConfiguration>,
+) -> App<
+    impl actix_web::dev::ServiceFactory<
+        actix_web::dev::ServiceRequest,
+        Config = (),
+        Response = actix_web::dev::ServiceResponse<impl MessageBody>,
+        Error = actix_web::Error,
+        InitError = (),
+    >,
+> {
+    let cors = api_config.cors();
+    let app = App::new()
+        .wrap_fn(|req, srv| {
+            let log_level = if req.method() == Method::GET && req.path() == "/healthz" {
+                Level::TRACE
+            } else {
+                Level::DEBUG
+            };
+            log_with_level!(log_level, "Request: {} {}", req.method(), req.path());
+            srv.call(req).map(log_response)
+        })
+        .wrap(middleware::Compress::default())
+        .wrap(observability::actix_middleware());
+
+    let app = match auth_configuration {
+        Some(auth_configuration) => {
+            let auth_middleware = HttpAuthentication::with_fn(crate::auth::auth_validator);
+            app.app_data(auth_configuration.clone())
+                .service(api_scope().wrap(auth_middleware).wrap(cors))
+        }
+        None => app.service(
+            api_scope()
+                .wrap_fn(|req, srv| {
+                    let req = crate::auth::tag_with_default_tenant_id(req);
+                    srv.call(req)
+                })
+                .wrap(cors),
+        ),
+    };
+
+    // `public_scope` MUST be the last `.service()` registered: it contains an
+    // empty-prefix sub-scope (the catch-all that serves the bundled
+    // web-console static files) that would shadow any service registered
+    // after it. The `public_scope_shadows_anything_registered_after_it` test
+    // pins this contract.
+    app.service(public_scope(api_config))
+}
+
+// Unauthenticated public endpoints and static UI assets. CORS is scoped to
+// `/config/*` only — it's the unauthenticated API surface that browser clients
+// may need to reach cross-origin. Every other route here is same-origin in practice
+// (swagger UI, healthz monitoring, static bundle), and keeping CORS off them
+// is what allows Firefox to honor `Cache-Control: immutable` on the bundle
+// (no `Vary: Origin`, no `Access-Control-Allow-Credentials`).
+//
+// Must be registered LAST in the App: the inner empty-prefix scope acts as the
+// SPA fallback and would otherwise shadow other top-level scopes.
+fn public_scope(api_config: &ApiServerConfig) -> Scope {
     let openapi = ApiDoc::openapi();
 
-    // Leave this as an empty prefix to load the UI by default. When constructing an
-    // app, always attach other scopes without empty prefixes before this one,
-    // or route resolution does not work correctly.
     web::scope("")
-        .service(endpoints::config::get_config_authentication)
+        .service(
+            web::scope("/config")
+                .wrap(api_config.cors())
+                .service(endpoints::config::get_config_authentication),
+        )
         .service(SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-doc/openapi.json", openapi))
         .service(healthz)
         .service(
-            web::scope("") // Nested scope: also matches "/"
+            web::scope("")
                 .wrap(middleware::from_fn(add_cache_headers))
                 .service(ResourceFiles::new("/", generate()).resolve_not_found_to_root()),
         )
@@ -560,6 +644,8 @@ fn api_scope() -> Scope {
         .service(endpoints::pipeline_management::post_pipeline_dismiss_error)
         .service(endpoints::pipeline_management::post_pipeline_clear)
         .service(endpoints::pipeline_management::get_pipeline_logs)
+        .service(endpoints::pipeline_management::pipeline_events::list_pipeline_events)
+        .service(endpoints::pipeline_management::pipeline_events::get_pipeline_event)
         // Pipeline interaction endpoints
         .service(endpoints::pipeline_interaction::http_input)
         .service(endpoints::pipeline_interaction::http_output)
@@ -575,8 +661,6 @@ fn api_scope() -> Scope {
         .service(endpoints::pipeline_interaction::post_pipeline_input_connector_action)
         .service(endpoints::pipeline_interaction::get_pipeline_input_connector_status)
         .service(endpoints::pipeline_interaction::get_pipeline_output_connector_status)
-        .service(endpoints::pipeline_interaction::post_pipeline_output_connector_reset)
-        .service(endpoints::pipeline_interaction::reset_status)
         .service(endpoints::pipeline_interaction::post_pipeline_output_connector_command)
         .service(endpoints::pipeline_interaction::get_pipeline_stats)
         .service(endpoints::pipeline_interaction::get_pipeline_metrics)
@@ -590,11 +674,13 @@ fn api_scope() -> Scope {
         .service(endpoints::pipeline_interaction::start_samply_profile)
         .service(endpoints::pipeline_interaction::support_bundle::get_pipeline_support_bundle)
         .service(endpoints::pipeline_interaction::post_pipeline_rebalance)
+        .service(endpoints::pipeline_interaction::post_pipeline_start_compaction)
         .service(endpoints::pipeline_interaction::pipeline_adhoc_sql)
         .service(endpoints::pipeline_interaction::completion_token)
         .service(endpoints::pipeline_interaction::completion_status)
         .service(endpoints::pipeline_interaction::start_transaction)
         .service(endpoints::pipeline_interaction::commit_transaction)
+        .service(endpoints::pipeline_interaction::clock_advance)
         // API keys endpoints
         .service(endpoints::api_key::list_api_keys)
         .service(endpoints::api_key::get_api_key)
@@ -754,87 +840,31 @@ pub async fn run(
             }
         }
     };
-    let server = match auth_configuration {
-        // We instantiate an awc::Client that can be used if the api-server needs to
-        // make outgoing calls. This object is not meant to have more than one instance
-        // per thread (otherwise, it causes high resource pressure on both CPU and fds).
-        Some(auth_configuration) => {
-            let common_config_cloned = common_config.clone();
-            let api_config = api_config.clone();
-            let state = state.clone();
-            let server = HttpServer::new(move || {
-                let auth_middleware = HttpAuthentication::with_fn(crate::auth::auth_validator);
-                let client = WebData::new(common_config_cloned.awc_client());
-                App::new()
-                    .app_data(state.clone())
-                    .app_data(auth_configuration.clone())
-                    .app_data(client)
-                    .wrap_fn(|req, srv| {
-                        let log_level = if req.method() == Method::GET && req.path() == "/healthz" {
-                            Level::TRACE
-                        } else {
-                            Level::DEBUG
-                        };
+    // We instantiate an awc::Client that can be used if the api-server needs to
+    // make outgoing calls. This object is not meant to have more than one instance
+    // per thread (otherwise, it causes high resource pressure on both CPU and fds).
+    let common_config_cloned = common_config.clone();
+    let api_config_cloned = api_config.clone();
+    let state_cloned = state.clone();
+    let server = HttpServer::new(move || {
+        let client = WebData::new(common_config_cloned.awc_client());
+        build_app(&api_config_cloned, &auth_configuration)
+            .app_data(state_cloned.clone())
+            .app_data(client)
+    })
+    .workers(common_config.http_workers)
+    .worker_max_blocking_threads(std::cmp::max(512 / common_config.http_workers, 1));
 
-                        log_with_level!(log_level, "Request: {} {}", req.method(), req.path());
-                        srv.call(req).map(log_response)
-                    })
-                    .wrap(middleware::Compress::default())
-                    .wrap(api_config.cors())
-                    .wrap(observability::actix_middleware())
-                    .service(api_scope().wrap(auth_middleware))
-                    .service(public_scope())
-            })
-            .workers(common_config.http_workers)
-            .worker_max_blocking_threads(std::cmp::max(512 / common_config.http_workers, 1));
-            if let Some(server_config) = common_config.https_server_config() {
-                server
-                    .listen_rustls_0_23(listener, server_config)
-                    .expect("API HTTPS server unable to listen")
-                    .run()
-            } else {
-                server
-                    .listen(listener)
-                    .expect("API HTTP server unable to listen")
-                    .run()
-            }
-        }
-        None => {
-            let common_config_cloned = common_config.clone();
-            let api_config = api_config.clone();
-            let state = state.clone();
-            let server = HttpServer::new(move || {
-                let client = WebData::new(common_config_cloned.awc_client());
-                App::new()
-                    .app_data(state.clone())
-                    .app_data(client)
-                    .wrap_fn(|req, srv| {
-                        trace!("Request: {} {}", req.method(), req.path());
-                        srv.call(req).map(log_response)
-                    })
-                    .wrap(middleware::Compress::default())
-                    .wrap(api_config.cors())
-                    .wrap(observability::actix_middleware())
-                    .service(api_scope().wrap_fn(|req, srv| {
-                        let req = crate::auth::tag_with_default_tenant_id(req);
-                        srv.call(req)
-                    }))
-                    .service(public_scope())
-            })
-            .workers(common_config.http_workers)
-            .worker_max_blocking_threads(std::cmp::max(512 / common_config.http_workers, 1));
-            if let Some(server_config) = common_config.https_server_config() {
-                server
-                    .listen_rustls_0_23(listener, server_config)
-                    .expect("API HTTPS server unable to listen")
-                    .run()
-            } else {
-                server
-                    .listen(listener)
-                    .expect("API HTTP server unable to listen")
-                    .run()
-            }
-        }
+    let server = if let Some(server_config) = common_config.https_server_config() {
+        server
+            .listen_rustls_0_23(listener, server_config)
+            .expect("API HTTPS server unable to listen")
+            .run()
+    } else {
+        server
+            .listen(listener)
+            .expect("API HTTP server unable to listen")
+            .run()
     };
     info!(
         "API {} server: ready on port {} ({} workers)",
@@ -983,4 +1013,298 @@ Version: {} v{}{}
 async fn healthz(state: WebData<ServerState>) -> Result<HttpResponse, ManagerError> {
     let probe = state.probe.lock().await;
     Ok(probe.as_http_response())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests covering the static-asset caching middleware and the CORS surface
+    //! of the App factory.
+    use super::*;
+    use actix_web::http::Method;
+    use actix_web::test;
+
+    /// Content-hashed bundle paths get year-long immutable caching plus
+    /// `ACAO: *` so SvelteKit's `crossorigin` script loads can be reused
+    /// from cache.
+    #[actix_web::test]
+    async fn cache_headers_immutable_path_sets_long_lived_cache_and_acao() {
+        // Drives the request through the full App that `run()` builds, so we
+        // verify both the middleware logic *and* that it's wrapped on the
+        // right scope. ResourceFiles will 404 since no bundle is embedded in
+        // the test build, but `add_cache_headers` still runs on the response
+        // and the assertions are against headers, not body.
+        let cfg = ApiServerConfig::test_config();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+        let req = test::TestRequest::get()
+            .uri("/_app/immutable/bundle.abc123.js")
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(
+            res.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable",
+        );
+        assert_eq!(
+            res.headers().get(header::EXPIRES).unwrap(),
+            "Thu, 31 Dec 2037 23:55:55 GMT",
+        );
+        // The ACAO is what unblocks Firefox caching of the static JS bundle (consumed in
+        // CORS mode because of SvelteKit's `<script type="module" crossorigin>`).
+        assert_eq!(
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*",
+        );
+    }
+
+    /// Non-hashed static assets (favicons, root-level images) get a 24h
+    /// cache and nothing else — no ACAO leak from the immutable branch.
+    /// Drives the production App so that "wiring removed" (someone deletes
+    /// the `add_cache_headers` wrap from `public_scope`'s static sub-scope)
+    /// fails this test alongside the immutable-branch test, even if the
+    /// middleware function's logic remains correct in isolation.
+    #[actix_web::test]
+    async fn cache_headers_short_cache_for_other_static_assets() {
+        let cfg = ApiServerConfig::test_config();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+        let req = test::TestRequest::get().uri("/favicon.png").to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(
+            res.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=86400",
+        );
+        // Only the immutable branch emits ACAO/EXPIRES.
+        assert!(res
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+        assert!(res.headers().get(header::EXPIRES).is_none());
+    }
+
+    // -------- CORS surface integration tests --------
+    //
+    // All integration tests below use `build_app(&cfg, &None)` — the same
+    // function `run()` calls — so any future regression in the wrap/service
+    // composition shows up here. Tests skip `app_data(state)` because the
+    // assertions are about response *headers*, not handler success: requests
+    // either flow through actix-cors's preflight handler (no inner handler
+    // invoked) or 404 from a scope/ResourceFiles before reaching state-bound
+    // handlers.
+
+    /// Regression test for Firefox refusing to cache the JS bundle.
+    ///
+    /// Firefox will not cache a static response if it carries the
+    /// credentialed-CORS headers `Vary: Origin` and
+    /// `Access-Control-Allow-Credentials: true`. The fix was to keep the
+    /// static asset path out of the CORS wrap; this test validates that.
+    ///
+    /// Sends a request with an `Origin` header (which would normally trigger
+    /// `actix-cors` to add credentialed headers if it were wrapping this
+    /// path) and checks the response: it must not have `Vary: Origin` or
+    /// `Access-Control-Allow-Credentials`, and it must have `ACAO: *` from
+    /// `add_cache_headers`. If a future change wraps the static scope with
+    /// `actix-cors` again, this test fails.
+    #[actix_web::test]
+    async fn static_immutable_has_no_credentialed_cors_headers() {
+        // test_config() leaves dev_mode=false, so .cors() returns the
+        // credentialed variant — exactly the variant that *would* poison
+        // Firefox caching if applied to /_app/immutable/.
+        let cfg = ApiServerConfig::test_config();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+
+        let req = test::TestRequest::get()
+            .uri("/_app/immutable/bundle.abc123.js")
+            .insert_header((header::ORIGIN, "http://example.com"))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+
+        assert!(
+            res.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).is_none(),
+            "static asset leaked Access-Control-Allow-Credentials — actix-cors regressed onto the static scope",
+        );
+        if let Some(vary) = res.headers().get(header::VARY) {
+            let vary = vary.to_str().unwrap_or("");
+            assert!(
+                !vary.to_ascii_lowercase().contains("origin"),
+                "static asset response has `Vary: {vary}` containing Origin — Firefox will refuse to cache the bundle",
+            );
+        }
+        // The bundle-fix ACAO must still be there for CORS-mode script reuse.
+        assert_eq!(
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*",
+        );
+    }
+
+    /// `/config/authentication` is the one unauthenticated endpoint
+    /// that must be reachable cross-origin (before any OIDC token is issued).
+    /// Verifies CORS preflight succeeds with credentialed CORS.
+    #[actix_web::test]
+    async fn config_authentication_preflight_returns_credentialed_cors() {
+        let cfg = ApiServerConfig::test_config();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+
+        let req = test::TestRequest::default()
+            .method(Method::OPTIONS)
+            .uri("/config/authentication")
+            .insert_header((header::ORIGIN, "http://example.com"))
+            .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+
+        assert!(
+            res.status().is_success(),
+            "/config/authentication preflight returned {} — dev console OIDC bootstrap will fail",
+            res.status(),
+        );
+        assert_eq!(
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .map(|h| h.to_str().unwrap_or("")),
+            Some("true"),
+            "/config/authentication lost credentialed CORS",
+        );
+        assert_eq!(
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|h| h.to_str().unwrap_or("")),
+            Some("http://example.com"),
+        );
+    }
+
+    /// `/v0/*` is the auth-bearing API surface consumed by external SDKs in
+    /// browsers. CORS preflight must succeed with credentialed CORS or those
+    /// clients break.
+    #[actix_web::test]
+    async fn v0_preflight_returns_credentialed_cors() {
+        let cfg = ApiServerConfig::test_config();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+
+        let req = test::TestRequest::default()
+            .method(Method::OPTIONS)
+            .uri("/v0/pipelines")
+            .insert_header((header::ORIGIN, "http://example.com"))
+            .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+
+        assert!(
+            res.status().is_success(),
+            "/v0/* preflight returned {} — external SDK clients will be blocked",
+            res.status(),
+        );
+        assert_eq!(
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .map(|h| h.to_str().unwrap_or("")),
+            Some("true"),
+            "/v0/* lost credentialed CORS",
+        );
+        // Credentialed CORS *must* echo the origin; `*` paired with
+        // `ACAC: true` is rejected by browsers per the fetch spec.
+        assert_eq!(
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|h| h.to_str().unwrap_or("")),
+            Some("http://example.com"),
+        );
+    }
+
+    /// Guards the static-asset middleware's blast radius: GET responses on
+    /// the credentialed-CORS routes (`/v0/*`, `/config/authentication`) must
+    /// never carry the static-only `ACAO: *` or `Cache-Control: immutable`.
+    /// If either leaks, the spec-incompatible `ACAO: *` + `ACAC: true` combo
+    /// would make browsers reject every API response.
+    #[actix_web::test]
+    async fn api_endpoints_dont_get_static_asset_headers() {
+        let cfg = ApiServerConfig::test_config();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+
+        // Sweeps representative routes across every code path that could
+        // plausibly leak static-asset headers: api_scope 404s, api_scope real
+        // handlers (which 500 on `WebData<ServerState>` extraction since this
+        // test skips `app_data` — `actix-cors` still adds headers on the
+        // response), api_scope param routes, the cors-wrapped `/config`
+        // sub-scope, and the unwrapped public routes (`/healthz`, swagger).
+        // `/config/authentication` works through its real handler because
+        // `auth_provider = None` in test_config returns early without state.
+        for uri in [
+            "/v0/nonexistent",
+            "/v0/pipelines",
+            "/v0/pipelines/foo",
+            "/v0/pipelines/foo/stats",
+            "/v0/pipelines/foo/start",
+            "/v0/api_keys",
+            "/v0/api_keys/some_key",
+            "/v0/config",
+            "/v0/config/demos",
+            "/v0/config/session",
+            "/v0/cluster/events",
+            "/v0/metrics",
+            "/v0/cluster_healthz",
+            "/config/authentication",
+            "/healthz",
+            "/swagger-ui/index.html",
+        ] {
+            let req = test::TestRequest::get()
+                .uri(uri)
+                .insert_header((header::ORIGIN, "http://example.com"))
+                .to_request();
+            let res = test::call_service(&app, req).await;
+
+            assert_ne!(
+                res.headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .map(|h| h.to_str().unwrap_or("")),
+                Some("*"),
+                "{uri} returned ACAO `*` — combined with ACAC `true` browsers will reject every API response",
+            );
+            let cache_control = res
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                !cache_control.contains("immutable"),
+                "{uri} returned `Cache-Control: {cache_control}` — static-asset middleware leaked onto an API route",
+            );
+            assert!(
+                res.headers().get(header::EXPIRES).is_none(),
+                "{uri} returned an Expires header — static-asset middleware leaked onto an API route",
+            );
+        }
+    }
+
+    /// Pins the catch-all behavior of `public_scope`'s inner empty-prefix
+    /// scope — the SPA fallback that motivates the "register `public_scope` last"
+    /// rule in `run()`. If this fails, the catch-all has been weakened
+    /// (prefix narrowed, fallback service removed, `resolve_not_found_to_root`
+    /// dropped, etc.) and any service registered after `public_scope` will
+    /// silently become reachable instead of being shadowed.
+    #[actix_web::test]
+    async fn public_scope_shadows_anything_registered_after_it() {
+        // Drives `build_app` (the production factory) and chains an extra
+        // sentinel route onto it — exactly mirroring the shape of a
+        // misregistration in `run()`, where someone might add `.service(...)`
+        // after the `build_app(...)` call.
+        let cfg = ApiServerConfig::test_config();
+        let app = test::init_service(build_app(&cfg, &None).route(
+            "/sentinel-must-be-shadowed",
+            web::get().to(|| async { HttpResponse::Ok().body("LEAKED") }),
+        ))
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/sentinel-must-be-shadowed")
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        let body = test::read_body(res).await;
+        assert_ne!(
+            &body[..],
+            b"LEAKED",
+            "a route registered after build_app() was reached — public_scope's SPA catch-all must shadow it",
+        );
+    }
 }

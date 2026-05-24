@@ -89,7 +89,7 @@ use utoipa::ToSchema;
 
 /// The number of the most recent errors stored for each endpoint as part of the endpoint status.
 /// There are separate counters for parse and transport errors and for every tag.
-const MAX_CONNECTOR_ERRORS: usize = 100;
+pub(crate) const MAX_CONNECTOR_ERRORS: usize = 100;
 
 /// Completion token.
 ///
@@ -452,6 +452,12 @@ pub struct ControllerStatus {
     /// Watch channel for notifying subscribers about [Completion] updates.
     pub completion_notifier: watch::Sender<Completion>,
 
+    /// Watch channel for notifying input adapters when a durable checkpoint
+    /// completes.  Carries the checkpointed step count (same semantics as
+    /// `total_completed_steps`: value `n` means steps `0..n` are durable).
+    /// Only fired when fault tolerance is enabled.
+    pub checkpoint_notifier: watch::Sender<u64>,
+
     /// Input endpoint configs and metrics.
     pub(crate) inputs: InputsStatus,
 
@@ -469,6 +475,10 @@ pub struct ControllerStatusContext {
     pub transaction_info: TransactionInfo,
     pub memory_pressure: MemoryPressure,
     pub memory_pressure_epoch: u64,
+    /// When `true`, per-endpoint error messages are serialized alongside
+    /// the counters. Set by the support-bundle collector via the
+    /// `?include_connector_errors=true` query parameter on `/stats`.
+    pub include_connector_errors: bool,
 }
 
 impl ControllerStatus {
@@ -480,6 +490,7 @@ impl ControllerStatus {
     ) -> Self {
         let (time_series_notifier, _) = broadcast::channel(1024); // Buffer for up to 1024 time series updates
         let (completion_notifier, _) = watch::channel(Completion::default());
+        let (checkpoint_notifier, _) = watch::channel(0u64);
         Self {
             pipeline_config,
             global_metrics: GlobalControllerMetrics::new(
@@ -490,6 +501,7 @@ impl ControllerStatus {
             time_series: Mutex::new(VecDeque::with_capacity(60)),
             time_series_notifier,
             completion_notifier,
+            checkpoint_notifier,
             inputs: RwLock::new(BTreeMap::new()),
             outputs: RwLock::new(BTreeMap::new()),
         }
@@ -804,12 +816,16 @@ impl ControllerStatus {
     /// Must be invoked any time this metric can change, i.e., after every output
     /// produced by an output connector as well as after each step.
     ///
+    /// The `transaction_state` parameter indicates the state of the current transaction when the
+    /// function is invoked after a step. Otherwise, if it is invoked by an output connector, it is None.
+    ///
     /// Computes `total_completed_records` as the minimum `total_processed_input_records` across
     /// all output connectors. In case there are no output connectors attached to the pipeline,
-    /// returns `total_processed_records`.
+    /// and the transaction state is None, it returns `total_processed_records`. Otherwise, it there
+    /// is currently a transaction in progress, it returns `total_completed_records`.
     ///
     /// Also updates watermark trackers in input endpoints.
-    pub fn update_total_completed_records(&self) {
+    pub fn update_total_completed_records(&self, transaction_state: Option<TransactionState>) {
         // Compute new `total_completed_records` atomically, protected by the output status lock.
         // However we don't want to call `watermarks_update_completed` while holding the lock, as that
         // will take the input status lock. This is not necessarily a bug, but it will complicate
@@ -821,8 +837,19 @@ impl ControllerStatus {
 
         let output_status = self.output_status();
 
-        let mut total_completed_records = self.global_metrics.num_total_processed_records();
-        let mut total_completed_steps = self.global_metrics.total_initiated_steps();
+        let (mut total_completed_records, mut total_completed_steps) =
+            if transaction_state == Some(TransactionState::None) || transaction_state.is_none() {
+                (
+                    self.num_total_processed_records(),
+                    self.global_metrics.total_initiated_steps(),
+                )
+            } else {
+                (
+                    self.num_total_completed_records(),
+                    self.global_metrics.total_completed_steps(),
+                )
+            };
+
         for output_ep in output_status.values() {
             total_completed_records =
                 total_completed_records.min(output_ep.num_total_processed_input_records());
@@ -855,6 +882,21 @@ impl ControllerStatus {
                 }
             });
         }
+    }
+
+    /// Notify input adapters that a checkpoint covering `step` steps has
+    /// completed.  Wakes any watchers (e.g. the Postgres CDC connector when
+    /// fault tolerance is enabled) that are deferring slot advancement until
+    /// a durable checkpoint exists.
+    pub fn notify_checkpoint(&self, step: Step) {
+        self.checkpoint_notifier.send_if_modified(|current| {
+            if *current < step {
+                *current = step;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Notify all watermark trackers about a new value for `total_completed_records`.
@@ -1081,7 +1123,7 @@ impl ControllerStatus {
                 circuit_thread_unparker.unpark();
             }
         };
-        self.update_total_completed_records();
+        self.update_total_completed_records(None);
     }
 
     pub fn update_output_memory(&self, endpoint_id: EndpointId, memory: usize) {
@@ -1097,7 +1139,7 @@ impl ControllerStatus {
         if let Some(endpoint_stats) = self.output_status().get(&endpoint_id) {
             endpoint_stats.output_buffered_batches(processed);
         }
-        self.update_total_completed_records();
+        self.update_total_completed_records(None);
     }
 
     pub fn output_buffer(&self, endpoint_id: EndpointId, num_bytes: usize, num_records: usize) {
@@ -1189,14 +1231,7 @@ impl ControllerStatus {
         // All received records have been processed by the circuit.
         let total_input_records = self.num_total_input_records();
 
-        if self.num_total_processed_records() != total_input_records {
-            return false;
-        }
-
-        // Outputs have been pushed to their respective transport endpoints.
-        if !self.output_status().values().all(|endpoint_stats| {
-            endpoint_stats.num_total_processed_input_records() == total_input_records
-        }) {
+        if self.num_total_completed_records() != total_input_records {
             return false;
         }
 
@@ -1327,7 +1362,7 @@ impl ControllerStatus {
         let mut inputs: Vec<_> = self
             .input_status()
             .values()
-            .map(|input| input.to_api_type(false))
+            .map(|input| input.to_api_type(ctx.include_connector_errors))
             .collect();
         inputs.sort_by(|ep1, ep2| ep1.endpoint_name.cmp(&ep2.endpoint_name));
 
@@ -1335,7 +1370,7 @@ impl ControllerStatus {
         let mut outputs: Vec<_> = self
             .output_status()
             .values()
-            .map(|output| output.to_api_type(false))
+            .map(|output| output.to_api_type(ctx.include_connector_errors))
             .collect();
         outputs.sort_by(|ep1, ep2| ep1.endpoint_name.cmp(&ep2.endpoint_name));
 
@@ -2007,6 +2042,15 @@ impl InputEndpointStatus {
         let paused_by_user =
             config.connector_config.paused || config.connector_config.start_after.is_some();
 
+        // When resuming from a checkpoint, restore the recent error messages
+        // alongside the counters.
+        let transport_errors = initial_statistics
+            .map(|s| ConnectorErrorList::from_api_type(s.transport_errors.clone()))
+            .unwrap_or_default();
+        let parse_errors = initial_statistics
+            .map(|s| ConnectorErrorList::from_api_type(s.parse_errors.clone()))
+            .unwrap_or_default();
+
         Self {
             endpoint_name: endpoint_name.to_string(),
             config,
@@ -2015,8 +2059,8 @@ impl InputEndpointStatus {
                     initial_statistics.into()
                 }),
             fatal_error: Mutex::new(None),
-            transport_errors: Mutex::new(ConnectorErrorList::new()),
-            parse_errors: Mutex::new(ConnectorErrorList::new()),
+            transport_errors: Mutex::new(transport_errors),
+            parse_errors: Mutex::new(parse_errors),
             health: Mutex::new(None),
             progress: Mutex::new(None),
             paused: AtomicBool::new(paused_by_user),
@@ -2138,16 +2182,18 @@ impl InputEndpointStatus {
     ) {
         let num_records = step_results.amt.records as u64;
         let num_bytes = step_results.amt.bytes as u64;
-        Event::new("input")
-            .with_category("Step")
-            .with_tooltip(|| {
-                format!(
-                    "{} submitted {num_records} records ({} bytes) for step {total_initiated_steps}",
-                    &self.endpoint_name,
-                    HumanBytes::from(num_bytes)
-                )
-            })
-            .record();
+        if num_records > 0 {
+            Event::new("input")
+                .with_category("Step")
+                .with_tooltip(|| {
+                    format!(
+                        "{} submitted {num_records} records ({} bytes) for step {total_initiated_steps}",
+                        &self.endpoint_name,
+                        HumanBytes::from(num_bytes)
+                    )
+                })
+                .record();
+        }
         *self.progress.lock().unwrap() = Some(step_results);
         self.metrics
             .buffered_records
@@ -2421,6 +2467,45 @@ impl ConnectorErrorList {
         errors.sort_by_key(|error| error.index);
         errors
     }
+
+    /// Reconstruct a list from the flat representation produced by
+    /// [`Self::to_api_type`]. Used when restoring from a checkpoint.
+    ///
+    /// Restored errors keep their pre-restart `index`; the sequence
+    /// counter itself lives on [`InputEndpointMetrics`] /
+    /// [`OutputEndpointMetrics`] and is restored separately, so new
+    /// errors resume numbering from `counter + 1` (see
+    /// `InputEndpointStatus::parse_error` and
+    /// `OutputEndpointStatus::encode_error` / `transport_error`). Do not
+    /// renumber on restore.
+    ///
+    /// The per-tag [`MAX_CONNECTOR_ERRORS`] bound is re-enforced so that
+    /// a malformed checkpoint cannot make a list grow unbounded. If the
+    /// input exceeds the bound for any tag, the excess oldest entries
+    /// are dropped and a warning is logged.
+    pub fn from_api_type(errors: Vec<ConnectorError>) -> Self {
+        let mut list = Self::new();
+        let mut dropped: usize = 0;
+        for error in errors {
+            let entry: &mut VecDeque<ConnectorError> =
+                list.errors.entry(error.tag.clone()).or_default();
+            entry.push_back(error);
+            if entry.len() > MAX_CONNECTOR_ERRORS {
+                entry.pop_front();
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            warn!(
+                "restored connector error list exceeded per-tag cap of \
+                 {MAX_CONNECTOR_ERRORS}; dropped {dropped} oldest \
+                 entr{} — checkpoint may be malformed or written by a \
+                 build with a higher cap",
+                if dropped == 1 { "y" } else { "ies" }
+            );
+        }
+        list
+    }
 }
 
 /// Output endpoint status information.
@@ -2507,13 +2592,21 @@ impl OutputEndpointStatus {
         total_processed_records: u64,
         initial_statistics: Option<&CheckpointOutputEndpointMetrics>,
     ) -> Self {
+        // error lists are restored from the checkpoint if present, empty otherwise
+        let encode_errors = initial_statistics
+            .map(|s| ConnectorErrorList::from_api_type(s.encode_errors.clone()))
+            .unwrap_or_default();
+        let transport_errors = initial_statistics
+            .map(|s| ConnectorErrorList::from_api_type(s.transport_errors.clone()))
+            .unwrap_or_default();
+
         Self {
             endpoint_name: endpoint_name.to_string(),
             config: config.clone(),
             metrics: OutputEndpointMetrics::new(total_processed_records, initial_statistics),
             fatal_error: Mutex::new(None),
-            encode_errors: Mutex::new(ConnectorErrorList::new()),
-            transport_errors: Mutex::new(ConnectorErrorList::new()),
+            encode_errors: Mutex::new(encode_errors),
+            transport_errors: Mutex::new(transport_errors),
             health: Mutex::new(None),
         }
     }

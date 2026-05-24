@@ -1,13 +1,18 @@
 import {
   type CombinedDesiredStatus as _CombinedDesiredStatus,
   type CombinedStatus as _CombinedStatus,
+  checkpointPipeline as _checkpointPipeline,
   deleteApiKey as _deleteApiKey,
   deletePipeline as _deletePipeline,
+  getCheckpointStatus as _getCheckpointStatus,
+  getCheckpointSyncStatus as _getCheckpointSyncStatus,
+  getCheckpoints as _getCheckpoints,
   getClusterEvent as _getClusterEvent,
   getConfig as _getConfig,
   getConfigSession as _getConfigSession,
   getPipeline as _getPipeline,
   getPipelineDataflowGraph as _getPipelineDataflowGraph,
+  getPipelineEvent as _getPipelineEvent,
   getPipelineInputConnectorStatus as _getPipelineInputConnectorStatus,
   getPipelineOutputConnectorStatus as _getPipelineOutputConnectorStatus,
   getPipelineStats as _getPipelineStats,
@@ -17,6 +22,10 @@ import {
   postPipeline as _postPipeline,
   postUpdateRuntime as _postUpdateRuntime,
   putPipeline as _putPipeline,
+  syncCheckpoint as _syncCheckpoint,
+  type CheckpointMetadata,
+  type CheckpointResponse,
+  type CheckpointStatus,
   type ControllerStatus,
   type ErrorResponse,
   type GetPipelineSupportBundleData,
@@ -25,6 +34,7 @@ import {
   httpInput,
   listApiKeys,
   listClusterEvents,
+  listPipelineEvents,
   listPipelines,
   type PipelineSelectedInfo,
   type PostPutPipeline,
@@ -41,6 +51,11 @@ import {
 } from '$lib/services/manager'
 
 export type {
+  CheckpointActivity,
+  CheckpointFailure,
+  CheckpointMetadata,
+  CheckpointResponse,
+  CheckpointStatus,
   InputEndpointConfig,
   InputEndpointStatus,
   OutputEndpointConfig,
@@ -75,7 +90,7 @@ export type ExtendedPipelineDescrNoCode = Omit<ExtendedPipelineDescr, 'program_c
 
 export type CompilerOutput = ReturnType<typeof toCompilerOutput>
 
-export type FetchOptions = { fetch?: typeof globalThis.fetch }
+export type FetchOptions = { fetch?: typeof globalThis.fetch; signal?: AbortSignal }
 
 const toCompilerOutput = (programError: ProgramError | null | undefined) => {
   return {
@@ -323,37 +338,29 @@ export type PipelineThumb = ReturnType<typeof toPipelineThumb>
 export type Pipeline = ReturnType<typeof toPipeline>
 export type ExtendedPipeline = ReturnType<typeof toExtendedPipeline>
 
-type RequestResult<R, E> = Promise<
-  (
-    | {
-        data: R
-        error: undefined
-      }
-    | {
-        data: undefined
-        error: E
-      }
-  ) & {
-    request: Request
-    response: Response
-  }
->
-
-const mapResponse = <R, T, E extends { message: string }>(
-  request: RequestResult<R, E>,
+// The SDK is generated with `responseStyle: 'data'` + `throwOnError: true`
+// (see openapi-ts.config.ts), so every call resolves to bare response data on
+// success and rejects with the parsed error body on failure. The client's error
+// interceptor (see auth.ts) attaches the original Response to the rejected error.
+//
+// Without a custom `g` handler the default wraps the rejected value in an Error
+// so callers always receive a proper Error instance. Real Error subclasses (e.g.
+// TypeError for network failures, AbortError for cancellations) are re-thrown
+// as-is because they are already Error instances.
+const mapResponse = <R, T>(
+  request: Promise<R>,
   f: (v: R) => T,
-  g?: (e: E) => T
+  g?: (e: ErrorResponse & { response?: Response }) => T
 ) => {
-  return request.then((response) => {
-    if ('error' in response && response.error) {
-      if (g) {
-        return g(response.error)
-      }
-      throw new Error(response.error.message, {
-        cause: { ...response.error, response: response.response }
-      })
+  const p = request.then(f)
+  if (g) {
+    return p.catch(g)
+  }
+  return p.catch((e: unknown) => {
+    if (e instanceof Error) {
+      throw e
     }
-    return f(response.data!)
+    throw new Error((e as ErrorResponse)?.message ?? 'Request failed', { cause: e })
   })
 }
 
@@ -500,6 +507,41 @@ export const getOutputConnectorStatus = (
     (v) => v
   )
 
+export const getPipelineCheckpoints = (pipeline_name: string, options?: FetchOptions) => {
+  return mapResponse(
+    _getCheckpoints({ path: { pipeline_name }, ...options }),
+    (v) => v as unknown as CheckpointMetadata[]
+  )
+}
+
+export const checkpointPipeline = (pipeline_name: string, options?: FetchOptions) => {
+  return mapResponse(
+    _checkpointPipeline({ path: { pipeline_name }, ...options }),
+    (v) => v as CheckpointResponse
+  )
+}
+
+export const getCheckpointStatus = (pipeline_name: string, options?: FetchOptions) => {
+  return mapResponse(
+    _getCheckpointStatus({ path: { pipeline_name }, ...options }),
+    (v) => v as CheckpointStatus
+  )
+}
+
+export const syncCheckpoint = (pipeline_name: string, options?: FetchOptions) => {
+  return mapResponse(
+    _syncCheckpoint({ path: { pipeline_name }, ...options }),
+    (v) => v
+  )
+}
+
+export const getCheckpointSyncStatus = (pipeline_name: string, options?: FetchOptions) => {
+  return mapResponse(
+    _getCheckpointSyncStatus({ path: { pipeline_name }, ...options }),
+    (v) => v
+  )
+}
+
 export const deletePipeline = async (pipeline_name: string, options?: FetchOptions) => {
   await mapResponse(_deletePipeline({ path: { pipeline_name }, ...options }), (v) => v)
 }
@@ -571,6 +613,24 @@ export const getClusterEvents = () => mapResponse(listClusterEvents(), (v) => v)
 export const getClusterEvent = (eventId: string) =>
   mapResponse(
     _getClusterEvent({ path: { event_id: eventId }, query: { selector: 'all' } }),
+    (v) => v
+  )
+
+export const getPipelineEvents = (pipelineName: string) =>
+  mapResponse(
+    listPipelineEvents({
+      path: { pipeline_name: pipelineName },
+      query: { selector: 'status' }
+    }),
+    (v) => v
+  )
+
+export const getPipelineEvent = (pipelineName: string, eventId: string) =>
+  mapResponse(
+    _getPipelineEvent({
+      path: { pipeline_name: pipelineName, event_id: eventId },
+      query: { selector: 'all' }
+    }),
     (v) => v
   )
 
@@ -653,14 +713,13 @@ export const getSamplyProfile = async (
 }
 
 export const collectSamplyProfile = async (pipelineName: string, durationSeconds: number) => {
-  const result = await startSamplyProfile({
+  const data = await startSamplyProfile({
     path: { pipeline_name: pipelineName },
     query: { duration_secs: durationSeconds }
+  }).catch((error: ErrorResponse) => {
+    throw new Error(apiErrorText(error), { cause: error })
   })
-  if (!result.error) {
-    return { data: result.data }
-  }
-  throw new Error(apiErrorText(result.error), { cause: result.error })
+  return { data }
 }
 
 /**
@@ -959,6 +1018,8 @@ export const getDemos = (options?: FetchOptions) =>
       }
     })
   )
+
+export type Demo = Awaited<ReturnType<typeof getDemos>>[number]
 
 export type SupportBundleOptions = NonNullable<Required<GetPipelineSupportBundleData['query']>>
 

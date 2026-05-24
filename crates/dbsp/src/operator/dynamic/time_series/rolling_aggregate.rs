@@ -5,7 +5,7 @@ use crate::{
         Scope,
         metadata::{BatchSizeStats, INPUT_BATCHES_STATS, OUTPUT_BATCHES_STATS, OperatorMeta},
         operator_traits::Operator,
-        splitter_output_chunk_size,
+        splitter_output_chunk_size, splitter_output_first_chunk_size,
     },
     dynamic::{
         ClonableTrait, Data, DataTrait, DowncastTrait, DynDataTyped, DynOpt, DynPair, DynUnit,
@@ -664,14 +664,12 @@ impl<B> Stream<RootCircuit, B> {
         V: DataTrait + ?Sized,
     {
         let circuit = self.circuit();
-        let stream = self.dyn_shard(&factories.input_factories);
-        let stream_window = self_window.dyn_shard(&factories.input_factories);
 
         let partitioned_tree_aggregate_name =
             partition_id.map(|name| format!("{name}-tree_aggregate"));
 
         // Build the radix tree over the bounded window.
-        let tree = stream_window
+        let tree = self_window
             .partitioned_tree_aggregate::<TS, V, Acc, Out>(
                 partitioned_tree_aggregate_name.as_deref(),
                 &factories.partitioned_tree_aggregate_factories,
@@ -680,7 +678,8 @@ impl<B> Stream<RootCircuit, B> {
             .set_persistent_id(partitioned_tree_aggregate_name.as_deref())
             .dyn_accumulate_integrate_trace(&factories.radix_tree_factories);
 
-        let input_trace = stream_window.dyn_accumulate_integrate_trace(&factories.input_factories);
+        let input_trace =
+            self_window.dyn_shard_accumulate_integrate_trace(&factories.input_factories);
 
         // Truncate timestamps `< bound` in the output trace.
         let bounds = TraceBounds::new();
@@ -702,7 +701,7 @@ impl<B> Stream<RootCircuit, B> {
                         aggregator,
                     ),
                 ),
-                &stream.dyn_accumulate(&factories.input_factories),
+                &self.dyn_shard_accumulate(&factories.input_factories),
                 &input_trace,
                 &tree,
                 &feedback.delayed_trace,
@@ -889,10 +888,13 @@ where
             let mut input_trace_cursor = input_trace.unwrap().cursor();
             let mut tree_cursor = radix_tree.unwrap().cursor();
 
+            // Limit the initial capacity of the builder in case the chunk size
+            // is bigger than memory (e.g. `usize::MAX`).
+            let capacity = splitter_output_first_chunk_size();
             let mut retraction_builder =
-                O::Builder::with_capacity(&self.output_factories, chunk_size, chunk_size);
+                O::Builder::with_capacity(&self.output_factories, capacity, capacity);
             let mut insertion_builder =
-                O::Builder::with_capacity(&self.output_factories, chunk_size, chunk_size);
+                O::Builder::with_capacity(&self.output_factories, capacity, capacity);
 
             // println!("delta: {input_delta:#x?}");
             // println!("radix tree: {radix_tree:#x?}");
@@ -1212,7 +1214,7 @@ mod test {
                 let waterline: Stream<_, TypedBox<u64, DynDataTyped<u64>>> = input_by_time
                     .waterline_monotonic(|| 0, move |ts| ts.saturating_sub(lateness))
                     .transaction_delay_with_initial_value(TypedBox::new(0))
-                    .inspect(|w| println!("waterline: {w:?}"));
+                    /* .inspect(|w| println!("waterline: {w:?}"))*/;
 
                 let aggregator = <Fold<i64, i64, DefaultSemigroup<_>, _, _>>::new(
                     0i64,

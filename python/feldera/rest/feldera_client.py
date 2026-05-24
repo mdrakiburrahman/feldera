@@ -2,10 +2,13 @@ import json
 import logging
 import pathlib
 import time
+import warnings
 from decimal import Decimal
 from typing import Any, Dict, Generator, Mapping, Optional
 from urllib.parse import quote
 
+import pyarrow as pa
+import pyarrow.ipc
 import requests
 
 from feldera.enums import BootstrapPolicy, PipelineFieldSelector, PipelineStatus
@@ -15,6 +18,7 @@ from feldera.rest.config import Config
 from feldera.rest.errors import FelderaAPIError, FelderaTimeoutError
 from feldera.rest.feldera_config import FelderaConfig
 from feldera.rest.pipeline import Pipeline
+from feldera.rest.retry import RetryConfig
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,7 @@ class FelderaClient:
         timeout: Optional[float] = None,
         connection_timeout: Optional[float] = None,
         requests_verify: Optional[bool | str] = None,
+        retry_config: Optional[RetryConfig] = None,
     ) -> None:
         """
         Constructs a Feldera client.
@@ -80,6 +85,9 @@ class FelderaClient:
             By setting `FELDERA_TLS_INSECURE` to `"1"`, `"true"` or `"yes"` (all case-insensitive), the default becomes
             `False` which means to disable TLS verification by default. If both variables are set, the former takes
             priority over the latter. If neither variable is set, the default is `True`.
+        :param retry_config: (Optional) Retry behavior for transient HTTP failures
+            (408, 502, 503, 504, timeouts). The default is `RetryConfig()` — 3 retries
+            with exponential backoff starting at 2 seconds.
         """
 
         self.config = Config(
@@ -88,6 +96,7 @@ class FelderaClient:
             timeout=timeout,
             connection_timeout=connection_timeout,
             requests_verify=requests_verify,
+            retry_config=retry_config,
         )
         self.http = HttpRequests(self.config)
 
@@ -779,6 +788,42 @@ Reason: The pipeline is in a STOPPED state due to the following error:
 
         return int(resp.get("transaction_id"))
 
+    def advance_clock(
+        self,
+        pipeline_name: str,
+        delta_ms: Optional[int] = None,
+    ) -> Dict[str, int | str]:
+        """
+        Advance the externally-driven `NOW()` clock and return its new value.
+
+        Requires `dev_tweaks.now_http_driven = True` on the pipeline.  The
+        clock is forward-only.
+
+        :param pipeline_name: The name of the pipeline.
+
+        :param delta_ms: Milliseconds to add to `NOW()`.  ``0`` reads the
+            current value without moving the clock; ``None`` (the default)
+            advances by one ``clock_resolution`` (one configured tick).
+            Must be non-negative.  Non-zero values round up to the next
+            ``clock_resolution`` boundary, so a sub-resolution delta still
+            moves the clock by one full tick.
+
+        The returned ``now_ms`` is the value the worker will emit on its
+        next pipeline step; queries against materialized views may
+        observe the previous ``NOW()`` until that step completes.  Poll
+        the view if you need read-after-write semantics.
+
+        :return: A dict ``{"now_ms": <int>, "now": <RFC 3339 str>}``.
+
+        :raises FelderaAPIError: If the clock is not in http-driven mode,
+            the body is malformed, or the pipeline is not running.
+        """
+
+        return self.http.post(
+            path=f"/pipelines/{pipeline_name}/clock/advance",
+            body={"delta_ms": delta_ms},
+        )
+
     def commit_transaction(
         self,
         pipeline_name: str,
@@ -1082,6 +1127,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         pipeline_name: str,
         table_name: str,
         format: str,
+        send_snapshot: Optional[bool] = None,
         backpressure: bool = True,
         array: bool = False,
         timeout: Optional[float] = None,
@@ -1093,6 +1139,9 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         :param pipeline_name: The name of the pipeline
         :param table_name: The name of the table to listen to
         :param format: The format of the data, either "json" or "csv"
+        :param send_snapshot: When True, the connector delivers a full snapshot
+            of the materialized view before streaming incremental updates. The
+            view must be materialized. Defaults to False.
         :param backpressure: When the flag is True (the default), this method waits for the consumer to receive each
             chunk and blocks the pipeline if the consumer cannot keep up. When this flag is False, the pipeline drops
             data chunks if the consumer is not keeping up with its output. This prevents a slow consumer from slowing
@@ -1108,6 +1157,9 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             "format": format,
             "backpressure": _prepare_boolean_input(backpressure),
         }
+
+        if send_snapshot is not None:
+            params["send_snapshot"] = _prepare_boolean_input(send_snapshot)
 
         if format == "json":
             params["array"] = _prepare_boolean_input(array)
@@ -1217,18 +1269,47 @@ Reason: The pipeline is in a STOPPED state due to the following error:
                 file.write(chunk)
         file.close()
 
-    def query_as_json(
+    def query_as_arrow(
         self, pipeline_name: str, query: str
-    ) -> Generator[Mapping[str, Any], None, None]:
+    ) -> Generator[pa.RecordBatch, None, None]:
         """
-        Executes an ad-hoc query on the specified pipeline and returns the result as a generator that yields
-        rows of the query as Python dictionaries.
-        All floating-point numbers are deserialized as Decimal objects to avoid precision loss.
+        Executes an ad-hoc query on the specified pipeline and returns the result
+        as a generator that yields PyArrow RecordBatches.
+
+        Arrow IPC preserves SQL type fidelity that the JSON format cannot:
+        integers wider than 53 bits, ``MAP`` keys that are not strings, and
+        result sets where two columns share a name. Prefer this method over
+        :meth:`.query_as_json` when programmatically inspecting results.
 
         :param pipeline_name: The name of the pipeline to query.
         :param query: The SQL query to be executed.
-        :return: A generator that yields each row of the result as a Python dictionary, deserialized from JSON.
+        :return: A generator that yields each query batch as a ``pyarrow.RecordBatch``.
         """
+        params = {
+            "pipeline_name": pipeline_name,
+            "sql": query,
+            "format": "arrow_ipc",
+        }
+        resp: requests.Response = self.http.get(
+            path=f"/pipelines/{pipeline_name}/query",
+            params=params,
+            stream=True,
+        )
+
+        try:
+            with pyarrow.ipc.open_stream(resp.raw) as reader:
+                for batch in reader:
+                    yield batch
+        finally:
+            resp.close()
+
+    def _query_json_stream(
+        self, pipeline_name: str, query: str
+    ) -> Generator[Mapping[str, Any], None, None]:
+        """Internal JSON streaming used by both `query_as_json` and the
+        higher-level dict-returning APIs. Does not emit a deprecation
+        warning so callers within Feldera can keep delegating to it
+        without making user code noisy."""
         params = {
             "pipeline_name": pipeline_name,
             "sql": query,
@@ -1244,6 +1325,39 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         for chunk in resp.iter_lines(chunk_size=1024):
             if chunk:
                 yield json.loads(chunk, parse_float=Decimal)
+
+    def query_as_json(
+        self, pipeline_name: str, query: str
+    ) -> Generator[Mapping[str, Any], None, None]:
+        """
+        Executes an ad-hoc query on the specified pipeline and returns the result as a generator that yields
+        rows of the query as Python dictionaries.
+
+        Finite floating-point numbers are decoded with ``decimal.Decimal``
+        so the digits printed on the JSON line round-trip exactly. JSON
+        cannot represent ``NaN``, ``Infinity`` or ``-Infinity``; the
+        server emits those as ``null`` and they arrive here as ``None``.
+
+        .. deprecated::
+            The JSON format coerces numbers to ``f64`` (losing precision for
+            wide integers), drops ``NaN`` and infinities, cannot represent
+            SQL ``MAP`` keys that are not strings, and silently drops
+            result columns that share a name. Use
+            :meth:`.query_as_arrow` instead. See
+            https://github.com/feldera/feldera/issues/4219.
+
+        :param pipeline_name: The name of the pipeline to query.
+        :param query: The SQL query to be executed.
+        :return: A generator that yields each row of the result as a Python dictionary, deserialized from JSON.
+        """
+        warnings.warn(
+            "query_as_json is deprecated; switch to query_as_arrow for "
+            "type-faithful results. See "
+            "https://github.com/feldera/feldera/issues/4219.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        yield from self._query_json_stream(pipeline_name, query)
 
     def input_connector_stats(
         self, pipeline_name: str, table_name: str, connector_name: str
@@ -1464,5 +1578,53 @@ Reason: The pipeline is in a STOPPED state due to the following error:
     def rebalance_pipeline(self, pipeline_name: str):
         self.http.post(path=f"/pipelines/{pipeline_name}/rebalance")
 
+    def start_compaction_pipeline(self, pipeline_name: str):
+        self.http.post(path=f"/pipelines/{pipeline_name}/start_compaction")
+
     def get_checkpoints(self, pipeline_name: str):
         return self.http.get(path=f"/pipelines/{pipeline_name}/checkpoints")
+
+    def get_pipeline_events(
+        self, pipeline_name: str, *, selector: str = "status"
+    ) -> list[dict]:
+        """
+        Retrieves all pipeline events (status fields only).
+
+        :param pipeline_name: Name of the pipeline.
+        :param selector: (Optional) Limit the returned fields. Valid values: "all", "status" (default).
+
+        :returns: List of pipeline events.
+        """
+        # Selector of fields
+        if selector not in ["all", "status"]:
+            raise ValueError(
+                f'invalid selector: {selector} (must be either "all" or "status")'
+            )
+
+        # Issue request and return response
+        return self.http.get(
+            path=f"/pipelines/{quote(pipeline_name, safe='')}/events?selector={selector}"
+        )
+
+    def get_pipeline_event(
+        self, pipeline_name: str, event_id: str, *, selector: str = "status"
+    ) -> dict:
+        """
+        Retrieves a specific pipeline event.
+
+        :param pipeline_name: Name of the pipeline.
+        :param event_id: Identifier (UUID) of the event to retrieve, or `latest` for the latest event.
+        :param selector: (Optional) Limit the returned fields. Valid values: "all", "status" (default).
+
+        :returns: Event (fields limited based on selector).
+        """
+        # Selector of fields
+        if selector not in ["all", "status"]:
+            raise ValueError(
+                f'invalid selector: {selector} (must be either "all" or "status")'
+            )
+
+        # Issue request and return response
+        return self.http.get(
+            path=f"/pipelines/{quote(pipeline_name, safe='')}/events/{quote(event_id, safe='')}?selector={selector}"
+        )

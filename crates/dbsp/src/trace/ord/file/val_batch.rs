@@ -1,5 +1,7 @@
 use crate::storage::buffer_cache::CacheStats;
-use crate::storage::filter_stats::FilterStats;
+use crate::storage::file::{
+    FilterKind, FilterStats, TouchedWindowCount, TouchedWindowCounter, collect_roaring_metadata,
+};
 use crate::trace::BatchLocation;
 use crate::trace::cursor::Position;
 use crate::trace::ord::file::UnwrapStorage;
@@ -10,14 +12,14 @@ use crate::{
         Factory, LeanVec, WeightTrait, WithFactory,
     },
     storage::file::{
-        Factories as FileFactories,
+        Factories as FileFactories, FilterPlan,
         format::BatchMetadata,
         reader::{Cursor as FileCursor, Error as ReaderError, Reader},
         writer::Writer2,
     },
     trace::{
         Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor, WeightedItem,
-        ord::{batch_filter::BatchFilters, merge_batcher::MergeBatcher},
+        filter::BatchFilters, ord::merge_batcher::MergeBatcher,
     },
     utils::Tup2,
 };
@@ -325,6 +327,10 @@ where
         self.filters.stats().membership_filter
     }
 
+    fn membership_filter_kind(&self) -> FilterKind {
+        self.filters.membership_filter_kind()
+    }
+
     fn range_filter_stats(&self) -> FilterStats {
         self.filters.stats().range_filter
     }
@@ -394,8 +400,16 @@ where
         Ok(Self::from_parts(factories.clone(), file, filters))
     }
 
+    fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)> {
+        self.filters.key_bounds()
+    }
+
     fn negative_weight_count(&self) -> Option<u64> {
         None
+    }
+
+    fn touched_window_count(&self) -> TouchedWindowCount {
+        self.file.metadata().touched_window_count
     }
 }
 
@@ -693,6 +707,8 @@ where
     num_tuples: usize,
     #[size_of(skip)]
     stats: BatchMetadata,
+    #[size_of(skip)]
+    touched_window_counter: Option<TouchedWindowCounter>,
 }
 
 impl<K, V, T, R> Builder<FileValBatch<K, V, T, R>> for FileValBuilder<K, V, T, R>
@@ -703,10 +719,11 @@ where
     T: Timestamp,
     R: WeightTrait + ?Sized,
 {
-    fn with_capacity(
+    fn with_capacity_in_location(
         factories: &FileValBatchFactories<K, V, T, R>,
         key_capacity: usize,
         _value_capacity: usize,
+        _location: Option<BatchLocation>,
     ) -> Self {
         Self {
             factories: factories.clone(),
@@ -716,22 +733,69 @@ where
                 Runtime::buffer_cache,
                 &*Runtime::storage_backend().unwrap_storage(),
                 Runtime::file_writer_parameters(),
-                key_capacity,
+                FilterPlan::<K>::decide_filter(None, key_capacity),
             )
             .unwrap_storage(),
             time_diffs: factories.timediff_factory.default_box(),
             num_tuples: 0,
             stats: BatchMetadata::default(),
+            touched_window_counter: collect_roaring_metadata().then(TouchedWindowCounter::default),
         }
     }
 
-    fn done(self) -> FileValBatch<K, V, T, R> {
+    fn for_merge<'a, B, I>(
+        factories: &FileValBatchFactories<K, V, T, R>,
+        batches: I,
+        _location: Option<BatchLocation>,
+    ) -> Self
+    where
+        B: Batch<Key = K, Val = V, Time = T, R = R>,
+        I: IntoIterator<Item = &'a B> + Clone,
+    {
+        let key_capacity = batches.clone().into_iter().map(|b| b.key_count()).sum();
+        let key_filter = if collect_roaring_metadata() {
+            let filter_plan = FilterPlan::from_batches(batches.clone());
+            filter_plan.map_or_else(
+                || FilterPlan::<K>::decide_filter(None, key_capacity),
+                |filter_plan| FilterPlan::decide_filter(Some(&filter_plan), key_capacity),
+            )
+        } else {
+            FilterPlan::<K>::decide_filter(None, key_capacity)
+        };
+        Self {
+            factories: factories.clone(),
+            writer: Writer2::new(
+                &factories.factories0,
+                &factories.factories1,
+                Runtime::buffer_cache,
+                &*Runtime::storage_backend().unwrap_storage(),
+                Runtime::file_writer_parameters(),
+                key_filter,
+            )
+            .unwrap_storage(),
+            time_diffs: factories.timediff_factory.default_box(),
+            num_tuples: 0,
+            stats: BatchMetadata::default(),
+            touched_window_counter: collect_roaring_metadata().then(TouchedWindowCounter::default),
+        }
+    }
+
+    fn done(mut self) -> FileValBatch<K, V, T, R> {
+        self.stats.touched_window_count = self
+            .touched_window_counter
+            .map(TouchedWindowCounter::finish)
+            .unwrap_or_default();
         let (file, filters) = self.writer.into_reader(self.stats).unwrap_storage();
         let file = Arc::new(file);
         FileValBatch::from_parts(self.factories, file, filters)
     }
 
     fn push_key(&mut self, key: &K) {
+        if let Some(counter) = self.touched_window_counter.as_mut()
+            && !counter.push_key(key)
+        {
+            self.touched_window_counter = None;
+        }
         self.writer.write0((key, &())).unwrap_storage();
     }
 

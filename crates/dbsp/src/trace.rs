@@ -30,12 +30,14 @@ use crate::circuit::metadata::OperatorMeta;
 use crate::dynamic::{ClonableTrait, DynDataTyped, DynUnit, Weight};
 use crate::storage::buffer_cache::CacheStats;
 use crate::storage::file::SerializerInner;
+use crate::storage::file::TouchedWindowCount;
 pub use crate::storage::file::{DbspSerializer, Deserializable, Deserializer, Rkyv};
+use crate::storage::file::{FilterKind, FilterStats};
 use crate::trace::cursor::{
     DefaultPushCursor, FilteredMergeCursor, FilteredMergeCursorWithSnapshot, PushCursor,
     UnfilteredMergeCursor,
 };
-use crate::utils::IsNone;
+use crate::utils::{IsNone, SupportsRoaring};
 use crate::{dynamic::ArchivedDBData, storage::buffer_cache::FBuf};
 use cursor::CursorFactory;
 use enum_map::Enum;
@@ -45,6 +47,7 @@ use rand::{Rng, thread_rng};
 use rkyv::ser::Serializer as _;
 use size_of::SizeOf;
 use std::any::TypeId;
+use std::future::Future;
 use std::sync::Arc;
 use std::{fmt::Debug, hash::Hash};
 
@@ -52,7 +55,9 @@ pub mod cursor;
 pub mod filter;
 pub mod layers;
 pub mod ord;
+mod sampling;
 pub mod spine_async;
+pub(crate) use sampling::sample_keys_from_batches;
 pub use spine_async::{BatchReaderWithSnapshot, ListMerger, Spine, SpineSnapshot, WithSnapshot};
 
 #[cfg(test)]
@@ -70,6 +75,7 @@ pub use ord::{
     VecWSetFactories,
 };
 
+use rkyv::bytecheck;
 use rkyv::{Deserialize, archived_root};
 
 use crate::{
@@ -77,10 +83,9 @@ use crate::{
     algebra::MonoidValue,
     dynamic::{DataTrait, DynPair, DynVec, DynWeightedPairs, Erase, Factory, WeightTrait},
     storage::file::reader::Error as ReaderError,
-    storage::filter_stats::FilterStats,
 };
 pub use cursor::{Cursor, MergeCursor};
-pub use filter::{Filter, GroupFilter};
+pub use filter::{BatchFilterStats, BatchFilters, Filter, GroupFilter};
 pub use layers::Trie;
 
 /// Trait for data stored in batches.
@@ -102,6 +107,7 @@ pub trait DBData:
     + Debug
     + ArchivedDBData
     + IsNone<Inner: ArchivedDBData>
+    + SupportsRoaring
     + 'static
 {
 }
@@ -119,12 +125,14 @@ impl<T> DBData for T where
         + Debug
         + ArchivedDBData
         + IsNone<Inner: ArchivedDBData>
+        + SupportsRoaring
         + 'static
 {
 }
 
 /// A spine that is serialized to a file.
 #[derive(rkyv::Serialize, rkyv::Deserialize, rkyv::Archive)]
+#[archive_attr(derive(rkyv::CheckBytes))]
 pub(crate) struct CommittedSpine {
     pub batches: Vec<String>,
     pub merged: Vec<(String, String)>,
@@ -244,11 +252,10 @@ pub trait Trace: BatchReader {
     fn consolidate(self) -> Option<Self::Batch>;
 
     /// Introduces a batch of updates to the trace.
-    fn insert(&mut self, batch: Self::Batch);
-
-    /// Introduces a batch of updates to the trace. More efficient that cloning
-    /// a batch and calling `insert`.
-    fn insert_arc(&mut self, batch: Arc<Self::Batch>);
+    ///
+    /// If the trace has too many unmerged batches, this method will block
+    /// (asynchronously) until some of them have been merged.
+    fn insert(&mut self, batch: impl Into<Arc<Self::Batch>>) -> impl Future<Output = ()>;
 
     /// Clears the value of the "dirty" flag to `false`.
     ///
@@ -308,6 +315,8 @@ pub trait Trace: BatchReader {
 
     /// Allows the trace to report additional metadata.
     fn metadata(&self, _meta: &mut OperatorMeta) {}
+
+    fn initiate_compaction(&self);
 }
 
 /// Where a batch is stored.
@@ -473,13 +482,22 @@ where
     /// [Cursor::seek_key_exact] after the range filter.
     ///
     /// Today this is usually a Bloom filter. Batches without such a filter
-    /// should return `FilterStats::default()`.
-    fn membership_filter_stats(&self) -> FilterStats;
+    /// should return zero/default stats.
+    fn membership_filter_stats(&self) -> FilterStats {
+        FilterStats::default()
+    }
+
+    /// Filter kind for the secondary membership filter used by
+    /// [Cursor::seek_key_exact].
+    fn membership_filter_kind(&self) -> FilterKind {
+        FilterKind::None
+    }
 
     /// Statistics of the in-memory range filter used by
     /// [Cursor::seek_key_exact].
     ///
-    /// Batches without a range filter should return `FilterStats::default()`.
+    /// Returns range-filter stats. Batches without a range filter should
+    /// return zeroed range stats.
     fn range_filter_stats(&self) -> FilterStats {
         FilterStats::default()
     }
@@ -534,7 +552,6 @@ where
     /// * The output sample contains keys sorted in ascending order.
     fn sample_keys<RG>(&self, rng: &mut RG, sample_size: usize, sample: &mut DynVec<Self::Key>)
     where
-        Self::Time: PartialEq<()>,
         RG: Rng;
 
     /// Returns num_partitions-1 keys from the batch that partition the batch into num_partitions
@@ -660,6 +677,9 @@ where
     fn membership_filter_stats(&self) -> FilterStats {
         (**self).membership_filter_stats()
     }
+    fn membership_filter_kind(&self) -> FilterKind {
+        (**self).membership_filter_kind()
+    }
     fn range_filter_stats(&self) -> FilterStats {
         (**self).range_filter_stats()
     }
@@ -674,7 +694,6 @@ where
     }
     fn sample_keys<RG>(&self, rng: &mut RG, sample_size: usize, sample: &mut DynVec<Self::Key>)
     where
-        Self::Time: PartialEq<()>,
         RG: Rng,
     {
         (**self).sample_keys(rng, sample_size, sample)
@@ -878,6 +897,29 @@ where
         Err(ReaderError::Unsupported)
     }
 
+    /// Minimum and maximum keys in this batch.
+    ///
+    /// File-backed batches materialize these bounds at write time. In-memory
+    /// batches compute them from their ordered key storage. Merge builders
+    /// use these bounds to decide whether a batch span can be encoded into a
+    /// roaring bitmap.
+    ///
+    /// Returns `None` for empty batches.
+    fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)>;
+
+    /// Exact number of 16-bit roaring windows touched by the batch, relative
+    /// to the batch minimum.
+    ///
+    /// File-backed batches materialize this count at write time. In-memory
+    /// batches track it while they are built. The merge-time filter predictor
+    /// uses it together with min/max span overlap to estimate how many roaring
+    /// containers the merged batch will likely touch.
+    ///
+    /// A value of `0` means the batch cannot provide an exact count, e.g. the
+    /// key type is not roaring-compatible, the batch span does not fit in
+    /// `u32`, or the batch is empty.
+    fn touched_window_count(&self) -> TouchedWindowCount;
+
     /// The number of tuples with negative weights in the batch.
     ///
     /// This metric is used in merger heuristics. Negative weights are likely to cancel out
@@ -983,11 +1025,27 @@ where
     /// Creates an empty builder with estimated capacities for keys and
     /// key-value pairs.  Only `tuple_capacity >= key_capacity` makes sense but
     /// implementations must tolerate contradictory capacity requests.
+    ///
+    /// The caller may optionally specify a preferred `location`.  The builder
+    /// should honor it if it can, but some builders only build in one specific
+    /// location.
+    fn with_capacity_in_location(
+        factories: &Output::Factories,
+        key_capacity: usize,
+        value_capacity: usize,
+        location: Option<BatchLocation>,
+    ) -> Self;
+
+    /// Creates an empty builder with estimated capacities for keys and
+    /// key-value pairs.  Only `tuple_capacity >= key_capacity` makes sense but
+    /// implementations must tolerate contradictory capacity requests.
     fn with_capacity(
         factories: &Output::Factories,
         key_capacity: usize,
         value_capacity: usize,
-    ) -> Self;
+    ) -> Self {
+        Self::with_capacity_in_location(factories, key_capacity, value_capacity, None)
+    }
 
     /// Creates an empty builder to hold the result of merging
     /// `batches`. Optionally, `location` can specify the preferred location for
@@ -998,13 +1056,12 @@ where
         location: Option<BatchLocation>,
     ) -> Self
     where
-        B: BatchReader,
+        B: Batch<Key = Output::Key, Val = Output::Val, Time = Output::Time, R = Output::R>,
         I: IntoIterator<Item = &'a B> + Clone,
     {
-        let _ = location;
         let key_capacity = batches.clone().into_iter().map(|b| b.key_count()).sum();
         let value_capacity = batches.into_iter().map(|b| b.len()).sum();
-        Self::with_capacity(factories, key_capacity, value_capacity)
+        Self::with_capacity_in_location(factories, key_capacity, value_capacity, location)
     }
 
     /// Adds time-diff pair `(time, weight)`.

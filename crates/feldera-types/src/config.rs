@@ -13,12 +13,14 @@ use crate::transport::clock::ClockConfig;
 use crate::transport::datagen::DatagenInputConfig;
 use crate::transport::delta_table::{DeltaTableReaderConfig, DeltaTableWriterConfig};
 use crate::transport::file::{FileInputConfig, FileOutputConfig};
-use crate::transport::http::HttpInputConfig;
+use crate::transport::http::{HttpInputConfig, HttpOutputConfig};
 use crate::transport::iceberg::IcebergReaderConfig;
 use crate::transport::kafka::{KafkaInputConfig, KafkaOutputConfig};
 use crate::transport::nats::NatsInputConfig;
 use crate::transport::nexmark::NexmarkInputConfig;
-use crate::transport::postgres::{PostgresReaderConfig, PostgresWriterConfig};
+use crate::transport::postgres::{
+    PostgresCdcReaderConfig, PostgresReaderConfig, PostgresWriterConfig,
+};
 use crate::transport::pubsub::PubSubInputConfig;
 use crate::transport::redis::RedisOutputConfig;
 use crate::transport::s3::S3InputConfig;
@@ -1360,6 +1362,15 @@ pub struct InputEndpointConfig {
     pub connector_config: ConnectorConfig,
 }
 
+impl InputEndpointConfig {
+    pub fn new(stream: impl Into<Cow<'static, str>>, connector_config: ConnectorConfig) -> Self {
+        Self {
+            stream: stream.into(),
+            connector_config,
+        }
+    }
+}
+
 /// Deserialize the `start_after` property of a connector configuration.
 /// It requires a non-standard deserialization because we want to accept
 /// either a string or an array of strings.
@@ -1388,9 +1399,23 @@ where
     }
 }
 
-/// A data connector's configuration
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ConnectorConfig {
+    /// Send a full snapshot of a materialized view when the connector first
+    /// starts. Valid for output connectors only.
+    ///
+    /// When `true`, the pipeline emits the current contents of the view as the
+    /// initial batch the first time the connector runs. The view must be
+    /// materialized (declared with `CREATE MATERIALIZED VIEW`).
+    ///
+    /// The snapshot is sent exactly once per connector lifetime: it does not
+    /// fire again when the pipeline resumes from a checkpoint. Modifying the
+    /// connector configuration or invoking the reset API triggers a fresh
+    /// snapshot when the connector supports reset (e.g., Delta Lake in
+    /// `truncate` mode and Postgres).
+    #[serde(default)]
+    pub send_snapshot: bool,
+
     /// Transport endpoint configuration.
     pub transport: TransportConfig,
 
@@ -1496,6 +1521,33 @@ pub struct ConnectorConfig {
 }
 
 impl ConnectorConfig {
+    pub fn new(transport: TransportConfig, format: Option<FormatConfig>) -> Self {
+        Self {
+            send_snapshot: false,
+            transport,
+            preprocessor: None,
+            format,
+            index: None,
+            output_buffer_config: Default::default(),
+            max_batch_size: None,
+            max_worker_batch_size: None,
+            max_queued_records: default_max_queued_records(),
+            paused: false,
+            labels: Vec::new(),
+            start_after: None,
+        }
+    }
+
+    pub fn with_max_batch_size(mut self, max_batch_size: Option<u64>) -> Self {
+        self.max_batch_size = max_batch_size;
+        self
+    }
+
+    pub fn with_max_queued_records(mut self, max_queued_records: u64) -> Self {
+        self.max_queued_records = max_queued_records;
+        self
+    }
+
     /// Compare two configs modulo the `paused` field.
     ///
     /// Used to compare checkpointed and current connector configs.
@@ -1599,6 +1651,15 @@ pub struct OutputEndpointConfig {
     pub connector_config: ConnectorConfig,
 }
 
+impl OutputEndpointConfig {
+    pub fn new(stream: impl Into<Cow<'static, str>>, connector_config: ConnectorConfig) -> Self {
+        Self {
+            stream: stream.into(),
+            connector_config,
+        }
+    }
+}
+
 /// Transport-specific endpoint configuration passed to
 /// `crate::OutputTransport::new_endpoint`
 /// and `crate::InputTransport::new_endpoint`.
@@ -1619,13 +1680,14 @@ pub enum TransportConfig {
     // Prevent rust from complaining about large size difference between enum variants.
     IcebergInput(Box<IcebergReaderConfig>),
     PostgresInput(PostgresReaderConfig),
+    PostgresCdcInput(PostgresCdcReaderConfig),
     PostgresOutput(PostgresWriterConfig),
     Datagen(DatagenInputConfig),
     Nexmark(NexmarkInputConfig),
     /// Direct HTTP input: cannot be instantiated through API
     HttpInput(HttpInputConfig),
     /// Direct HTTP output: cannot be instantiated through API
-    HttpOutput,
+    HttpOutput(HttpOutputConfig),
     /// Ad hoc input: cannot be instantiated through API
     AdHocInput(AdHocInputConfig),
     ClockInput(ClockConfig),
@@ -1646,11 +1708,12 @@ impl TransportConfig {
             TransportConfig::DeltaTableOutput(_) => "delta_table_output".to_string(),
             TransportConfig::IcebergInput(_) => "iceberg_input".to_string(),
             TransportConfig::PostgresInput(_) => "postgres_input".to_string(),
+            TransportConfig::PostgresCdcInput(_) => "postgres_cdc_input".to_string(),
             TransportConfig::PostgresOutput(_) => "postgres_output".to_string(),
             TransportConfig::Datagen(_) => "datagen".to_string(),
             TransportConfig::Nexmark(_) => "nexmark".to_string(),
             TransportConfig::HttpInput(_) => "http_input".to_string(),
-            TransportConfig::HttpOutput => "http_output".to_string(),
+            TransportConfig::HttpOutput(_) => "http_output".to_string(),
             TransportConfig::AdHocInput(_) => "adhoc_input".to_string(),
             TransportConfig::RedisOutput(_) => "redis_output".to_string(),
             TransportConfig::ClockInput(_) => "clock".to_string(),
@@ -1664,7 +1727,7 @@ impl TransportConfig {
             self,
             TransportConfig::AdHocInput(_)
                 | TransportConfig::HttpInput(_)
-                | TransportConfig::HttpOutput
+                | TransportConfig::HttpOutput(_)
                 | TransportConfig::ClockInput(_)
         )
     }

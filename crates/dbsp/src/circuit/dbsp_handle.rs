@@ -22,6 +22,7 @@ pub use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOption
 use feldera_types::transaction::CommitProgressSummary;
 use itertools::Either;
 use std::collections::BTreeMap;
+use std::net::TcpListener;
 use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -180,6 +181,18 @@ impl Layout {
         }
     }
 
+    /// Returns an iterator across the ranges of workers on all the hosts in
+    /// this layout.  A single-host layout will have a single range with all the
+    /// workers, a two-host layout will have two ranges, and so on.
+    pub fn all_hosts(&self) -> impl Iterator<Item = Range<usize>> {
+        match self {
+            Self::Solo { n_workers } => Either::Left(std::iter::once(0..*n_workers)),
+            Self::Multihost { hosts, .. } => {
+                Either::Right(hosts.iter().map(|host| host.workers.clone()))
+            }
+        }
+    }
+
     /// Returns the network address for the current machine, or `None` if this
     /// is a solo layout.
     pub fn local_address(&self) -> Option<SocketAddr> {
@@ -248,7 +261,7 @@ impl Display for LayoutError {
 impl StdError for LayoutError {}
 
 /// DBSP circuit execution mode.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
 pub enum Mode {
     /// Operators in the circuit have persistent id's.
     ///
@@ -269,13 +282,35 @@ pub enum Mode {
     Ephemeral,
 }
 
+/// Whether the circuit runs with microsteps or full steps.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub enum StepSize {
+    /// The circuit supports microsteps.
+    ///
+    /// Microsteps break large batches that flow between operators into smaller
+    /// batches, which increases performance.  The common case for DBSP is
+    /// incremental circuits that support microsteps.
+    #[default]
+    Microsteps,
+
+    /// The circuit does not support microsteps.
+    ///
+    /// This setting disables breaking large batches into smaller ones for
+    /// performance.  It also disables optimizations in the ShardAccumulate
+    /// operator that can cause batches of any size to be processed in multiple
+    /// microsteps.
+    ///
+    /// Nonincremental circuits need this setting because their steps cannot be
+    /// divided into microsteps without changing the results.
+    FullSteps,
+}
+
 /// A config for instantiating a multithreaded/multihost runtime to execute
 /// circuits.
 ///
 /// As opposed to `RuntimeConfig`, this struct stores state about which hosts
 /// run the circuit and where they store data, e.g., state typically not
 /// tunable/exposed by the user.
-#[derive(Clone)]
 pub struct CircuitConfig {
     /// How the circuit is laid out across one or multiple machines.
     pub layout: Layout,
@@ -289,20 +324,58 @@ pub struct CircuitConfig {
 
     pub mode: Mode,
 
-    /// Storage configuration. If present, then storage is enabled..
+    /// Whether the circuit can use microsteps.
+    pub step_size: StepSize,
+
+    /// Storage configuration. If present, then storage is enabled.
     pub storage: Option<CircuitStorageConfig>,
 
     /// Parsed from `RuntimeConfig` for use by the circuit.
     pub dev_tweaks: DevTweaks,
+
+    /// Optionally, the TCP socket on which to listen for exchange.  This is
+    /// relevant only if `layout` is multihost.  If it is provided, then the
+    /// socket must be listening on the port indicated for this host in
+    /// `layout`.
+    pub exchange_listener: Option<TcpListener>,
 }
 
 /// Returns the chunk size for splitter operators, in records.
 ///
-/// Operators that split their output into multiple chunks, such as joins, distinct, and aggregation,
-/// should attempt to limit their output to this chunk size.
+/// Operators that split their output into multiple chunks, such as joins,
+/// distinct, and aggregation, should attempt to limit their output to this
+/// chunk size.
 pub fn splitter_output_chunk_size() -> usize {
     Runtime::with_dev_tweaks(|d| d.splitter_chunk_size_records() as usize)
 }
+
+/// Returns the number of records to preallocate in the first iteration of loops
+/// that break records into groups by the chunk size.
+///
+/// Operators that split their output into multiple chunks, such as joins,
+/// distinct, and aggregation, should attempt to limit their output to the chunk
+/// size returned by [splitter_output_chunk_size].  However,
+/// [splitter_output_chunk_size] can return an arbitrarily large value, even
+/// [usize::MAX].  This means that blindly allocating enough memory for the
+/// specified number of records can panic.  Instead, code should allocate at
+/// most `splitter_output_first_chunk_size` records in the first iteration of a
+/// loop that splits records by the chunk size.  In later iterations, after the
+/// configured chunk size has been reached once (and thus one knows that the
+/// given number of records fits in memory), the code can use the configured
+/// chunk size directly.
+pub fn splitter_output_first_chunk_size() -> usize {
+    splitter_output_chunk_size().min(MAX_FIRST_CHUNK_SIZE)
+}
+
+/// The chunk size returned by [splitter_output_chunk_size] can be arbitrarily
+/// large, even [usize::MAX].  This means that blindly allocating enough memory
+/// for the specified number of records can panic.  Instead, code should
+/// allocate at most memory for `MAX_FIRST_CHUNK_SIZE` records in the first
+/// iteration of a loop that splits records by the chunk size.  In later
+/// iterations, after the configured chunk size has been reached once (and thus
+/// one knows that the given number of records fits in memory), the code can use
+/// the configured chunk size directly.
+pub const MAX_FIRST_CHUNK_SIZE: usize = 50_000;
 
 pub fn balancer_min_absolute_improvement_threshold() -> u64 {
     Runtime::with_dev_tweaks(|d| d.balancer_min_absolute_improvement_threshold())
@@ -392,8 +465,10 @@ impl CircuitConfig {
             max_rss_bytes: None,
             pin_cpus: Vec::new(),
             mode: Mode::Ephemeral,
+            step_size: StepSize::default(),
             storage: None,
             dev_tweaks: DevTweaks::default(),
+            exchange_listener: None,
         }
     }
 
@@ -407,8 +482,23 @@ impl CircuitConfig {
         self
     }
 
-    pub fn with_storage(mut self, storage: CircuitStorageConfig) -> Self {
-        self.storage = Some(storage);
+    pub fn with_step_size(mut self, step_size: StepSize) -> Self {
+        self.step_size = step_size;
+        self
+    }
+
+    pub fn with_pin_cpus(mut self, pin_cpus: Vec<usize>) -> Self {
+        self.pin_cpus = pin_cpus;
+        self
+    }
+
+    pub fn with_storage(mut self, storage: Option<CircuitStorageConfig>) -> Self {
+        self.storage = storage;
+        self
+    }
+
+    pub fn with_dev_tweaks(mut self, dev_tweaks: DevTweaks) -> Self {
+        self.dev_tweaks = dev_tweaks;
         self
     }
 
@@ -481,11 +571,10 @@ impl CircuitConfig {
             None => num_workers * DEFAULT_MERGER_THREAD_RATIO,
         }
     }
-}
 
-impl From<&CircuitConfig> for CircuitConfig {
-    fn from(value: &CircuitConfig) -> Self {
-        value.clone()
+    pub fn with_exchange_listener(mut self, exchange_listener: TcpListener) -> Self {
+        self.exchange_listener = Some(exchange_listener);
+        self
     }
 }
 
@@ -569,7 +658,9 @@ impl Runtime {
         let (status_senders, status_receivers): (Vec<_>, Vec<_>) =
             (0..nworkers).map(|_| bounded(1)).unzip();
 
-        let runtime = Self::run(&config, move |parker| {
+        let storage = config.storage.clone();
+
+        let runtime = Self::run(config, move |parker| {
             let worker_index = Runtime::local_worker_offset();
 
             // Drop all but one channels.  This makes sure that if one of the worker panics
@@ -635,15 +726,10 @@ impl Runtime {
                             return;
                         }
                     }
-                    Ok(Command::BootstrapStep) => {
-                        if let Err(e) = circuit.transaction() {
-                            if status_sender.send(Err(e)).is_err() {
-                                return;
-                            }
-                        } else if status_sender
-                            .send(Ok(Response::BootstrapComplete(
-                                circuit.is_replay_complete(),
-                            )))
+                    Ok(Command::IsBootstrapComplete) => {
+                        let complete = circuit.is_replay_complete();
+                        if status_sender
+                            .send(Ok(Response::BootstrapComplete(complete)))
                             .is_err()
                         {
                             return;
@@ -711,11 +797,17 @@ impl Runtime {
                             return;
                         }
                     }
-                    Ok(Command::SetBalancerHints(hints)) => {
+                    Ok(Command::SetAutoRebalance(enable)) => {
+                        let result = circuit.set_auto_rebalance(enable).map(|_| Response::Unit);
+                        if status_sender.send(result).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(Command::SetBalancerHintsByGlobalId(hints)) => {
                         let results = hints
                             .into_iter()
                             .map(|(global_node_id, hint)| {
-                                circuit.set_balancer_hint(&global_node_id, hint)
+                                circuit.set_balancer_hint_by_global_id(&global_node_id, hint)
                             })
                             .collect::<Vec<Result<(), DbspError>>>();
                         if status_sender
@@ -725,8 +817,31 @@ impl Runtime {
                             return;
                         }
                     }
-                    Ok(Command::GetCurrentBalancerPolicy) => {
-                        let policy = circuit.get_current_balancer_policy();
+                    Ok(Command::SetBalancerHints(hints)) => {
+                        let results = hints
+                            .into_iter()
+                            .map(|(persistent_id, hint)| {
+                                circuit.set_balancer_hint(&persistent_id, hint)
+                            })
+                            .collect::<Vec<Result<(), DbspError>>>();
+                        if status_sender
+                            .send(Ok(Response::SetBalancerHints(results)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(Command::GetCurrentBalancerPolicies) => {
+                        let policy = circuit.get_current_balancer_policies();
+                        if status_sender
+                            .send(Ok(Response::CurrentBalancerPolicies(policy)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(Command::GetCurrentBalancerPolicy(persistent_id)) => {
+                        let policy = circuit.get_current_balancer_policy(&persistent_id);
                         if status_sender
                             .send(Ok(Response::CurrentBalancerPolicy(policy)))
                             .is_err()
@@ -736,6 +851,12 @@ impl Runtime {
                     }
                     Ok(Command::Rebalance) => {
                         circuit.rebalance();
+                        if status_sender.send(Ok(Response::Unit)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(Command::StartCompaction) => {
+                        circuit.start_compaction();
                         if status_sender.send(Ok(Response::Unit)).is_err() {
                             return;
                         }
@@ -787,8 +908,7 @@ impl Runtime {
             Ok(result) => result,
         };
 
-        let (backend, init_checkpoint) = config
-            .storage
+        let (backend, init_checkpoint) = storage
             .map(|storage| (storage.backend.clone(), storage.init_checkpoint))
             .unzip();
         let mut dbsp = DBSPHandle::new(
@@ -813,8 +933,7 @@ enum Command {
     CommitTransaction,
     CommitProgress,
     Transaction,
-    /// Execute a step in bootstrap mode.
-    BootstrapStep,
+    IsBootstrapComplete,
     CompleteBootstrap,
     EnableProfiler,
     DumpProfile {
@@ -828,9 +947,13 @@ enum Command {
     GetLir,
     Checkpoint(StoragePath),
     Restore(StoragePath),
-    SetBalancerHints(Vec<(GlobalNodeId, BalancerHint)>),
-    GetCurrentBalancerPolicy,
+    SetBalancerHintsByGlobalId(Vec<(GlobalNodeId, BalancerHint)>),
+    SetBalancerHints(Vec<(String, BalancerHint)>),
+    GetCurrentBalancerPolicies,
+    GetCurrentBalancerPolicy(String),
     Rebalance,
+    SetAutoRebalance(bool),
+    StartCompaction,
 }
 
 impl Debug for Command {
@@ -841,7 +964,7 @@ impl Debug for Command {
             Command::CommitTransaction => write!(f, "CommitTransaction"),
             Command::CommitProgress => write!(f, "CommitProgress"),
             Command::Transaction => write!(f, "Transaction"),
-            Command::BootstrapStep => write!(f, "BootstrapStep"),
+            Command::IsBootstrapComplete => write!(f, "IsBootstrapComplete"),
             Command::CompleteBootstrap => write!(f, "CompleteBootstrap"),
             Command::EnableProfiler => write!(f, "EnableProfiler"),
             Command::RetrieveGraph => write!(f, "RetrieveGraph"),
@@ -856,11 +979,23 @@ impl Debug for Command {
             Command::GetLir => write!(f, "GetLir"),
             Command::Checkpoint(path) => f.debug_tuple("Checkpoint").field(path).finish(),
             Command::Restore(path) => f.debug_tuple("Restore").field(path).finish(),
+            Command::SetBalancerHintsByGlobalId(hints) => f
+                .debug_tuple("SetBalancerHintsByGlobalId")
+                .field(hints)
+                .finish(),
             Command::SetBalancerHints(hints) => {
                 f.debug_tuple("SetBalancerHints").field(hints).finish()
             }
-            Command::GetCurrentBalancerPolicy => write!(f, "GetCurrentBalancerPolicy"),
+            Command::GetCurrentBalancerPolicies => write!(f, "GetCurrentBalancerPolicies"),
+            Command::GetCurrentBalancerPolicy(persistent_id) => f
+                .debug_tuple("GetCurrentBalancerPolicy")
+                .field(persistent_id)
+                .finish(),
             Command::Rebalance => write!(f, "Rebalance"),
+            Command::SetAutoRebalance(enable) => {
+                f.debug_tuple("SetAutoRebalance").field(enable).finish()
+            }
+            Command::StartCompaction => write!(f, "StartCompaction"),
         }
     }
 }
@@ -877,7 +1012,8 @@ enum Response {
     CheckpointRestored(Option<BootstrapInfo>),
     Lir(LirCircuit),
     SetBalancerHints(Vec<Result<(), DbspError>>),
-    CurrentBalancerPolicy(BTreeMap<GlobalNodeId, PartitioningPolicy>),
+    CurrentBalancerPolicies(BTreeMap<GlobalNodeId, PartitioningPolicy>),
+    CurrentBalancerPolicy(Result<PartitioningPolicy, DbspError>),
 }
 
 /// A handle to control the execution of a circuit in a multithreaded runtime.
@@ -1111,13 +1247,49 @@ impl DBSPHandle {
         Ok(reply)
     }
 
+    /// Check if the bootstrap is complete and clear bootstrap info if it is.
+    ///
+    /// Should be called after a step or transaction is completed.
+    fn check_bootstrap_complete(&mut self) -> Result<(), DbspError> {
+        if self.bootstrap_in_progress() {
+            let mut replay_complete = Vec::with_capacity(self.status_receivers.len());
+
+            let result =
+                self.broadcast_command(Command::IsBootstrapComplete, |_worker, response| {
+                    let Response::BootstrapComplete(complete) = response else {
+                        panic!("Expected BootstrapComplete response, got {response:?}");
+                    };
+                    replay_complete.push(complete);
+                });
+
+            result?;
+
+            if replay_complete.iter().all(|complete| *complete) {
+                info!("Bootstrap complete");
+                self.send_complete_bootstrap()?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Start and instantly commit a transaction, waiting for the commit to complete.
     pub fn transaction(&mut self) -> Result<(), DbspError> {
-        if self.bootstrap_in_progress() {
-            self.step_bootstrap()
-        } else {
-            self.transaction_regular()
+        DBSP_STEP.fetch_add(1, Ordering::Relaxed);
+        let start = Instant::now();
+        let result = self.broadcast_command(Command::Transaction, |_, _| {});
+        DBSP_STEP_LATENCY_MICROSECONDS
+            .lock()
+            .unwrap()
+            .record_elapsed(start);
+        if let Some(handle) = self.runtime.as_ref() {
+            self.runtime_elapsed +=
+                start.elapsed() * handle.runtime().layout().local_workers().len() as u32 * 2;
         }
+
+        self.check_bootstrap_complete()?;
+
+        result
     }
 
     /// Start a transaction.
@@ -1178,6 +1350,7 @@ impl DBSPHandle {
 
         if commit_complete {
             debug!("Commit complete");
+            self.check_bootstrap_complete()?;
         }
 
         Ok(commit_complete)
@@ -1222,69 +1395,6 @@ impl DBSPHandle {
         })?;
 
         Ok(progress)
-    }
-
-    pub fn set_replay_step_size(&mut self, step_size: usize) {
-        if let Some(handle) = self.runtime.as_ref() {
-            handle.runtime().set_replay_step_size(step_size);
-        }
-    }
-
-    pub fn get_replay_step_size(&self) -> usize {
-        if let Some(handle) = self.runtime.as_ref() {
-            handle.runtime().get_replay_step_size()
-        } else {
-            0
-        }
-    }
-
-    fn transaction_regular(&mut self) -> Result<(), DbspError> {
-        DBSP_STEP.fetch_add(1, Ordering::Relaxed);
-        let start = Instant::now();
-        let result = self.broadcast_command(Command::Transaction, |_, _| {});
-        DBSP_STEP_LATENCY_MICROSECONDS
-            .lock()
-            .unwrap()
-            .record_elapsed(start);
-        if let Some(handle) = self.runtime.as_ref() {
-            self.runtime_elapsed +=
-                start.elapsed() * handle.runtime().layout().local_workers().len() as u32 * 2;
-        }
-        result
-    }
-
-    /// In the bootstrap mode, after performing a step, check if all workers have finished bootstrapping.
-    /// If so, notify all workers to exit the bootstrap phase and start normal operation.
-    fn step_bootstrap(&mut self) -> Result<(), DbspError> {
-        DBSP_STEP.fetch_add(1, Ordering::Relaxed);
-        let start = Instant::now();
-
-        let mut replay_complete = Vec::with_capacity(self.status_receivers.len());
-
-        let result = self.broadcast_command(Command::BootstrapStep, |_worker, response| {
-            let Response::BootstrapComplete(complete) = response else {
-                panic!("Expected BootstrapComplete response, got {response:?}");
-            };
-            replay_complete.push(complete);
-        });
-
-        DBSP_STEP_LATENCY_MICROSECONDS
-            .lock()
-            .unwrap()
-            .record_elapsed(start);
-        if let Some(handle) = self.runtime.as_ref() {
-            self.runtime_elapsed +=
-                start.elapsed() * handle.runtime().layout().local_workers().len() as u32 * 2;
-        }
-
-        result?;
-
-        if replay_complete.iter().all(|complete| *complete) {
-            info!("Bootstrap complete");
-            self.send_complete_bootstrap()?;
-        }
-
-        Ok(())
     }
 
     /// The circuit has been resumed from a checkpoint and is currently bootstrapping the modified part of the circuit.
@@ -1490,18 +1600,74 @@ impl DBSPHandle {
         self.kill_inner()
     }
 
-    pub fn set_balancer_hint(
+    /// Enable/disable automatic rebalancing of the circuit.
+    ///
+    /// When enabled, the circuit will automatically rebalance skewed joins based on internal
+    /// heuristics. Rebalancing can introduce pipeline stalls.
+    ///
+    /// When disabled, the circuit will not automatically rebalance skewed joins. Rebalancing can
+    /// be triggered explicitly by calling `rebalance`.
+    pub fn set_auto_rebalance(&mut self, enable: bool) -> Result<(), DbspError> {
+        self.broadcast_command(Command::SetAutoRebalance(enable), |_, resp| {
+            let Response::Unit = resp else {
+                panic!("Expected Unit response, got {resp:?}");
+            };
+        })?;
+        Ok(())
+    }
+
+    pub fn set_balancer_hint_by_global_id(
         &mut self,
         global_node_id: &GlobalNodeId,
         hint: BalancerHint,
     ) -> Result<(), DbspError> {
-        let mut result = self.set_balancer_hints(vec![(global_node_id.clone(), hint)])?;
+        let mut result =
+            self.set_balancer_hints_by_global_id(vec![(global_node_id.clone(), hint)])?;
         result.pop().unwrap()
     }
 
-    pub fn set_balancer_hints(
+    /// Set the balancer hint for the stream with the given persistent id.
+    ///
+    /// - `persistent_id` must exist in the circuit and belong to an input stream of a
+    ///   balancing join operator. In practice, this means that the circuit should be running
+    ///   in `Persistent` mode and the stream should have a persistent id assigned using
+    ///   `set_persistent_id`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the above requirements are not met or the hint cannot be enforced in the current state,
+    /// e.g., if the user is setting Broadcast policy on both inputs to a join.
+    pub fn set_balancer_hint(
+        &mut self,
+        persistent_id: &str,
+        hint: BalancerHint,
+    ) -> Result<(), DbspError> {
+        let mut result = self.set_balancer_hints(vec![(persistent_id.to_string(), hint)])?;
+        result.pop().unwrap()
+    }
+
+    pub fn set_balancer_hints_by_global_id(
         &mut self,
         hints: Vec<(GlobalNodeId, BalancerHint)>,
+    ) -> Result<Vec<Result<(), DbspError>>, DbspError> {
+        let mut results = Vec::new();
+
+        self.broadcast_command(Command::SetBalancerHintsByGlobalId(hints), |_, resp| {
+            let Response::SetBalancerHints(worker_results) = resp else {
+                panic!("Expected SetBalancerHints response, got {resp:?}");
+            };
+            results = worker_results;
+        })?;
+
+        Ok(results)
+    }
+
+    /// Set multiple balancer hints.
+    ///
+    /// Applies hints one by one.
+    pub fn set_balancer_hints(
+        &mut self,
+        hints: Vec<(String, BalancerHint)>,
     ) -> Result<Vec<Result<(), DbspError>>, DbspError> {
         let mut results = Vec::new();
 
@@ -1515,19 +1681,41 @@ impl DBSPHandle {
         Ok(results)
     }
 
-    pub fn get_current_balancer_policy(
+    /// Get the current balancer policies for all operators in the circuit.
+    pub fn get_current_balancer_policies(
         &mut self,
     ) -> Result<BTreeMap<GlobalNodeId, PartitioningPolicy>, DbspError> {
-        let resp = self.unicast_command(0, Command::GetCurrentBalancerPolicy)?;
+        let resp = self.unicast_command(0, Command::GetCurrentBalancerPolicies)?;
 
-        let Response::CurrentBalancerPolicy(policy) = resp else {
-            panic!("Expected GetCurrentBalancerPolicy policy response, got {resp:?}");
+        let Response::CurrentBalancerPolicies(policy) = resp else {
+            panic!("Expected GetCurrentBalancerPolicies response, got {resp:?}");
         };
         Ok(policy)
     }
 
+    /// Get the current balancer policy for the operator with the given persistent id.
+    pub fn get_current_balancer_policy(
+        &mut self,
+        persistent_id: &str,
+    ) -> Result<PartitioningPolicy, DbspError> {
+        let resp = self.unicast_command(
+            0,
+            Command::GetCurrentBalancerPolicy(persistent_id.to_string()),
+        )?;
+
+        let Response::CurrentBalancerPolicy(policy) = resp else {
+            panic!("Expected GetCurrentBalancerPolicy response, got {resp:?}");
+        };
+        policy
+    }
+
     pub fn rebalance(&mut self) -> Result<(), DbspError> {
         self.broadcast_command(Command::Rebalance, |_, _| {})?;
+        Ok(())
+    }
+
+    pub fn start_compaction(&mut self) -> Result<(), DbspError> {
+        self.broadcast_command(Command::StartCompaction, |_, _| {})?;
         Ok(())
     }
 }
@@ -1592,6 +1780,12 @@ impl<'a> CheckpointBuilder<'a> {
     /// commit it later.
     pub fn prepare(self) -> Result<CheckpointCommitter, DbspError> {
         let checkpointer = self.handle.checkpointer()?.clone();
+
+        // Write an empty catalog before the UUID directory is created by
+        // operators.  This prevents read_checkpoints from seeing orphaned UUID
+        // directories during the first checkpoint commit on fresh storage.
+        checkpointer.lock().unwrap().ensure_catalog_exists()?;
+
         let uuid = Uuid::now_v7();
         let checkpoint_dir = Checkpointer::checkpoint_dir(uuid);
         let mut readers = Vec::new();
@@ -1652,11 +1846,10 @@ pub(crate) mod tests {
     use std::time::Duration;
     use std::{fs, vec};
 
-    use super::{CircuitStorageConfig, Mode};
+    use super::CircuitStorageConfig;
+    use crate::circuit::CircuitConfig;
     use crate::circuit::checkpointer::Checkpointer;
-    use crate::circuit::dbsp_handle::DevTweaks;
     use crate::circuit::runtime::TOKIO_WORKER_INDEX;
-    use crate::circuit::{CircuitConfig, Layout};
     use crate::dynamic::{ClonableTrait, DowncastTrait, DynData, Erase};
     use crate::operator::Generator;
     use crate::operator::TraceBound;
@@ -1670,7 +1863,7 @@ pub(crate) mod tests {
     use anyhow::anyhow;
     use feldera_buffer_cache::ThreadType;
     use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
-    use tempfile::{TempDir, tempdir};
+    use tempfile::tempdir;
     use uuid::Uuid;
 
     // Panic during initialization in worker thread.
@@ -1872,7 +2065,7 @@ pub(crate) mod tests {
         InputHandle<usize>,
     );
 
-    fn mkcircuit(cconf: &CircuitConfig) -> Result<(DBSPHandle, CircuitHandle), DbspError> {
+    fn mkcircuit(cconf: CircuitConfig) -> Result<(DBSPHandle, CircuitHandle), DbspError> {
         Runtime::init_circuit(cconf, move |circuit| {
             let (stream, handle) = circuit.add_input_indexed_zset::<i32, i32>();
             let (sample_size_stream, sample_size_handle) = circuit.add_input_stream::<usize>();
@@ -1895,9 +2088,7 @@ pub(crate) mod tests {
         })
     }
 
-    fn mkcircuit_different(
-        cconf: &CircuitConfig,
-    ) -> Result<(DBSPHandle, CircuitHandle), DbspError> {
+    fn mkcircuit_different(cconf: CircuitConfig) -> Result<(DBSPHandle, CircuitHandle), DbspError> {
         Runtime::init_circuit(cconf, move |circuit| {
             let map_factories = BatchReaderFactories::new::<Tup2<i32, i32>, (), ZWeight>();
             let (stream, handle) = circuit.add_input_indexed_zset::<i32, i32>();
@@ -1936,7 +2127,7 @@ pub(crate) mod tests {
 
     #[allow(clippy::type_complexity)]
     fn mkcircuit_with_bounds(
-        cconf: &CircuitConfig,
+        cconf: CircuitConfig,
     ) -> Result<(DBSPHandle, CircuitHandle), DbspError> {
         Runtime::init_circuit(cconf, move |circuit| {
             let (stream, handle) = circuit.add_input_indexed_zset::<i32, i32>();
@@ -1962,29 +2153,20 @@ pub(crate) mod tests {
         })
     }
 
-    pub(crate) fn mkconfig() -> (TempDir, CircuitConfig) {
-        let temp = tempdir().expect("Can't create temp dir for storage");
-        let cconf = CircuitConfig {
-            layout: Layout::new_solo(1),
-            max_rss_bytes: None,
-            mode: Mode::Ephemeral,
-            pin_cpus: Vec::new(),
-            storage: Some(
-                CircuitStorageConfig::for_config(
-                    StorageConfig {
-                        path: temp.path().to_string_lossy().into_owned(),
-                        cache: StorageCacheConfig::default(),
-                    },
-                    StorageOptions {
-                        min_storage_bytes: Some(0),
-                        ..StorageOptions::default()
-                    },
-                )
-                .unwrap(),
-            ),
-            dev_tweaks: DevTweaks::default(),
-        };
-        (temp, cconf)
+    pub(crate) fn mkconfig(path: &Path) -> CircuitConfig {
+        CircuitConfig::with_workers(1).with_storage(Some(
+            CircuitStorageConfig::for_config(
+                StorageConfig {
+                    path: path.to_string_lossy().into_owned(),
+                    cache: StorageCacheConfig::default(),
+                },
+                StorageOptions {
+                    min_storage_bytes: Some(0),
+                    ..StorageOptions::default()
+                },
+            )
+            .unwrap(),
+        ))
     }
 
     /// Utility function that runs a circuit and takes a checkpoint at every
@@ -1993,11 +2175,12 @@ pub(crate) mod tests {
     /// point.
     fn generic_checkpoint_restore(
         input: Vec<Vec<Tup2<i32, Tup2<i32, i64>>>>,
-        circuit_fun: fn(&CircuitConfig) -> Result<(DBSPHandle, CircuitHandle), DbspError>,
+        circuit_fun: fn(CircuitConfig) -> Result<(DBSPHandle, CircuitHandle), DbspError>,
     ) {
         const SAMPLE_SIZE: usize = 25; // should be bigger than #keys
         assert!(input.len() < SAMPLE_SIZE, "input should be <SAMPLE_SIZE");
-        let (_temp, mut cconf) = mkconfig();
+        let _temp = tempdir().expect("Can't create temp dir for storage");
+        let cconf = mkconfig(_temp.path());
 
         let mut committed = vec![];
         let mut checkpoints = vec![];
@@ -2006,7 +2189,7 @@ pub(crate) mod tests {
         // step.
         {
             let (mut dbsp, (input_handle, output_handle, sample_size_handle)) =
-                circuit_fun(&cconf).unwrap();
+                circuit_fun(cconf).unwrap();
             for mut batch in input.clone() {
                 let cpm = dbsp.checkpoint().run().expect("commit shouldn't fail");
                 checkpoints.push(cpm);
@@ -2025,9 +2208,10 @@ pub(crate) mod tests {
         // what we would expect it to be at the given point we restored it to
         let mut batches_to_insert = input.clone();
         for (i, cpm) in checkpoints.iter().enumerate() {
+            let mut cconf = mkconfig(_temp.path());
             cconf.storage.as_mut().unwrap().init_checkpoint = Some(cpm.uuid);
             let (mut dbsp, (input_handle, output_handle, sample_size_handle)) =
-                mkcircuit(&cconf).unwrap();
+                mkcircuit(cconf).unwrap();
             sample_size_handle.set_for_all(SAMPLE_SIZE);
             input_handle.append(&mut batches_to_insert[i]);
             dbsp.transaction().unwrap();
@@ -2041,8 +2225,9 @@ pub(crate) mod tests {
     /// Smoke test for `gather_batches_for_checkpoint`.
     #[test]
     fn can_find_batches_for_checkpoint() {
-        let (_temp, cconf) = mkconfig();
-        let (mut dbsp, (input_handle, _, _)) = mkcircuit(&cconf).unwrap();
+        let _temp = tempdir().expect("Can't create temp dir for storage");
+        let cconf = mkconfig(_temp.path());
+        let (mut dbsp, (input_handle, _, _)) = mkcircuit(cconf).unwrap();
         let mut batch = vec![Tup2(1, Tup2(2, 1))];
         input_handle.append(&mut batch);
         dbsp.transaction().unwrap();
@@ -2062,11 +2247,11 @@ pub(crate) mod tests {
     /// restarts.
     #[test]
     fn checkpoint_file() {
-        let (_temp, cconf) = mkconfig();
+        let _temp = tempdir().expect("Can't create temp dir for storage");
 
         {
             let (mut dbsp, (_input_handle, _output_handle, sample_size_handle)) =
-                mkcircuit(&cconf).unwrap();
+                mkcircuit(mkconfig(_temp.path())).unwrap();
             sample_size_handle.set_for_all(2);
             dbsp.transaction().unwrap();
             dbsp.checkpoint()
@@ -2078,7 +2263,7 @@ pub(crate) mod tests {
         }
 
         {
-            let (dbsp, _) = mkcircuit(&cconf).unwrap();
+            let (dbsp, _) = mkcircuit(mkconfig(_temp.path())).unwrap();
             let cpm = &dbsp
                 .checkpointer
                 .as_ref()
@@ -2108,10 +2293,10 @@ pub(crate) mod tests {
     /// directory twice because the directory is locked.
     #[test]
     fn circuit_takes_ownership_of_storage_dir() {
-        let (_temp, cconf) = mkconfig();
-        let (_dbsp, _) = mkcircuit(&cconf).unwrap();
+        let _temp = tempdir().expect("Can't create temp dir for storage");
+        let (_dbsp, _) = mkcircuit(mkconfig(_temp.path())).unwrap();
 
-        let r = Runtime::init_circuit(cconf, |_circuit| Ok(()));
+        let r = Runtime::init_circuit(mkconfig(_temp.path()), |_circuit| Ok(()));
         assert!(matches!(
             r,
             Err(DbspError::Storage(StorageError::StorageLocked(_, _)))
@@ -2121,13 +2306,14 @@ pub(crate) mod tests {
     /// We should fail if we revert to a checkpoint that doesn't exist.
     #[test]
     fn revert_to_unknown_checkpoint() {
-        let (_temp, mut cconf) = mkconfig();
-        let (dbsp, _) = mkcircuit(&cconf).unwrap();
+        let _temp = tempdir().expect("Can't create temp dir for storage");
+        let (dbsp, _) = mkcircuit(mkconfig(_temp.path())).unwrap();
         drop(dbsp); // makes sure we can take ownership of storage dir again
 
+        let mut cconf = mkconfig(_temp.path());
         cconf.storage.as_mut().unwrap().init_checkpoint = Some(Uuid::now_v7()); // this checkpoint doesn't exist
 
-        let res = mkcircuit(&cconf);
+        let res = mkcircuit(cconf);
         let Err(err) = res else {
             panic!("revert_to_unknown_checkpoint is supposed to fail");
         };
@@ -2142,18 +2328,19 @@ pub(crate) mod tests {
     #[test]
     #[should_panic]
     fn revert_to_partial_checkpoint() {
-        let (temp, mut cconf) = mkconfig();
-        let (dbsp, _) = mkcircuit(&cconf).unwrap();
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let (dbsp, _) = mkcircuit(mkconfig(temp.path())).unwrap();
         drop(dbsp); // makes sure we can take ownership of storage dir again
 
         let init_checkpoint = Uuid::now_v7(); // A made-up checkpoint, that does not have the necessary files
+        let mut cconf = mkconfig(temp.path());
         cconf.storage.as_mut().unwrap().init_checkpoint = Some(init_checkpoint);
         let checkpoint_dir = temp.path().join(init_checkpoint.to_string());
         create_dir_all(checkpoint_dir).expect("can't create checkpoint dir");
 
         // Initializing this circuit again will panic because it won't find the
         // necessary files in the checkpoint directory.
-        mkcircuit(&cconf).unwrap();
+        mkcircuit(cconf).unwrap();
     }
 
     fn init_test_tracing() {
@@ -2165,7 +2352,8 @@ pub(crate) mod tests {
     #[test]
     fn gc_commits() {
         init_test_tracing();
-        let (temp, cconf) = mkconfig();
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let cconf = mkconfig(temp.path());
 
         fn count_directory_entries<P: AsRef<Path>>(path: P) -> io::Result<usize> {
             let mut file_count = 0;
@@ -2177,7 +2365,7 @@ pub(crate) mod tests {
             Ok(file_count)
         }
 
-        let (mut dbsp, (input_handle, _, _)) = mkcircuit(&cconf).unwrap();
+        let (mut dbsp, (input_handle, _, _)) = mkcircuit(cconf).unwrap();
 
         let _cpm = dbsp.checkpoint().run().expect("commit failed");
         let mut batches: Vec<Vec<Tup2<i32, Tup2<i32, i64>>>> = vec![
@@ -2216,8 +2404,8 @@ pub(crate) mod tests {
     fn gc_on_startup() {
         init_test_tracing();
 
-        let (temp, cconf) = mkconfig();
-        let (mut dbsp, (input_handle, _, _)) = mkcircuit(&cconf).unwrap();
+        let temp = tempdir().expect("Can't create temp dir for storage");
+        let (mut dbsp, (input_handle, _, _)) = mkcircuit(mkconfig(temp.path())).unwrap();
 
         let mut batch: Vec<Tup2<i32, Tup2<i32, i64>>> = vec![Tup2(1, Tup2(2, 1))];
         input_handle.append(&mut batch);
@@ -2237,7 +2425,7 @@ pub(crate) mod tests {
 
         // Initializing this circuit again will remove the
         // unnecessary files in the checkpoint directory.
-        let (_dbsp, _) = mkcircuit(&cconf).unwrap();
+        let (_dbsp, _) = mkcircuit(mkconfig(temp.path())).unwrap();
 
         assert!(!incomplete_checkpoint_dir.exists());
         assert!(!incomplete_batch_path.exists());
@@ -2282,14 +2470,23 @@ pub(crate) mod tests {
     /// Make sure two circuits end up with a different fingerprint.
     #[test]
     fn fingerprint_is_different() {
-        let (_tempdir, cconf) = mkconfig();
-        let fid1 = mkcircuit(&cconf).unwrap().0.fingerprint();
-        let fid2 = mkcircuit_different(&cconf).unwrap().0.fingerprint();
+        let _tempdir = tempdir().expect("Can't create temp dir for storage");
+        let fid1 = mkcircuit(mkconfig(_tempdir.path()))
+            .unwrap()
+            .0
+            .fingerprint();
+        let fid2 = mkcircuit_different(mkconfig(_tempdir.path()))
+            .unwrap()
+            .0
+            .fingerprint();
         assert_ne!(fid1, fid2);
 
         // Unfortunately, the fingerprint isn't perfect, e.g., it thinks these two
         // circuits are the same:
-        let fid3 = mkcircuit_with_bounds(&cconf).unwrap().0.fingerprint();
+        let fid3 = mkcircuit_with_bounds(mkconfig(_tempdir.path()))
+            .unwrap()
+            .0
+            .fingerprint();
         assert_eq!(fid1, fid3); // Ideally, should be assert_ne
     }
 
@@ -2298,16 +2495,17 @@ pub(crate) mod tests {
     #[test]
     #[should_panic]
     fn reject_different_fingerprint() {
-        let (_temp, mut cconf) = mkconfig();
-        let (mut dbsp, (input_handle, _, _)) = mkcircuit(&cconf).unwrap();
+        let _temp = tempdir().expect("Can't create temp dir for storage");
+        let (mut dbsp, (input_handle, _, _)) = mkcircuit(mkconfig(_temp.path())).unwrap();
         let mut batch: Vec<Tup2<i32, Tup2<i32, i64>>> = vec![Tup2(1, Tup2(2, 1))];
         input_handle.append(&mut batch);
         let cpi = dbsp.checkpoint().run().expect("commit shouldn't fail");
         drop(dbsp);
 
+        let mut cconf = mkconfig(_temp.path());
         cconf.storage.as_mut().unwrap().init_checkpoint = Some(cpi.uuid);
         let (dbsp_different, (_input_handle, _, _sample_size_handle)) =
-            mkcircuit_different(&cconf).unwrap();
+            mkcircuit_different(cconf).unwrap();
         drop(dbsp_different);
     }
 
@@ -2315,12 +2513,12 @@ pub(crate) mod tests {
     #[test]
     #[allow(clippy::borrowed_box)]
     fn test_z1_checkpointing() {
-        let (_temp, mut cconf) = mkconfig();
+        let _temp = tempdir().expect("Can't create temp dir for storage");
 
         //let expected_waterlines = vec![115, 115, 125, 145];
         let expected_waterlines = vec![115, 115, 125, 145];
         fn mkcircuit(
-            cconf: &CircuitConfig,
+            cconf: CircuitConfig,
             mut expected_waterline: vec::IntoIter<i32>,
         ) -> (DBSPHandle, ZSetHandle<i32>) {
             Runtime::init_circuit(cconf, move |circuit| {
@@ -2348,14 +2546,17 @@ pub(crate) mod tests {
             vec![Tup2(130, 1), Tup2(140, 1), Tup2(0, 1)],
         ];
 
+        let mut checkpoint = None;
         for (idx, mut batch) in batches.into_iter().enumerate() {
             let expected_waterlines = expected_waterlines.clone();
             let expected_waterlines: Vec<i32> = expected_waterlines[idx..].into();
-            let (mut dbsp, input_handle) = mkcircuit(&cconf, expected_waterlines.into_iter());
+            let mut cconf = mkconfig(_temp.path());
+            cconf.storage.as_mut().unwrap().init_checkpoint = checkpoint;
+            let (mut dbsp, input_handle) = mkcircuit(cconf, expected_waterlines.into_iter());
             input_handle.append(&mut batch);
             dbsp.transaction().unwrap();
             let cpm = dbsp.checkpoint().run().unwrap();
-            cconf.storage.as_mut().unwrap().init_checkpoint = Some(cpm.uuid);
+            checkpoint = Some(cpm.uuid);
             dbsp.kill().unwrap();
         }
     }

@@ -6,7 +6,6 @@
 
 <script lang="ts">
   import { SegmentedControl } from '@skeletonlabs/skeleton-svelte'
-  import { format } from 'd3-format'
   import Dayjs from 'dayjs'
   import PipelineMemoryGraph from '$lib/components/layout/pipelines/PipelineMemoryGraph.svelte'
   import PipelineStorageGraph from '$lib/components/layout/pipelines/PipelineStorageGraph.svelte'
@@ -15,25 +14,27 @@
   import ConnectorErrors, {
     type ConnectorErrorFilter
   } from '$lib/components/pipelines/editor/performance/ConnectorErrors.svelte'
+  import CheckpointsStatus from '$lib/components/pipelines/editor/performance/CheckpointsStatus.svelte'
   import { useIsScreenXl } from '$lib/compositions/layout/useIsMobile.svelte'
   import {
     type PipelineManagerApi,
     usePipelineManager
   } from '$lib/compositions/usePipelineManager.svelte'
-  import { formatDateTime, useElapsedTime } from '$lib/functions/format'
+  import { formatDateTime, formatQty } from '$lib/functions/format'
+  import { useElapsedTime } from '$lib/compositions/common/useElapsedTime'
   import type { PipelineMetrics } from '$lib/functions/pipelineMetrics'
   import {
-    CustomJSONParserTransformStream,
-    parseCancellable,
+    createBigNumberStreamParser,
+    parseStream,
     pushAsCircularBuffer
   } from '$lib/functions/pipelines/changeStream'
   import { getDeploymentStatusLabel, isMetricsAvailable } from '$lib/functions/pipelines/status'
+  import type { CheckpointMetadata, CheckpointStatus } from '$lib/services/manager'
   import type { ExtendedPipeline } from '$lib/services/pipelineManager'
   import type { TimeSeriesEntry } from '$lib/types/pipelineManager'
+  import CheckpointsIndicator from './performance/CheckpointsIndicator.svelte'
   import TransactionStatus from './performance/TransactionStatus.svelte'
-
-  const formatQty = (v: number) =>
-    typeof v === 'number' && Number.isFinite(v) ? format(',.0f')(v) : 'unknown'
+  import Drawer from '$lib/components/layout/Drawer.svelte'
 
   const {
     pipeline,
@@ -54,20 +55,26 @@
   const isXl = useIsScreenXl()
   const api = usePipelineManager()
 
-  let openConnector = $state<{
-    relationName: string
-    connectorName: string
-    direction: 'input' | 'output'
-    filter: ConnectorErrorFilter
-  } | null>(null)
+  type DrawerState =
+    | {
+        kind: 'connector'
+        relationName: string
+        connectorName: string
+        direction: 'input' | 'output'
+        filter: ConnectorErrorFilter
+      }
+    | { kind: 'checkpoints' }
 
+  let openDrawer = $state<DrawerState | null>(null)
+  let checkpoints = $state<CheckpointMetadata[]>([])
+  let checkpointStatus = $state<CheckpointStatus | null>(null)
   const handleConnectorSelect = (
     relationName: string,
     connectorName: string,
     direction: 'input' | 'output',
     filter: ConnectorErrorFilter
   ) => {
-    openConnector = { relationName, connectorName, direction, filter }
+    openDrawer = { kind: 'connector', relationName, connectorName, direction, filter }
   }
 
   let cancelStream: (() => void) | undefined
@@ -83,8 +90,12 @@
       cancelStream = undefined
       return undefined
     }
-    const { cancel } = parseCancellable(
+    const { cancel } = parseStream(
       result,
+      createBigNumberStreamParser<TimeSeriesEntry>({
+        paths: ['$'],
+        separator: ''
+      }),
       {
         pushChanges: (rows: TimeSeriesEntry[]) => {
           pushAsCircularBuffer(
@@ -113,10 +124,6 @@
           }
         }
       },
-      new CustomJSONParserTransformStream<TimeSeriesEntry>({
-        paths: ['$'],
-        separator: ''
-      }),
       {
         bufferSize: 8 * 1024 * 1024
       }
@@ -131,12 +138,13 @@
     pipelineName
     if (deleted) {
       endMetricsStream()
-      openConnector = null
+      openDrawer = null
       return
     }
     if (!metricsAvailable) {
       endMetricsStream()
-      openConnector = null
+      openDrawer = null
+      checkpoints = []
       return
     }
     $effect.root(() => {
@@ -150,11 +158,32 @@
       endMetricsStream()
     }
   })
+
+  $effect(() => {
+    pipelineName
+    if (!metricsAvailable) {
+      checkpoints = []
+      checkpointStatus = null
+      return
+    }
+    // Poll checkpoint-related endpoints so the UI stays current with
+    // ongoing checkpoint activity (also needed for the mock simulator).
+    const fetchCheckpoints = () => {
+      api.getPipelineCheckpoints(pipelineName).then((v) => {
+        checkpoints = v
+      })
+      api.getCheckpointStatus(pipelineName).then((v) => {
+        checkpointStatus = v
+      })
+    }
+    fetchCheckpoints()
+    const interval = setInterval(fetchCheckpoints, 2_000)
+    return () => clearInterval(interval)
+  })
 </script>
 
 {#snippet label()}
-  <span class="inline sm:hidden"> Perf </span>
-  <span class="hidden sm:inline"> Performance </span>
+  Runtime
 {/snippet}
 
 {#if isMetricsAvailable(pipeline.current.status) === 'no'}
@@ -190,7 +219,7 @@
     >
       <div class="flex w-full flex-col gap-4">
         <div class="flex flex-wrap gap-4">
-          <div class="flex h-20 flex-wrap items-center gap-4">
+          <div class="mt-1 flex flex-wrap items-center gap-4">
             <div class="flex flex-col">
               <div class="text-start text-sm text-nowrap">Records Ingested</div>
               <div class="pt-2">
@@ -219,7 +248,7 @@
               </div>
             {/snippet}
             {#snippet updated()}
-              <div class="w-54 pt-2 text-nowrap">
+              <div class="w-64 pt-2 text-nowrap">
                 {getDeploymentStatusLabel(pipeline.current.status)} since {Dayjs(
                   pipeline.current.deploymentStatusSince
                 ).format('MMM D, YYYY h:mm A')}
@@ -281,7 +310,6 @@
               </div>
             {/if}
           </div>
-          <TransactionStatus {metrics}></TransactionStatus>
         </div>
         <div class="flex w-full flex-col gap-4 xl:flex-row">
           <div class="bg-white-dark relative h-52 w-full max-w-[700px] rounded">
@@ -305,6 +333,14 @@
             ></PipelineStorageGraph>
           </div>
         </div>
+        <CheckpointsIndicator
+          {pipelineName}
+          {checkpoints}
+          {metrics}
+          {checkpointStatus}
+          onShowCheckpoints={() => (openDrawer = { kind: 'checkpoints' })}
+        />
+        <TransactionStatus {metrics} class="w-full"></TransactionStatus>
       </div>
       {#if metrics.current.views.size || metrics.current.tables.size}
         <div class="flex flex-wrap gap-4">
@@ -312,20 +348,24 @@
         </div>
       {/if}
     </div>
-    {#if openConnector}
-      <ConnectorErrors
-        {pipelineName}
-        relationName={openConnector.relationName}
-        connectorName={openConnector.connectorName}
-        direction={openConnector.direction}
-        filter={openConnector.filter}
-        bind:open={
-          () => !!openConnector,
-          () => {
-            openConnector = null
-          }
-        }
-      />
-    {/if}
+    <Drawer open={!!openDrawer} side="right" width="w-[500px]" onClose={() => (openDrawer = null)}>
+      {#if openDrawer?.kind === 'connector'}
+        <ConnectorErrors
+          {pipelineName}
+          relationName={openDrawer.relationName}
+          connectorName={openDrawer.connectorName}
+          direction={openDrawer.direction}
+          filter={openDrawer.filter}
+          onClose={() => (openDrawer = null)}
+        />
+      {:else if openDrawer?.kind === 'checkpoints'}
+        <CheckpointsStatus
+          {checkpoints}
+          onClose={() => (openDrawer = null)}
+          onCheckpoint={() => api.checkpointPipeline(pipelineName)}
+          checkpointInProgress={metrics.current.checkpoint_activity.status !== 'idle'}
+        />
+      {/if}
+    </Drawer>
   </div>
 {/if}

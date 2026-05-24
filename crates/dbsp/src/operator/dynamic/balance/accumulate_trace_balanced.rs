@@ -13,10 +13,10 @@ use crate::{
             TOTAL_REBALANCING_TIME_SECONDS,
         },
         operator_traits::Operator,
-        splitter_output_chunk_size,
+        splitter_output_chunk_size, splitter_output_first_chunk_size,
     },
     circuit_cache_key, default_hasher,
-    dynamic::{ClonableTrait, Data as _, DataTrait, Erase, WeightTrait},
+    dynamic::{ClonableTrait, Data as _, Erase},
     operator::{
         Z1,
         async_stream_operators::{StreamingTernarySinkOperator, StreamingTernarySinkWrapper},
@@ -39,6 +39,7 @@ use crate::{
 };
 use async_stream::stream;
 use feldera_storage::{FileCommitter, StoragePath, fbuf::FBuf};
+use rkyv::AlignedVec;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
@@ -132,7 +133,6 @@ where
                     let runtime = Runtime::runtime().unwrap();
                     let exchange_id = runtime.sequence_next().try_into().unwrap();
                     let worker_index = Runtime::worker_index();
-                    let batch_factories_clone = batch_factories.clone();
                     let start_wait_usecs = Arc::new(AtomicU64::new(0));
                     let balancer = circuit.balancer();
 
@@ -141,21 +141,8 @@ where
                     // Exchange object. The Boolean flag signals that the sender won't produce more outputs
                     // during the current transaction. It will be set to `true` exactly once per transaction.
                     // Once all senders are flushed, the receiver can report itself as flushed too.
-                    let exchange: Arc<Exchange<(B, bool)>> = Exchange::with_runtime(
-                        &runtime,
-                        exchange_id,
-                        Box::new(move |mut vec| {
-                            let flush = match vec.pop().unwrap() {
-                                0 => false,
-                                1 => true,
-                                _ => unreachable!(),
-                            };
-                            (
-                                deserialize_indexed_wset(&batch_factories_clone, &vec),
-                                flush,
-                            )
-                        }),
-                    );
+                    let exchange: Arc<Exchange<(B, bool)>> =
+                        Exchange::with_runtime(&runtime, exchange_id);
 
                     // Exchange receiver
                     let batch_factories_clone = batch_factories.clone();
@@ -166,9 +153,13 @@ where
                         exchange.clone(),
                         || Vec::new(),
                         start_wait_usecs.clone(),
+                        move |vec: AlignedVec| {
+                            deserialize_indexed_wset(&batch_factories_clone, &vec)
+                        },
                         |batches: &mut Vec<B>, batch: B| batches.push(batch),
                     ));
 
+                    let batch_factories_clone = batch_factories.clone();
                     let sharded_stream =
                         receiver.apply_owned_named("merge shards", move |batches| {
                             // TODO: instead of merging the batches here, modify the BalancingAccumulator operator to accept a vector of batches
@@ -305,6 +296,10 @@ struct RebalanceState<B: Batch<Time = ()>> {
     /// The policy that was used to accumulate the integral before the rebalancing.
     /// This is the policy used during the previous transaction.
     trace_policy: PartitioningPolicy,
+
+    /// True if `trace_policy` differs from the current policy, i.e., the integral
+    /// must be retracted and redistributed before the transaction commits.
+    rebalance_trace: bool,
 }
 
 /// Information about the key distribution of the input stream.
@@ -361,7 +356,7 @@ impl KeyDistribution {
 /// Checkpointed state of the ExchangeSender operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RebalanceExchangeSenderCheckpoint {
-    current_policy: PartitioningPolicy,
+    current_policy: Option<PartitioningPolicy>,
     key_distribution: KeyDistribution,
 }
 
@@ -374,6 +369,7 @@ where
     batch_factories: B::Factories,
 
     global_id: GlobalNodeId,
+    global_id_string: Arc<String>,
 
     /// Origin node of the input to this operator.
     input_node_id: NodeId,
@@ -402,7 +398,11 @@ where
     num_steps_in_transaction: Cell<usize>,
 
     /// Current partitioning policy.
-    current_policy: Cell<PartitioningPolicy>,
+    ///
+    /// The policy is not set when the operator is first created. It must
+    /// be set by the balance before the first step. It is also set when restoring
+    /// from a checkpoint.
+    current_policy: Cell<Option<PartitioningPolicy>>,
 
     /// When Some(), the policy has changed during the current transaction, and the operator must rebalance
     /// accumulator and integral state before committing the transaction.
@@ -451,6 +451,10 @@ where
         Self {
             batch_factories: batch_factories.clone(),
             global_id: GlobalNodeId::root(),
+            global_id_string: Arc::new(format!(
+                "RebalancingExchangeSender {}",
+                exchange.exchange_id()
+            )),
             input_node_id,
             worker_index,
             location,
@@ -461,7 +465,7 @@ where
             input_batch_stats: BatchSizeStats::new(),
             flush_state: Cell::new(FlushState::FlushCompleted),
             num_steps_in_transaction: Cell::new(0),
-            current_policy: Cell::new(PartitioningPolicy::Shard),
+            current_policy: Cell::new(None),
             rebalance_state: RefCell::new(None),
             rebalance_start_time: Cell::new(None),
             num_rebalancings: Cell::new(0),
@@ -538,21 +542,25 @@ where
     ///   of the integral.
     fn update_policy(&self, new_policy: PartitioningPolicy, delayed_accumulator: Vec<Arc<B>>) {
         let old_policy = self.current_policy.get();
-        if old_policy == new_policy {
+        if old_policy == Some(new_policy) {
             return;
         }
 
         // Only log rebalancing in worker 0 to avoid spamming the logs.
         if Runtime::worker_index() == 0 {
             info!(
-                "rebalancing stream {}: {}->{} (key distribution: {})",
+                "Rebalancing stream {}: {}->{} (key distribution: {})",
                 self.input_node_id,
-                old_policy,
-                new_policy,
+                if let Some(policy) = old_policy {
+                    policy.to_string()
+                } else {
+                    "none".to_string()
+                },
+                new_policy.to_string(),
                 self.key_distribution.borrow()
             );
         }
-        self.current_policy.set(new_policy);
+        self.current_policy.set(Some(new_policy));
         self.num_rebalancings.update(|value| value + 1);
 
         // Discard the accumulator state, so we don't need to retract it explicitly.
@@ -561,7 +569,7 @@ where
         // If the accumulator was populated with broadcast policy, we want to re-balance only
         // one copy of the data.
         let accumulator_batches =
-            if old_policy != PartitioningPolicy::Broadcast || self.worker_index == 0 {
+            if old_policy != Some(PartitioningPolicy::Broadcast) || self.worker_index == 0 {
                 delayed_accumulator
             } else {
                 vec![]
@@ -572,14 +580,17 @@ where
                 retractions
                     .accumulator
                     .extend_with_batches(accumulator_batches);
+                retractions.rebalance_trace = retractions.trace_policy != new_policy;
             }
             retractions @ None => {
+                let trace_policy = old_policy.unwrap_or(PartitioningPolicy::Shard);
                 *retractions = Some(RebalanceState {
                     accumulator: SpineSnapshot::with_batches(
                         &self.batch_factories,
                         accumulator_batches,
                     ),
-                    trace_policy: old_policy,
+                    trace_policy,
+                    rebalance_trace: trace_policy != new_policy,
                 });
             }
         }
@@ -589,7 +600,11 @@ where
     ///
     /// Update key distribution stats.
     fn partition_batch(&self, delta: B) -> Vec<B> {
-        match self.current_policy.get() {
+        match self
+            .current_policy
+            .get()
+            .expect("RebalancingExchangeSender::partition_batch: current_policy is not set")
+        {
             PartitioningPolicy::Shard => self.shard_batch(delta),
             PartitioningPolicy::Balance => self.balance_batch(delta),
             PartitioningPolicy::Broadcast => self.broadcast_batch(delta),
@@ -608,7 +623,8 @@ where
     ) where
         TS: Timestamp,
     {
-        assert!(old_policy != self.current_policy.get());
+        assert_ne!(self.current_policy.get(), None);
+        assert_ne!(old_policy, self.current_policy.get().unwrap());
 
         match old_policy {
             PartitioningPolicy::Broadcast => self.repartition_after_broadcast(
@@ -639,7 +655,9 @@ where
     {
         let shards = builders.len();
 
-        match self.current_policy.get() {
+        match self.current_policy.get().expect(
+            "RebalancingExchangeSender::repartition_after_unicast: current policy is not set",
+        ) {
             PartitioningPolicy::Shard => {
                 while cursor.key_valid() {
                     let b = &mut builders[cursor.key().default_hash() as usize % shards];
@@ -747,7 +765,9 @@ where
     {
         let shards = Runtime::num_workers();
 
-        match self.current_policy.get() {
+        match self.current_policy.get().expect(
+            "RebalancingExchangeSender::repartition_after_broadcast: current policy is not set",
+        ) {
             PartitioningPolicy::Shard => {
                 while cursor.key_valid() {
                     let shard = cursor.key().default_hash() as usize % shards;
@@ -1006,6 +1026,46 @@ where
     fn checkpoint_file(base: &StoragePath, persistent_id: &str) -> StoragePath {
         base.child(format!("rebalancing-exchange-{}.dat", persistent_id))
     }
+
+    async fn send(
+        &self,
+        batches: impl IntoIterator<Item = B>,
+        flush_complete: bool,
+        serializer_inner: &mut Option<SerializerInner>,
+    ) {
+        self.exchange
+            .send_all_with_serializer(
+                &self.global_id_string,
+                batches.into_iter().map(|batch| (batch, flush_complete)),
+                |(batch, flush)| {
+                    let mut fbuf =
+                        serialize_indexed_wset(&batch, serializer_inner.get_or_insert_default());
+                    fbuf.push(flush as u8);
+                    fbuf
+                },
+            )
+            .await;
+    }
+
+    async fn send_builders(
+        &self,
+        builders: Vec<B::Builder>,
+        capacity: &mut usize,
+        flush_complete: bool,
+        serializer_inner: &mut Option<SerializerInner>,
+    ) -> Vec<B::Builder> {
+        let batches = builders
+            .into_iter()
+            .map(|builder| builder.done())
+            .inspect(|batch| {
+                if batch.key_count() > *capacity {
+                    *capacity = batch.key_count();
+                }
+            });
+
+        self.send(batches, flush_complete, serializer_inner).await;
+        self.create_builders(*capacity)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1028,7 +1088,7 @@ pub struct RebalancingExchangeSenderExchangeMetadata {
     pub flush_state: FlushState,
 
     /// Currently selected sharding policy.
-    pub current_policy: PartitioningPolicy,
+    pub current_policy: Option<PartitioningPolicy>,
 
     /// Key distribution of the input stream computed based on the inputs received by the current worker.
     pub key_distribution: KeyDistribution,
@@ -1047,7 +1107,7 @@ where
         meta.extend(metadata! {
             INPUT_BATCHES_STATS => self.input_batch_stats.metadata(),
             KEY_DISTRIBUTION => self.key_distribution.borrow().meta_item(),
-            BALANCER_POLICY => MetaItem::String(self.current_policy.get().to_string()),
+            BALANCER_POLICY => MetaItem::String(self.current_policy.get().map(|policy| policy.to_string()).unwrap_or("none".to_string())),
             RABALANCINGS_COUNT => MetaItem::Count(self.num_rebalancings.get()),
             REBALANCING_IN_PROGRESS => MetaItem::Bool(self.rebalancing_in_progress()),
             ACCUMULATOR_RECORDS_TO_REPARTITION_COUNT => MetaItem::Count(self.rebalance_accumulator_size.get()),
@@ -1083,6 +1143,10 @@ where
 
     fn init(&mut self, global_id: &GlobalNodeId) {
         self.global_id = global_id.clone();
+        self.global_id_string = Arc::new(format!(
+            "RebalancingExchangeSender {}",
+            global_id.node_identifier()
+        ));
     }
 
     fn register_ready_callback<F>(&mut self, cb: F)
@@ -1165,18 +1229,25 @@ where
             })?;
 
         self.current_policy.set(checkpoint.current_policy);
-        self.balancer
-            .set_policy_for_stream(self.input_node_id, checkpoint.current_policy);
-        *self.key_distribution.borrow_mut() = checkpoint.key_distribution;
 
-        // Report current policy to metadata_exchange. See invalidate_clusters_for_bootstrapping.
-        self.update_exchange_metadata();
+        if let Some(policy) = checkpoint.current_policy {
+            // Normally the current policy is communicated to the balancer before every step
+            // via metadata_exchange, but if the restored node is disabled during bootstrapping,
+            // it doesn't participate in steps, so we need to set the policy explicitly.
+            // This policy will be:
+            // - Used to determine if the cluster needs to be invalidated during bootstrapping
+            //   (see `BalancerInner::invalidate_clusters_for_bootstrapping`).
+            // - Frozen during replay (see `BalancerInner::get_fixed_policy`).
+            self.balancer
+                .set_policy_for_stream(self.input_node_id, policy);
+        }
+        *self.key_distribution.borrow_mut() = checkpoint.key_distribution;
 
         Ok(())
     }
 
     fn clear_state(&mut self) -> Result<(), crate::Error> {
-        self.current_policy.set(PartitioningPolicy::Shard);
+        self.current_policy.set(None);
         *self.key_distribution.borrow_mut() = KeyDistribution::new(Runtime::num_workers());
 
         // Clear the metadata. If the operator is deactivated during bootstrapping, its metadata
@@ -1206,6 +1277,11 @@ where
         let mut delayed_trace = delayed_trace.ro_snapshot();
         let chunk_size = splitter_output_chunk_size();
 
+        // Capacity for the builders that we create.  We don't want to initially
+        // allocate the full `chunk_size`, because it might be bigger than
+        // memory, e.g. if it's `usize::MAX`.
+        let mut builder_capacity = splitter_output_first_chunk_size();
+
         let delta = delta.into_owned();
 
         self.num_steps_in_transaction.update(|steps| steps + 1);
@@ -1229,21 +1305,6 @@ where
         // retractions? Because otherwise retractions will not appear in the output of the accumulator, which is in turn
         // used as input to other operators such as join (see `accumulator_stream` in the diagram above).
         let mut serializer_inner = None;
-        fn serialize_with_flush<B, K, V, R>(
-            (batch, flush): (B, bool),
-            serializer_inner: &mut Option<SerializerInner>,
-        ) -> FBuf
-        where
-            B: BatchReader<Key = K, Val = V, Time = (), R = R>,
-            K: DataTrait + ?Sized,
-            V: DataTrait + ?Sized,
-            R: WeightTrait + ?Sized,
-        {
-            let mut fbuf = serialize_indexed_wset(&batch, serializer_inner.get_or_insert_default());
-            fbuf.push(flush as u8);
-            fbuf
-        }
-
         stream! {
             // Policy change? Update rebalancing state.
             let new_policy = self.balancer.get_optimal_policy(self.input_node_id).unwrap();
@@ -1255,13 +1316,9 @@ where
                 // if *self.current_policy.borrow() != new_policy  {
                 //     println!("{}: current_policy: {:?}, new_policy: {:?}", self.input_node_id, *self.current_policy.borrow(), new_policy);
                 // }
-                assert_eq!(self.current_policy.get(), new_policy);
+                assert_eq!(self.current_policy.get().unwrap(), new_policy);
                 // ExchangeReceiver expects precisely one flush per transaction.
-                assert!(self.exchange.try_send_all_with_serializer(
-                    self.worker_index,
-                    repeat((B::dyn_empty(&batch_factories), false)),
-                    |args| serialize_with_flush(args, &mut serializer_inner)));
-
+                self.send(repeat(B::dyn_empty(&batch_factories)), false, &mut serializer_inner).await;
                 self.update_exchange_metadata();
                 yield (true, None);
                 return;
@@ -1289,12 +1346,7 @@ where
             // println!("{}: delta: {:?}", Runtime::worker_index(), batches);
 
             let flush_complete = ready_to_commit && self.rebalance_state.borrow().is_none();
-
-            assert!(self.exchange.try_send_all_with_serializer(
-                self.worker_index,
-                batches.into_iter().map(|batch| (batch, flush_complete)),
-                |args| serialize_with_flush(args, &mut serializer_inner)
-            ));
+            self.send(batches, flush_complete, &mut serializer_inner).await;
 
             if !rebalance {
                 if flush_complete {
@@ -1319,28 +1371,47 @@ where
             // Used to measure step duration and add it to the total rebalancing time.
             let mut step_start_time = Instant::now();
 
-            let RebalanceState { mut accumulator, trace_policy } = self.rebalance_state.borrow_mut().take().unwrap();
+            let RebalanceState {
+                mut accumulator,
+                trace_policy,
+                rebalance_trace,
+            } = self.rebalance_state.borrow_mut().take().unwrap();
 
             self.rebalance_accumulator_size.set(accumulator.len());
-            self.rebalance_integral_size.set(delayed_trace.len());
+            self.rebalance_integral_size.set(if rebalance_trace {
+                delayed_trace.len()
+            } else {
+                0
+            });
 
             let mut integral_cursor = delayed_trace.cursor();
 
-            let mut builders = self.create_builders(chunk_size);
+            let mut builders = self.create_builders(builder_capacity);
 
             // Retract the contents of the integral by sending it with negated weights to the accumulator
             // in the same worker.
-            while integral_cursor.key_valid() {
-                self.process_retractions(&mut integral_cursor, &mut builders[self.worker_index], chunk_size);
+            if rebalance_trace {
+                while integral_cursor.key_valid() {
+                    self.process_retractions(
+                        &mut integral_cursor,
+                        &mut builders[self.worker_index],
+                        chunk_size,
+                    );
 
-                let batches = builders.into_iter().map(|builder| (builder.done(), false));
-                // println!("{}: integral retractions: {:?}", Runtime::worker_index(), batches);
-                assert!(self.exchange.try_send_all_with_serializer(self.worker_index, batches, |args| serialize_with_flush(args, &mut serializer_inner)));
-                builders = self.create_builders(chunk_size);
-                self.update_exchange_metadata();
-                self.update_total_rebalancing_time(&step_start_time);
-                yield (false, None);
-                step_start_time = Instant::now();
+                    // println!("{}: integral retractions: {:?}", Runtime::worker_index(), batches);
+                    builders = self
+                        .send_builders(
+                            builders,
+                            &mut builder_capacity,
+                            false,
+                            &mut serializer_inner,
+                        )
+                        .await;
+                    self.update_exchange_metadata();
+                    self.update_total_rebalancing_time(&step_start_time);
+                    yield (false, None);
+                    step_start_time = Instant::now();
+                }
             }
 
             // Start new cursors.
@@ -1351,10 +1422,8 @@ where
             while accumulator_cursor.key_valid() {
                 self.repartition_after_unicast(&mut accumulator_cursor, &mut builders, chunk_size);
 
-                let batches = builders.into_iter().map(|builder| (builder.done(), false));
                 // println!("{}: acc insertions: {:?}", Runtime::worker_index(), batches);
-                assert!(self.exchange.try_send_all_with_serializer(self.worker_index, batches, |args| serialize_with_flush(args, &mut serializer_inner)));
-                builders = self.create_builders(chunk_size);
+                builders = self.send_builders(builders, &mut builder_capacity, false, &mut serializer_inner).await;
                 self.update_exchange_metadata();
                 self.update_total_rebalancing_time(&step_start_time);
                 yield (false, None);
@@ -1362,39 +1431,45 @@ where
             }
 
             // Repartition integral.
-            while integral_cursor.key_valid() {
-                self.repartition(trace_policy, &mut integral_cursor, &mut builders, chunk_size);
+            if rebalance_trace {
+                while integral_cursor.key_valid() {
+                    self.repartition(trace_policy, &mut integral_cursor, &mut builders, chunk_size);
 
-                let batches = builders.into_iter().map(|builder| (builder.done(), !integral_cursor.key_valid()));
-                // println!("{}: integral insertions: {:?}", Runtime::worker_index(), batches);
-                assert!(self.exchange.try_send_all_with_serializer(self.worker_index, batches, |args| serialize_with_flush(args, &mut serializer_inner)));
-                builders = self.create_builders(chunk_size);
-                self.update_exchange_metadata();
-
-                if integral_cursor.key_valid(){
+                    // println!("{}: integral insertions: {:?}", Runtime::worker_index(), batches);
+                    builders = self
+                        .send_builders(
+                            builders,
+                            &mut builder_capacity,
+                            !integral_cursor.key_valid(),
+                            &mut serializer_inner,
+                        )
+                        .await;
                     self.update_exchange_metadata();
-                    self.update_total_rebalancing_time(&step_start_time);
-                    yield (false, None);
-                    step_start_time = Instant::now();
-                } else {
-                    // if Runtime::worker_index() == 0 {
-                    //     println!("{}: flush complete 2 ({:?})", self.input_node_id, *self.current_policy.borrow());
-                    // }
 
-                    self.flush_state.set(FlushState::FlushCompleted);
-                    self.update_exchange_metadata();
-                    self.rebalance_accumulator_size.set(0);
-                    self.rebalance_integral_size.set(0);
-                    self.update_total_rebalancing_time(&step_start_time);
-                    self.rebalance_start_time.set(None);
-                    yield (true, None);
-                    return;
+                    if integral_cursor.key_valid() {
+                        self.update_exchange_metadata();
+                        self.update_total_rebalancing_time(&step_start_time);
+                        yield (false, None);
+                        step_start_time = Instant::now();
+                    } else {
+                        // if Runtime::worker_index() == 0 {
+                        //     println!("{}: flush complete 2 ({:?})", self.input_node_id, *self.current_policy.borrow());
+                        // }
+
+                        self.flush_state.set(FlushState::FlushCompleted);
+                        self.update_exchange_metadata();
+                        self.rebalance_accumulator_size.set(0);
+                        self.rebalance_integral_size.set(0);
+                        self.update_total_rebalancing_time(&step_start_time);
+                        self.rebalance_start_time.set(None);
+                        yield (true, None);
+                        return;
+                    }
                 }
             }
 
-            let batches = builders.into_iter().map(|builder| (builder.done(), true));
             // println!("{}: final batches: {:?}", Runtime::worker_index(), batches);
-            assert!(self.exchange.try_send_all_with_serializer(self.worker_index, batches, |args| serialize_with_flush(args, &mut serializer_inner)));
+            self.send_builders(builders, &mut builder_capacity, true, &mut serializer_inner).await;
 
             // if Runtime::worker_index() == 0 {
             //     println!("{}: flush complete 3 ({:?})", self.input_node_id, *self.current_policy.borrow());

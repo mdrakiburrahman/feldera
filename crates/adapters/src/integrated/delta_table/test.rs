@@ -94,12 +94,529 @@ where
         &json_file.path().display().to_string(),
     );
     input_pipeline.start();
-    wait(|| input_pipeline.status().pipeline_complete(), 400_000).expect("timeout");
+    wait(|| input_pipeline.pipeline_complete(), 400_000).expect("timeout");
     input_pipeline.stop().unwrap();
 
     info!("Read delta snapshot in {:?}", start.elapsed());
 
     json_file
+}
+
+/// Register the object stores required by delta-rs 0.31.x `TableProvider` scans.
+fn register_delta_table_object_stores(datafusion: &SessionContext, table: &DeltaTable) {
+    let log_store = table.log_store();
+    let runtime_env = datafusion.runtime_env();
+    runtime_env.register_object_store(
+        log_store.object_store_url().as_ref(),
+        log_store.object_store(None),
+    );
+    runtime_env.register_object_store(log_store.root_url(), log_store.root_object_store(None));
+}
+
+const DELTA_TEST_INPUT_ENDPOINT: &str = "test_input1";
+
+/// Completed Delta table version reported by the input connector waterline.
+fn pipeline_completed_version(pipeline: &Controller) -> Option<i64> {
+    pipeline
+        .status()
+        .input_status()
+        .values()
+        .next()
+        .and_then(|s| s.completed_frontier.completed_watermark())
+        .and_then(|w| w.metadata["version"].as_i64())
+}
+
+/// One deterministic test row (even `bigint` so `bigint % 2 = 0` filters pass).
+fn delta_test_record(bigint: i64) -> DeltaTestStruct {
+    let mut runner = TestRunner::default();
+    let mut record = DeltaTestStruct::arbitrary()
+        .new_tree(&mut runner)
+        .unwrap()
+        .current();
+    record.bigint = bigint;
+    record
+}
+
+/// Append a single row, producing exactly one new Delta table version.
+async fn append_table_version(
+    table: DeltaTable,
+    arrow_schema: &ArrowSchema,
+    record: &DeltaTestStruct,
+) -> DeltaTable {
+    write_data_to_table(table, arrow_schema, std::slice::from_ref(record)).await
+}
+
+fn delta_connector_counter(pipeline: &Controller, metric_name: &str) -> u64 {
+    delta_connector_gauge(pipeline, metric_name) as u64
+}
+
+fn delta_connector_gauge(pipeline: &Controller, metric_name: &str) -> f64 {
+    let endpoint_id = pipeline
+        .input_endpoint_id_by_name(DELTA_TEST_INPUT_ENDPOINT)
+        .expect("delta input endpoint must exist");
+    let custom_metrics = pipeline
+        .status()
+        .input_status()
+        .get(&endpoint_id)
+        .and_then(|status| status.custom_metrics.clone())
+        .expect("delta input connector must expose custom metrics");
+    custom_metrics
+        .metrics()
+        .iter()
+        .find(|(name, ..)| *name == metric_name)
+        .map(|(_, _, _, value)| *value)
+        .unwrap_or(0.0)
+}
+
+fn delta_version_gauge(pipeline: &Controller, metric_name: &str) -> Option<i64> {
+    let version = delta_connector_gauge(pipeline, metric_name);
+    if version < 0.0 {
+        None
+    } else {
+        Some(version as i64)
+    }
+}
+
+/// Last Delta table version ingested by the connector (`None` if none yet).
+fn delta_last_ingested_version(pipeline: &Controller) -> Option<i64> {
+    delta_version_gauge(pipeline, "input_connector_delta_last_ingested_version")
+}
+
+/// Target Delta table version for the in-flight catchup window (`None` if none).
+fn delta_catchup_target_version(pipeline: &Controller) -> Option<i64> {
+    delta_version_gauge(pipeline, "input_connector_delta_catchup_target_version")
+}
+
+/// Number of Feldera follow transactions the Delta input connector started.
+fn delta_follow_transaction_starts(pipeline: &Controller) -> u64 {
+    delta_connector_counter(pipeline, "input_connector_delta_follow_transaction_starts")
+}
+
+/// Number of Feldera snapshot transactions the Delta input connector started.
+fn delta_snapshot_transaction_starts(pipeline: &Controller) -> u64 {
+    delta_connector_counter(
+        pipeline,
+        "input_connector_delta_snapshot_transaction_starts",
+    )
+}
+
+/// Connector phase (`0` = loading snapshot, `1` = follow, `2` = completed).
+fn delta_connector_phase(pipeline: &Controller) -> u64 {
+    delta_connector_counter(pipeline, "input_connector_delta_phase")
+}
+
+async fn wait_for_delta_connector_phase(pipeline: &Controller, phase: u64, timeout_ms: u64) {
+    let start = Instant::now();
+    loop {
+        if delta_connector_phase(pipeline) == phase {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(timeout_ms),
+            "timeout waiting for connector phase {phase} (current: {})",
+            delta_connector_phase(pipeline),
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Outcome of [`run_catchup_lag_experiment`].
+struct CatchupLagExperimentResult {
+    /// Total `input_connector_delta_snapshot_transaction_starts` when the experiment finishes.
+    snapshot_transaction_starts: u64,
+    /// Feldera follow transactions started in each pause/write/resume round.
+    follow_transactions_per_round: Vec<u64>,
+    /// Last input waterline Delta version observed (if any).
+    completed_version: Option<i64>,
+    /// Whether the input endpoint was unhealthy when the experiment ended.
+    ended_unhealthy: bool,
+}
+
+/// Configuration for [`run_catchup_lag_experiment`].
+struct CatchupLagExperimentOptions<'a> {
+    transaction_mode: DeltaTableTransactionMode,
+    versions_per_round: &'a [i64],
+    end_version: Option<i64>,
+    snapshot_rows: Option<i64>,
+    max_retries: Option<u32>,
+    /// Strip read permission on the input table root before resuming this round (Unix only).
+    inject_read_failure_before_resume_round: Option<usize>,
+    /// After injection, wait for unhealthy health and restore permissions before continuing.
+    clear_read_failure_after_unhealthy: bool,
+    /// When true, ingestion must not reach the round's target version; skips output validation.
+    expect_ingest_failure: bool,
+}
+
+fn catchup_lag_options<'a>(
+    transaction_mode: DeltaTableTransactionMode,
+    versions_per_round: &'a [i64],
+    end_version: Option<i64>,
+    snapshot_rows: Option<i64>,
+) -> CatchupLagExperimentOptions<'a> {
+    CatchupLagExperimentOptions {
+        transaction_mode,
+        versions_per_round,
+        end_version,
+        snapshot_rows,
+        max_retries: None,
+        inject_read_failure_before_resume_round: None,
+        clear_read_failure_after_unhealthy: false,
+        expect_ingest_failure: false,
+    }
+}
+
+fn input_endpoint_is_unhealthy(pipeline: &Controller) -> bool {
+    pipeline
+        .input_endpoint_status(DELTA_TEST_INPUT_ENDPOINT)
+        .ok()
+        .and_then(|s| s.health)
+        .is_some_and(|h| {
+            matches!(
+                h.status,
+                feldera_types::adapter_stats::ConnectorHealthStatus::Unhealthy
+            )
+        })
+}
+
+fn wait_input_endpoint_unhealthy(pipeline: &Controller, timeout_ms: u128) {
+    wait(|| input_endpoint_is_unhealthy(pipeline), timeout_ms)
+        .unwrap_or_else(|_| panic!("timeout waiting for input connector to become unhealthy"));
+}
+
+fn wait_input_endpoint_healthy(pipeline: &Controller, timeout_ms: u128) {
+    wait(
+        || {
+            pipeline
+                .input_endpoint_status(DELTA_TEST_INPUT_ENDPOINT)
+                .ok()
+                .and_then(|s| s.health)
+                .is_some_and(|h| {
+                    matches!(
+                        h.status,
+                        feldera_types::adapter_stats::ConnectorHealthStatus::Healthy
+                    )
+                })
+        },
+        timeout_ms,
+    )
+    .unwrap_or_else(|_| panic!("timeout waiting for input connector to become healthy"));
+}
+
+/// Build a Delta input pipeline and, for each entry in `versions_per_round`, pause the connector
+/// (when needed), append that many Delta commits, resume, and wait for ingestion to catch up.
+///
+/// With `snapshot_rows`, uses `snapshot_and_follow`: writes that many rows before starting the
+/// pipeline (unpaused), waits for the follow phase, and checks that the snapshot used exactly one
+/// Feldera transaction before running follow rounds.
+async fn run_catchup_lag_experiment(
+    opts: CatchupLagExperimentOptions<'_>,
+) -> CatchupLagExperimentResult {
+    const DELTA_PHASE_FOLLOW: u64 = 1;
+    init_logging();
+
+    let CatchupLagExperimentOptions {
+        transaction_mode,
+        versions_per_round,
+        end_version,
+        snapshot_rows,
+        max_retries,
+        inject_read_failure_before_resume_round,
+        clear_read_failure_after_unhealthy,
+        expect_ingest_failure,
+    } = opts;
+
+    let relation_schema = DeltaTestStruct::schema();
+    let arrow_fields = relation_to_arrow_fields(&relation_schema, true);
+    let arrow_schema = ArrowSchema::new(arrow_fields);
+
+    let input_table_dir = TempDir::new().unwrap();
+    let input_table_uri = input_table_dir.path().display().to_string();
+    let output_table_dir = TempDir::new().unwrap();
+    let output_table_uri = output_table_dir.path().display().to_string();
+    let storage_dir = TempDir::new().unwrap();
+
+    let mut table = create_table(&input_table_uri, &HashMap::new(), &{
+        let mut struct_fields = Vec::new();
+        for f in arrow_schema.fields.iter() {
+            let data_type = DataType::try_from_arrow(f.data_type()).unwrap();
+            struct_fields.push(StructField::new(f.name(), data_type, f.is_nullable()));
+        }
+        struct_fields
+    })
+    .await;
+
+    let snapshot_and_follow = snapshot_rows.is_some();
+    let mut expected_output = Vec::new();
+    let mut record_index: i64 = 0;
+
+    if let Some(snapshot_rows) = snapshot_rows {
+        let mut snapshot_records = Vec::with_capacity(snapshot_rows as usize);
+        for i in 0..snapshot_rows {
+            let mut record = delta_test_record(i * 2);
+            record.unused = None;
+            snapshot_records.push(record);
+        }
+        table = write_data_to_table(table, &arrow_schema, &snapshot_records).await;
+        expected_output.extend(snapshot_records);
+        record_index = snapshot_rows;
+    }
+
+    let mut input_config: HashMap<String, Value> = HashMap::new();
+    input_config.insert(
+        "mode".into(),
+        if snapshot_and_follow {
+            "snapshot_and_follow"
+        } else {
+            "follow"
+        }
+        .into(),
+    );
+    input_config.insert(
+        "transaction_mode".into(),
+        serde_json::to_value(transaction_mode).unwrap(),
+    );
+    input_config.insert("filter".into(), "bigint % 2 = 0".into());
+    if let Some(end_version) = end_version {
+        input_config.insert("end_version".into(), end_version.into());
+    }
+    if let Some(max_retries) = max_retries {
+        input_config.insert("max_retries".into(), max_retries.into());
+    }
+
+    let input_table_root = input_table_dir.path().to_path_buf();
+
+    // Follow-only: start paused so the first round can build lag. Snapshot-and-follow: start
+    // running so the connector ingests the initial snapshot immediately.
+    let start_paused = !snapshot_and_follow;
+
+    let storage_dir_path = storage_dir.path().to_path_buf();
+    let input_table_uri_clone = input_table_uri.clone();
+    let output_table_uri_clone = output_table_uri.clone();
+    let input_config_clone = input_config.clone();
+    let pipeline = tokio::task::spawn_blocking(move || {
+        delta_to_delta_pipeline::<DeltaTestStruct>(
+            &input_table_uri_clone,
+            true,
+            &input_config_clone,
+            &output_table_uri_clone,
+            &HashMap::new(),
+            1000,
+            100,
+            &storage_dir_path,
+            start_paused,
+        )
+    })
+    .await
+    .unwrap();
+
+    pipeline.start();
+
+    if snapshot_and_follow {
+        wait_for_delta_connector_phase(&pipeline, DELTA_PHASE_FOLLOW, 120_000).await;
+        assert_eq!(
+            delta_snapshot_transaction_starts(&pipeline),
+            1,
+            "catchup must ingest the initial snapshot in one Feldera transaction"
+        );
+        assert_eq!(
+            delta_follow_transaction_starts(&pipeline),
+            0,
+            "follow transactions must not start until the follow phase ingests log commits"
+        );
+        assert_eq!(
+            delta_last_ingested_version(&pipeline),
+            Some(table.version().unwrap()),
+            "last_ingested_version must reflect the snapshot version"
+        );
+        assert_eq!(
+            delta_catchup_target_version(&pipeline),
+            None,
+            "catchup_target_version must be unset before the first catchup window"
+        );
+    } else {
+        // `connect_input` during controller construction blocks until the Delta worker finishes
+        // `open_table` and sends init `Ok`, then parks on `wait_running` while still paused.
+        assert!(
+            pipeline
+                .is_input_endpoint_paused(DELTA_TEST_INPUT_ENDPOINT)
+                .unwrap(),
+            "connector must start paused so we can build an exact log lag"
+        );
+    }
+
+    let mut transactions_per_round = Vec::with_capacity(versions_per_round.len());
+    let mut ingest_failed_as_expected = false;
+
+    'rounds: for (round, &num_versions) in versions_per_round.iter().enumerate() {
+        if snapshot_and_follow || round > 0 {
+            pipeline
+                .pause_input_endpoint(DELTA_TEST_INPUT_ENDPOINT)
+                .unwrap();
+            wait(
+                || {
+                    pipeline
+                        .is_input_endpoint_paused(DELTA_TEST_INPUT_ENDPOINT)
+                        .unwrap_or(false)
+                },
+                60_000,
+            )
+            .expect("timeout waiting for input endpoint to pause");
+        }
+
+        let metric_at_round_start = delta_follow_transaction_starts(&pipeline);
+        let version_before_burst = table.version().unwrap();
+
+        for _ in 0..num_versions {
+            let record = delta_test_record(record_index * 2);
+            record_index += 1;
+            table = append_table_version(table, &arrow_schema, &record).await;
+            let new_version = table.version().unwrap();
+            if end_version.is_none() || new_version <= end_version.unwrap() {
+                let mut record = record;
+                record.unused = None;
+                expected_output.push(record);
+            }
+        }
+
+        let version_after_burst = table.version().unwrap();
+        assert_eq!(
+            version_after_burst,
+            version_before_burst + num_versions,
+            "round {round}: each append must add exactly one Delta commit"
+        );
+
+        assert!(
+            pipeline_completed_version(&pipeline).is_none_or(|v| v < version_after_burst),
+            "round {round}: connector must not ingest commits written while paused \
+             (completed version: {:?}, table version: {version_after_burst})",
+            pipeline_completed_version(&pipeline),
+        );
+
+        let inject_read_failure = inject_read_failure_before_resume_round == Some(round);
+        #[cfg(unix)]
+        let mut permission_restore: Option<Vec<(PathBuf, u32)>> = None;
+        #[cfg(unix)]
+        if inject_read_failure {
+            let mut saved = Vec::new();
+            strip_delta_input_table_read_permission(&input_table_root, &mut saved).unwrap_or_else(
+                |e| panic!("round {round}: inject read failure on delta input table: {e}"),
+            );
+            permission_restore = Some(saved);
+        }
+        #[cfg(not(unix))]
+        if inject_read_failure {
+            panic!("read-failure injection requires a Unix platform");
+        }
+
+        pipeline
+            .start_input_endpoint(DELTA_TEST_INPUT_ENDPOINT)
+            .unwrap();
+
+        let target_version = end_version
+            .map(|end| min(version_after_burst, end))
+            .unwrap_or(version_after_burst);
+
+        if inject_read_failure && clear_read_failure_after_unhealthy {
+            wait_input_endpoint_unhealthy(&pipeline, 60_000);
+            #[cfg(unix)]
+            if let Some(saved) = permission_restore.take() {
+                restore_delta_input_table_read_permission(saved).unwrap_or_else(|e| {
+                    panic!("round {round}: restore read permission on delta input table: {e}")
+                });
+            }
+            wait_input_endpoint_healthy(&pipeline, 60_000);
+        }
+
+        let round_timeout = if expect_ingest_failure {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(120)
+        };
+
+        let start = Instant::now();
+        loop {
+            if let Some(catchup_target) = delta_catchup_target_version(&pipeline) {
+                assert_eq!(
+                    catchup_target, target_version,
+                    "round {round}: catchup_target_version metric must match the active window"
+                );
+            }
+            if pipeline_completed_version(&pipeline) == Some(target_version) {
+                if expect_ingest_failure {
+                    panic!(
+                        "round {round}: connector reached version {target_version} but ingest failure was expected"
+                    );
+                }
+                break;
+            }
+            if start.elapsed() >= round_timeout {
+                if expect_ingest_failure {
+                    assert!(
+                        pipeline_completed_version(&pipeline).is_none_or(|v| v < target_version),
+                        "round {round}: connector must not ingest version {target_version} after fatal error \
+                         (completed: {:?})",
+                        pipeline_completed_version(&pipeline),
+                    );
+                    ingest_failed_as_expected = true;
+                    break 'rounds;
+                }
+                panic!(
+                    "round {round}: timeout waiting for connector to reach version {target_version} \
+                     (completed: {:?})",
+                    pipeline_completed_version(&pipeline),
+                );
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            delta_last_ingested_version(&pipeline),
+            Some(target_version),
+            "last_ingested_version metric must track the completed waterline"
+        );
+        assert_eq!(
+            delta_catchup_target_version(&pipeline),
+            None,
+            "catchup_target_version metric must be cleared after the window closes"
+        );
+
+        let metric_at_round_end = delta_follow_transaction_starts(&pipeline);
+        transactions_per_round.push(metric_at_round_end - metric_at_round_start);
+    }
+
+    if expect_ingest_failure && !ingest_failed_as_expected {
+        panic!("expected ingest to fail but all rounds reached their target versions");
+    }
+
+    if !expect_ingest_failure {
+        let datafusion = SessionContext::new();
+        let mut output_table = Arc::new(
+            DeltaTableBuilder::from_url(ensure_table_uri(&output_table_uri).unwrap())
+                .unwrap()
+                .load()
+                .await
+                .unwrap(),
+        );
+        wait_for_output_records::<DeltaTestStruct>(
+            &mut output_table,
+            &expected_output,
+            &datafusion,
+            60_000,
+            false,
+        )
+        .await;
+    }
+
+    let snapshot_transaction_starts = delta_snapshot_transaction_starts(&pipeline);
+    let completed_version = pipeline_completed_version(&pipeline);
+    let ended_unhealthy = input_endpoint_is_unhealthy(&pipeline);
+    pipeline.stop().unwrap();
+    CatchupLagExperimentResult {
+        snapshot_transaction_starts,
+        follow_transactions_per_round: transactions_per_round,
+        completed_version,
+        ended_unhealthy,
+    }
 }
 
 /// Wait until `table` contains exactly `expected_count` records.
@@ -113,6 +630,7 @@ async fn wait_for_output_records<T>(
     T: for<'a> DeserializeWithContext<'a, SqlSerdeConfig, Variant> + DBData,
 {
     let start = Instant::now();
+    register_delta_table_object_stores(datafusion, table);
     loop {
         // select count() output_table == len().
         Arc::get_mut(table)
@@ -121,8 +639,12 @@ async fn wait_for_output_records<T>(
             .await
             .unwrap();
 
+        let provider = table
+            .table_provider()
+            .await
+            .expect("table_provider() failed while polling output table in test");
         let data = datafusion
-            .read_table(table.clone())
+            .read_table(provider)
             .unwrap()
             .collect()
             .await
@@ -449,6 +971,7 @@ where
                 &key_fields,
                 key_func,
                 &[Some("output")],
+                false,
             ))
         },
         &config,
@@ -530,6 +1053,7 @@ where
                 &key_fields,
                 key_func,
                 &[Some("output")],
+                false,
             ))
         },
         &config,
@@ -542,6 +1066,8 @@ where
 ///
 /// * `verify` - verify the final contents of the delta table is equivalent to
 ///   `data`.  Currently only works for tables in the local FS.
+/// * `index_is_alias` - if true, uses catalog.register_materialized_output_map_persistent with
+///    index_is_alias=true to register index; otherwise, uses catalog.register_index_persistent.
 ///
 /// TODO: implement verification using the delta table API rather than
 /// by reading parquet files directly.  I guess the best way to do this is
@@ -552,6 +1078,7 @@ fn delta_table_output_test(
     object_store_config: &HashMap<String, String>,
     verify: bool,
     threads: Option<usize>,
+    index_is_alias: bool,
 ) {
     init_logging();
 
@@ -624,13 +1151,14 @@ fn delta_table_output_test(
     .unwrap();
 
     let controller = Controller::with_test_config(
-        |workers| {
+        move |workers| {
             Ok(test_circuit_with_index::<DeltaTestStruct, DeltaTestKey, _>(
                 workers,
                 &DeltaTestStruct::schema(),
                 &[SqlIdentifier::from("bigint")],
                 |x: &DeltaTestStruct| DeltaTestKey { bigint: x.bigint },
                 &[None],
+                index_is_alias,
             ))
         },
         &config,
@@ -640,7 +1168,7 @@ fn delta_table_output_test(
 
     controller.start();
 
-    wait(|| controller.status().pipeline_complete(), 100_000).unwrap();
+    wait(|| controller.pipeline_complete(), 100_000).unwrap();
 
     if verify {
         let parquet_files =
@@ -1168,6 +1696,7 @@ async fn test_cdc(
     data: Vec<DeltaTestStruct>,
     suspend: bool,
     index: bool,
+    transaction_mode: DeltaTableTransactionMode,
 ) {
     init_logging();
 
@@ -1206,6 +1735,14 @@ async fn test_cdc(
         "__feldera_op = 'd'".to_string(),
     );
     input_config.insert("cdc_order_by".to_string(), "__feldera_ts".to_string());
+    input_config.insert(
+        "transaction_mode".to_string(),
+        serde_json::to_value(transaction_mode)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string(),
+    );
 
     let table_uri_clone = table_uri.to_string();
 
@@ -1444,38 +1981,38 @@ async fn delta_table_follow_file_test_common(
     // With `end_version`, the connector stops tailing the log before new versions appear, so
     // stripping read permission would not drive the connector unhealthy (wait would time out).
     #[cfg(unix)]
-    let (inject_failure, clear_failure): (Option<Box<dyn Fn()>>, Option<Box<dyn Fn()>>) =
-        if end_version {
-            (None, None)
-        } else {
-            let saved_modes: Arc<Mutex<Vec<(PathBuf, u32)>>> = Arc::new(Mutex::new(Vec::new()));
-            let input_root = input_table_dir.path().to_path_buf();
+    type FailureHook = Option<Box<dyn Fn()>>;
+    #[cfg(unix)]
+    let (inject_failure, clear_failure): (FailureHook, FailureHook) = if end_version {
+        (None, None)
+    } else {
+        let saved_modes: Arc<Mutex<Vec<(PathBuf, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let input_root = input_table_dir.path().to_path_buf();
 
-            let inject_failure: Box<dyn Fn()> = {
-                let saved_modes = Arc::clone(&saved_modes);
-                let input_root = input_root.clone();
-                Box::new(move || {
-                    let mut guard = saved_modes.lock().unwrap();
-                    guard.clear();
-                    strip_delta_input_table_read_permission(&input_root, &mut *guard)
-                        .unwrap_or_else(|e| {
-                            panic!("inject_failure (strip read permission on input table): {e}")
-                        });
-                })
-            };
-
-            let clear_failure: Box<dyn Fn()> = {
-                let saved_modes = Arc::clone(&saved_modes);
-                Box::new(move || {
-                    let entries = std::mem::take(&mut *saved_modes.lock().unwrap());
-                    restore_delta_input_table_read_permission(entries).unwrap_or_else(|e| {
-                        panic!("clear_failure (restore read permission on input table): {e}")
-                    });
-                })
-            };
-
-            (Some(inject_failure), Some(clear_failure))
+        let inject_failure: Box<dyn Fn()> = {
+            let saved_modes = Arc::clone(&saved_modes);
+            let input_root = input_root.clone();
+            Box::new(move || {
+                let mut guard = saved_modes.lock().unwrap();
+                guard.clear();
+                strip_delta_input_table_read_permission(&input_root, &mut guard).unwrap_or_else(
+                    |e| panic!("inject_failure (strip read permission on input table): {e}"),
+                );
+            })
         };
+
+        let clear_failure: Box<dyn Fn()> = {
+            let saved_modes = Arc::clone(&saved_modes);
+            Box::new(move || {
+                let entries = std::mem::take(&mut *saved_modes.lock().unwrap());
+                restore_delta_input_table_read_permission(entries).unwrap_or_else(|e| {
+                    panic!("clear_failure (restore read permission on input table): {e}")
+                });
+            })
+        };
+
+        (Some(inject_failure), Some(clear_failure))
+    };
 
     #[cfg(not(unix))]
     let (inject_failure, clear_failure) = (None, None);
@@ -1517,6 +2054,48 @@ async fn delta_table_cdc_file_test() {
         data,
         false,
         false,
+        DeltaTableTransactionMode::None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_table_cdc_file_catchup_test() {
+    let mut runner = TestRunner::default();
+    let data = delta_data(20_000).new_tree(&mut runner).unwrap().current();
+
+    let relation_schema = DeltaTestStruct::schema();
+
+    let input_table_dir = TempDir::new().unwrap();
+    let input_table_uri = input_table_dir.path().display().to_string();
+
+    test_cdc(
+        &relation_schema,
+        &input_table_uri,
+        &HashMap::new(),
+        data,
+        false,
+        false,
+        DeltaTableTransactionMode::Catchup,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_table_cdc_file_catchup_suspend_test() {
+    let mut runner = TestRunner::default();
+    let data = delta_data(20_000).new_tree(&mut runner).unwrap().current();
+    let relation_schema = DeltaTestStruct::schema();
+    let input_table_dir = TempDir::new().unwrap();
+    let input_table_uri = input_table_dir.path().display().to_string();
+    test_cdc(
+        &relation_schema,
+        &input_table_uri,
+        &HashMap::new(),
+        data,
+        true,
+        false,
+        DeltaTableTransactionMode::Catchup,
     )
     .await;
 }
@@ -1540,6 +2119,7 @@ async fn delta_table_cdc_file_indexed_test() {
         data,
         false,
         true,
+        DeltaTableTransactionMode::None,
     )
     .await;
 }
@@ -1564,8 +2144,569 @@ async fn delta_table_cdc_file_suspend_test() {
         data,
         true,
         false,
+        DeltaTableTransactionMode::None,
     )
     .await;
+}
+
+/// CDC connector must not re-emit rows when a Delta operation rewrites a
+/// file without changing its logical contents. Covers:
+/// - `OPTIMIZE` (every action has `data_change=false` -> early return).
+/// - No-op `UPDATE` (paired Add+Remove with identical rows -> EXCEPT ALL
+///   cancels them).
+/// - Real `UPDATE` (genuine row change is propagated).
+///
+/// Each step is followed by a sentinel-row append. Because the connector
+/// processes Delta versions in order, the sentinel can appear in the
+/// materialized output only after the prior step has been processed; that
+/// turns each `wait_for_records_materialized` into a deterministic check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_table_cdc_rewrite_test() {
+    use crate::test::TestStruct;
+    use arrow::array::{
+        Array, BooleanArray, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
+    };
+    use deltalake::datafusion::prelude::{col, lit};
+    use deltalake::kernel::{DataType as KernelDataType, PrimitiveType, StructField};
+    use std::num::NonZeroU64;
+
+    init_logging();
+
+    let row = |id: u32, label: &str| TestStruct {
+        id,
+        b: false,
+        i: None,
+        s: label.to_string(),
+    };
+
+    // Two batches => two parquet files, so OPTIMIZE has work to do.
+    // Filter `id % 2 = 0` keeps half of them.
+    let batch1: Vec<TestStruct> = (0..6).map(|id| row(id, &format!("row-{id}"))).collect();
+    let batch2: Vec<TestStruct> = (6..12).map(|id| row(id, &format!("row-{id}"))).collect();
+    let all: Vec<TestStruct> = batch1.iter().chain(batch2.iter()).cloned().collect();
+    let expected_initial: Vec<TestStruct> = all.iter().filter(|r| r.id % 2 == 0).cloned().collect();
+
+    // TestStruct columns + the CDC bookkeeping columns the connector expects.
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, false),
+        ArrowField::new("b", ArrowDataType::Boolean, false),
+        ArrowField::new("s", ArrowDataType::Utf8, false),
+        ArrowField::new("__feldera_op", ArrowDataType::Utf8, false),
+        ArrowField::new(
+            "__feldera_ts",
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+    let struct_fields = vec![
+        StructField::new("id", KernelDataType::Primitive(PrimitiveType::Long), false),
+        StructField::new(
+            "b",
+            KernelDataType::Primitive(PrimitiveType::Boolean),
+            false,
+        ),
+        StructField::new("s", KernelDataType::Primitive(PrimitiveType::String), false),
+        StructField::new(
+            "__feldera_op",
+            KernelDataType::Primitive(PrimitiveType::String),
+            false,
+        ),
+        StructField::new(
+            "__feldera_ts",
+            KernelDataType::Primitive(PrimitiveType::TimestampNtz),
+            false,
+        ),
+    ];
+
+    let make_batch = |rows: &[TestStruct], op: &str, ts: i64| -> RecordBatch {
+        let n = rows.len();
+        RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    rows.iter().map(|r| r.id as i64),
+                )) as Arc<dyn Array>,
+                Arc::new(rows.iter().map(|r| Some(r.b)).collect::<BooleanArray>()),
+                Arc::new(StringArray::from_iter_values(
+                    rows.iter().map(|r| r.s.clone()),
+                )),
+                Arc::new(StringArray::from_iter_values((0..n).map(|_| op))),
+                Arc::new(TimestampMicrosecondArray::from_iter_values(
+                    (0..n as i64).map(|i| ts + i),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+
+    async fn append(delta: DeltaTable, batches: Vec<RecordBatch>) -> DeltaTable {
+        delta
+            .write(batches)
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap()
+    }
+
+    let table_dir = TempDir::new().unwrap();
+    let table_uri = table_dir.path().display().to_string();
+    let mut delta = create_table(&table_uri, &HashMap::new(), &struct_fields).await;
+
+    let storage_dir = TempDir::new().unwrap();
+    let read_pipeline = {
+        let table_uri = table_uri.clone();
+        let storage_dir = storage_dir.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let pipeline_config: PipelineConfig = serde_json::from_value(json!({
+                "name": "test",
+                "workers": 4,
+                "storage_config": { "path": storage_dir },
+                "inputs": {
+                    "test_input1": {
+                        "stream": "test_input1",
+                        "transport": {
+                            "name": "delta_table_input",
+                            "config": {
+                                "uri": table_uri,
+                                "mode": "cdc",
+                                "filter": "id % 2 = 0",
+                                "cdc_delete_filter": "__feldera_op = 'd'",
+                                "cdc_order_by": "__feldera_ts",
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+            Controller::with_test_config(
+                move |workers| {
+                    Ok(test_circuit::<TestStruct>(
+                        workers,
+                        &TestStruct::schema(),
+                        &[Some("output")],
+                    ))
+                },
+                &pipeline_config,
+                Box::new(move |e, _| panic!("cdc rewrite test: {e}")),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap()
+    };
+    read_pipeline.start();
+    let output = SqlIdentifier::from("test_output1");
+
+    // Step 1: two appends => two parquet files, one Delta version each.
+    delta = append(delta, vec![make_batch(&batch1, "i", 1_000)]).await;
+    delta = append(delta, vec![make_batch(&batch2, "i", 2_000)]).await;
+    wait_for_records_materialized(&read_pipeline, &output, &expected_initial).await;
+
+    // Step 2: OPTIMIZE coalesces the two files into one. Every action has
+    // `data_change=false`, so the connector early-returns. Any spurious
+    // emission would be exposed by the size check below.
+    let v_before = delta.version().unwrap();
+    let (optimized, _) = delta
+        .optimize()
+        .with_target_size(NonZeroU64::new(128 * 1024 * 1024).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        optimized.version().unwrap() > v_before,
+        "OPTIMIZE should produce a new commit"
+    );
+    let sentinel1 = row(100, "sentinel-after-optimize");
+    delta = append(
+        optimized,
+        vec![make_batch(std::slice::from_ref(&sentinel1), "i", 2_500)],
+    )
+    .await;
+    let mut expected = expected_initial.clone();
+    expected.push(sentinel1);
+    wait_for_records_materialized(&read_pipeline, &output, &expected).await;
+
+    // Step 3: no-op UPDATE (`b = b`). delta-rs rewrites every matching file
+    // with paired Add+Remove actions over identical rows; EXCEPT ALL must
+    // cancel them so no rows are re-ingested.
+    let v_before = delta.version().unwrap();
+    let (updated, _) = delta
+        .update()
+        .with_predicate(col("id").gt_eq(lit(0i64)))
+        .with_update("b", col("b"))
+        .await
+        .unwrap();
+    assert!(
+        updated.version().unwrap() > v_before,
+        "no-op UPDATE should produce a new commit"
+    );
+    let sentinel2 = row(200, "sentinel-after-noop-update");
+    delta = append(
+        updated,
+        vec![make_batch(std::slice::from_ref(&sentinel2), "i", 2_700)],
+    )
+    .await;
+    expected.push(sentinel2);
+    wait_for_records_materialized(&read_pipeline, &output, &expected).await;
+
+    // Step 4: real change. CDC tables encode an in-place row update as a
+    // `'d'` row (old value) followed by an `'i'` row (new value), ordered
+    // by `cdc_order_by`. The connector should turn that into delete+insert.
+    let target_id: u32 = 0;
+    let original = all.iter().find(|r| r.id == target_id).unwrap().clone();
+    let mut modified = original.clone();
+    modified.b = true;
+    let _ = append(
+        delta,
+        vec![
+            make_batch(std::slice::from_ref(&original), "d", 3_000_000),
+            make_batch(std::slice::from_ref(&modified), "i", 3_000_001),
+        ],
+    )
+    .await;
+    let mut expected_after = expected.clone();
+    expected_after
+        .iter_mut()
+        .find(|r| r.id == target_id)
+        .unwrap()
+        .b = true;
+    wait_for_records_materialized(&read_pipeline, &output, &expected_after).await;
+
+    read_pipeline.stop().unwrap();
+}
+
+/// `cdc_delete_filter` is parsed against the snapshot schema at
+/// connector startup, so an expression that references a column that
+/// does not exist on the Delta table must fail before any row flows
+/// through the pipeline, with an error that names the missing column
+/// and the `cdc_delete_filter` setting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_table_cdc_invalid_delete_filter_test() {
+    use crate::test::TestStruct;
+    use deltalake::kernel::{DataType as KernelDataType, PrimitiveType, StructField};
+
+    init_logging();
+
+    let struct_fields = vec![
+        StructField::new("id", KernelDataType::Primitive(PrimitiveType::Long), false),
+        StructField::new(
+            "b",
+            KernelDataType::Primitive(PrimitiveType::Boolean),
+            false,
+        ),
+        StructField::new("s", KernelDataType::Primitive(PrimitiveType::String), false),
+        StructField::new(
+            "__feldera_op",
+            KernelDataType::Primitive(PrimitiveType::String),
+            false,
+        ),
+        StructField::new(
+            "__feldera_ts",
+            KernelDataType::Primitive(PrimitiveType::TimestampNtz),
+            false,
+        ),
+    ];
+
+    let table_dir = TempDir::new().unwrap();
+    let table_uri = table_dir.path().display().to_string();
+    let _ = create_table(&table_uri, &HashMap::new(), &struct_fields).await;
+
+    let storage_dir = TempDir::new().unwrap();
+    let result = {
+        let table_uri = table_uri.clone();
+        let storage_dir = storage_dir.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let pipeline_config: PipelineConfig = serde_json::from_value(json!({
+                "name": "test",
+                "workers": 4,
+                "storage_config": { "path": storage_dir },
+                "inputs": {
+                    "test_input1": {
+                        "stream": "test_input1",
+                        "transport": {
+                            "name": "delta_table_input",
+                            "config": {
+                                "uri": table_uri,
+                                "mode": "cdc",
+                                "cdc_delete_filter": "no_such_column = 'd'",
+                                "cdc_order_by": "__feldera_ts",
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+            Controller::with_test_config(
+                move |workers| {
+                    Ok(test_circuit::<TestStruct>(
+                        workers,
+                        &TestStruct::schema(),
+                        &[Some("output")],
+                    ))
+                },
+                &pipeline_config,
+                Box::new(move |_, _| {}),
+            )
+        })
+        .await
+        .unwrap()
+    };
+
+    let err = match result {
+        Ok(_) => panic!("controller should fail to start with an invalid cdc_delete_filter"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no_such_column"),
+        "expected error to name the missing column 'no_such_column', got: {msg}",
+    );
+    assert!(
+        msg.contains("cdc_delete_filter"),
+        "expected error to mention 'cdc_delete_filter', got: {msg}",
+    );
+}
+
+/// Assert the logical-plan shape of the CDC `DataFrame`: filter on
+/// both sides of an `EXCEPT ALL`, then a sort by `cdc_order_by`. Also
+/// checks that an `order_by` referencing an unknown column fails at
+/// build time.
+#[tokio::test]
+async fn build_cdc_dataframe_plan_structure() {
+    use crate::integrated::delta_table::input::build_cdc_dataframe;
+    use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
+    use datafusion::datasource::MemTable;
+
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, false),
+        ArrowField::new("b", ArrowDataType::Boolean, false),
+        ArrowField::new("__feldera_op", ArrowDataType::Utf8, false),
+        ArrowField::new(
+            "__feldera_ts",
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+
+    // Two independently-registered tables so the filter expression has
+    // to resolve against each side of the set difference.
+    let ctx = SessionContext::new();
+    let empty = || Arc::new(MemTable::try_new(arrow_schema.clone(), vec![vec![]]).unwrap());
+    ctx.register_table("cdc_adds", empty()).unwrap();
+    ctx.register_table("cdc_removes", empty()).unwrap();
+
+    // Full path: filter + removes + order_by.
+    let df = build_cdc_dataframe(
+        ctx.table("cdc_adds").await.unwrap(),
+        Some(ctx.table("cdc_removes").await.unwrap()),
+        Some("id % 2 = 0"),
+        "__feldera_ts",
+        "unit-test",
+    )
+    .unwrap();
+    let plan = format!("{}", df.logical_plan().display_indent());
+
+    assert!(
+        plan.contains("Sort: "),
+        "expected a Sort node; plan was:\n{plan}"
+    );
+    assert!(
+        plan.contains("__feldera_ts"),
+        "expected sort key '__feldera_ts'; plan was:\n{plan}"
+    );
+    assert!(
+        plan.contains("LeftAnti"),
+        "expected a LeftAnti join (DataFusion encoding of EXCEPT); plan was:\n{plan}"
+    );
+    // EXCEPT ALL uses a LeftAnti join without a Distinct wrapper;
+    // EXCEPT DISTINCT inserts a `Distinct:` node above the join.
+    assert!(
+        !plan.contains("Distinct:"),
+        "expected EXCEPT ALL (no Distinct node); plan was:\n{plan}"
+    );
+    let filter_lines = plan
+        .lines()
+        .filter(|line| line.trim_start().starts_with("Filter:"))
+        .count();
+    assert_eq!(
+        filter_lines, 2,
+        "expected Filter applied to both adds and removes; plan was:\n{plan}"
+    );
+
+    // No removes: no set-difference in the plan.
+    let df = build_cdc_dataframe(
+        ctx.table("cdc_adds").await.unwrap(),
+        None,
+        Some("id % 2 = 0"),
+        "__feldera_ts",
+        "unit-test",
+    )
+    .unwrap();
+    let plan = format!("{}", df.logical_plan().display_indent());
+    assert!(
+        plan.contains("Sort: "),
+        "expected Sort even without removes; plan was:\n{plan}"
+    );
+    assert!(
+        !plan.contains("LeftAnti"),
+        "no removes -> no LeftAnti join; plan was:\n{plan}"
+    );
+    let filter_lines = plan
+        .lines()
+        .filter(|line| line.trim_start().starts_with("Filter:"))
+        .count();
+    assert_eq!(
+        filter_lines, 1,
+        "expected one Filter (adds only); plan was:\n{plan}"
+    );
+
+    // No filter: set difference and sort, no Filter node.
+    let df = build_cdc_dataframe(
+        ctx.table("cdc_adds").await.unwrap(),
+        Some(ctx.table("cdc_removes").await.unwrap()),
+        None,
+        "__feldera_ts",
+        "unit-test",
+    )
+    .unwrap();
+    let plan = format!("{}", df.logical_plan().display_indent());
+    assert!(plan.contains("Sort: "), "expected Sort; plan was:\n{plan}");
+    assert!(
+        plan.contains("LeftAnti"),
+        "expected LeftAnti join; plan was:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Filter:"),
+        "no filter configured -> no Filter node; plan was:\n{plan}"
+    );
+
+    // Invalid `order_by`: error surfaces at build time.
+    let err = build_cdc_dataframe(
+        ctx.table("cdc_adds").await.unwrap(),
+        None,
+        None,
+        "no_such_column",
+        "unit-test",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("no_such_column"),
+        "expected error to name the missing column; got: {err}"
+    );
+    assert!(
+        err.contains("cdc_order_by"),
+        "expected error to mention 'cdc_order_by'; got: {err}"
+    );
+}
+
+/// Pin the exact set of arrow types that the `EXCEPT ALL` cancellation
+/// step in `do_process_cdc_transaction` cannot handle.
+///
+/// `EXCEPT ALL` is planned via `RowConverter`, so any column type for
+/// which `RowConverter::supports_fields` returns `false` will make the
+/// CDC rewrite path fail at runtime once the transaction contains
+/// Removes. Locking that list down here means a future arrow upgrade
+/// that widens (or narrows) support is caught by this test instead of
+/// silently changing user-visible behavior, and gives us a concrete
+/// reference for the caveat documented at the call site.
+#[test]
+fn except_all_unsupported_types_are_only_map() {
+    use arrow::datatypes::{DataType, Field, TimeUnit};
+    use arrow::row::{RowConverter, SortField};
+    use std::sync::Arc;
+
+    let supports = |dt: DataType| -> bool { RowConverter::supports_fields(&[SortField::new(dt)]) };
+
+    // Every Delta-mappable scalar / nested type that previous review
+    // comments and code comments listed as "unsupported" is in fact
+    // supported by `arrow-row` 57.x.
+    assert!(supports(DataType::Binary), "Binary must be supported");
+    assert!(
+        supports(DataType::LargeBinary),
+        "LargeBinary must be supported",
+    );
+    assert!(
+        supports(DataType::FixedSizeBinary(16)),
+        "FixedSizeBinary must be supported",
+    );
+    assert!(
+        supports(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )))),
+        "List<Utf8> must be supported",
+    );
+    assert!(
+        supports(DataType::LargeList(Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )))),
+        "LargeList<Utf8> must be supported",
+    );
+    assert!(
+        supports(DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            4,
+        )),
+        "FixedSizeList<Int32> must be supported",
+    );
+    assert!(
+        supports(DataType::Struct(
+            vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Utf8, true),
+            ]
+            .into(),
+        )),
+        "Struct must be supported",
+    );
+
+    // Spot-check that the broader scalar surface area used by
+    // `DeltaTestStruct` is supported too — these are the types a CDC
+    // rewrite is most likely to encounter in practice.
+    for dt in [
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::UInt8,
+        DataType::UInt16,
+        DataType::UInt32,
+        DataType::UInt64,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Boolean,
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Date32,
+        DataType::Date64,
+        DataType::Time64(TimeUnit::Microsecond),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        DataType::Decimal128(10, 3),
+    ] {
+        assert!(supports(dt.clone()), "{dt:?} must be supported");
+    }
+
+    // `Map` is the one Delta-mappable type that is genuinely unsupported.
+    let map_type = Field::new_map(
+        "map",
+        "entries",
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Utf8, true),
+        false,
+        true,
+    )
+    .data_type()
+    .clone();
+    assert!(
+        !supports(map_type),
+        "Map is expected to be unsupported by RowConverter; if this \
+         changes, update the caveat in `do_process_cdc_transaction`",
+    );
 }
 
 #[cfg(feature = "delta-s3-test")]
@@ -1608,6 +2749,7 @@ async fn delta_table_cdc_s3_test_suspend() {
         data,
         false,
         true,
+        DeltaTableTransactionMode::None,
     )
     .await;
 }
@@ -1626,6 +2768,198 @@ async fn delta_table_transactional_snapshot_and_follow_file_test() {
 #[tokio::test]
 async fn delta_table_transactional_always_snapshot_and_follow_file_test() {
     delta_table_follow_file_test_common(true, DeltaTableTransactionMode::Always, false, false).await
+}
+
+/// With the input endpoint paused between rounds, verify catchup batches each round's Delta
+/// commits into a single Feldera transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_table_catchup_batches_multiple_versions_test() {
+    let result = run_catchup_lag_experiment(catchup_lag_options(
+        DeltaTableTransactionMode::Catchup,
+        &[3, 2],
+        None,
+        None,
+    ))
+    .await;
+    assert_eq!(
+        result.follow_transactions_per_round,
+        vec![1, 1],
+        "catchup must use one Feldera transaction per pause/write/resume round"
+    );
+}
+
+/// Control for [`delta_table_catchup_batches_multiple_versions_test`]: `always` mode commits once
+/// per Delta log version in each round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_table_always_one_transaction_per_version_test() {
+    let result = run_catchup_lag_experiment(catchup_lag_options(
+        DeltaTableTransactionMode::Always,
+        &[2, 2],
+        None,
+        None,
+    ))
+    .await;
+    assert_eq!(
+        result.follow_transactions_per_round,
+        vec![2, 2],
+        "always mode must commit each Delta version in its own Feldera transaction"
+    );
+}
+
+/// `end_version` caps the catchup window target at startup of the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_table_catchup_end_version_caps_window_test() {
+    const NUM_VERSIONS: i64 = 8;
+    const END_VERSION: i64 = 5;
+    let result = run_catchup_lag_experiment(catchup_lag_options(
+        DeltaTableTransactionMode::Catchup,
+        &[NUM_VERSIONS],
+        Some(END_VERSION),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        result.follow_transactions_per_round,
+        vec![1],
+        "catchup with end_version must still batch versions 1..=end_version in one transaction"
+    );
+}
+
+/// Large bursts across two rounds: each round still uses one Feldera transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_table_catchup_rapid_versions_test() {
+    let result = run_catchup_lag_experiment(catchup_lag_options(
+        DeltaTableTransactionMode::Catchup,
+        &[6, 6],
+        None,
+        None,
+    ))
+    .await;
+    assert_eq!(
+        result.follow_transactions_per_round,
+        vec![1, 1],
+        "catchup must batch a large pre-existing commit backlog in one transaction per round"
+    );
+}
+
+/// Catchup survives a transient unreadable table (chmod on input root): unhealthy, then healthy,
+/// one Feldera transaction per catch-up round.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_table_catchup_transient_read_failure_test() {
+    let result = run_catchup_lag_experiment(CatchupLagExperimentOptions {
+        transaction_mode: DeltaTableTransactionMode::Catchup,
+        versions_per_round: &[2, 2],
+        end_version: None,
+        snapshot_rows: None,
+        max_retries: None,
+        inject_read_failure_before_resume_round: Some(0),
+        clear_read_failure_after_unhealthy: true,
+        expect_ingest_failure: false,
+    })
+    .await;
+    assert_eq!(
+        result.follow_transactions_per_round,
+        vec![1, 1],
+        "catchup must still batch each round in one Feldera transaction after recovery"
+    );
+    assert!(
+        !result.ended_unhealthy,
+        "connector must be healthy after permissions are restored"
+    );
+    assert_eq!(
+        result.completed_version,
+        Some(4),
+        "all four follow commits (two per round) must be ingested"
+    );
+}
+
+/// With `max_retries = 0`, a read failure is fatal: connector stays unhealthy and does not advance.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_table_catchup_max_retries_fatal_test() {
+    let result = run_catchup_lag_experiment(CatchupLagExperimentOptions {
+        transaction_mode: DeltaTableTransactionMode::Catchup,
+        versions_per_round: &[1],
+        end_version: None,
+        snapshot_rows: None,
+        max_retries: Some(0),
+        inject_read_failure_before_resume_round: Some(0),
+        clear_read_failure_after_unhealthy: false,
+        expect_ingest_failure: true,
+    })
+    .await;
+    assert!(
+        result.ended_unhealthy,
+        "connector must remain unhealthy after retries are exhausted"
+    );
+    assert!(
+        result.completed_version.is_none_or(|v| v < 1),
+        "connector must not ingest the commit written while paused (completed: {:?})",
+        result.completed_version
+    );
+    assert!(
+        result.follow_transactions_per_round.iter().all(|&n| n == 0),
+        "no follow transaction should complete when ingestion fails immediately: {:?}",
+        result.follow_transactions_per_round
+    );
+}
+
+#[tokio::test]
+async fn delta_table_follow_file_catchup_test() {
+    delta_table_follow_file_test_common(false, DeltaTableTransactionMode::Catchup, false, false)
+        .await
+}
+
+/// In `snapshot_and_follow` + `catchup`, the initial snapshot uses one Feldera transaction; each
+/// follow catch-up window still uses one transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_table_snapshot_and_follow_catchup_snapshot_transaction_test() {
+    const SNAPSHOT_ROWS: i64 = 10;
+    let result = run_catchup_lag_experiment(catchup_lag_options(
+        DeltaTableTransactionMode::Catchup,
+        &[2],
+        None,
+        Some(SNAPSHOT_ROWS),
+    ))
+    .await;
+    assert_eq!(
+        result.snapshot_transaction_starts, 1,
+        "catchup must ingest the initial snapshot in one Feldera transaction"
+    );
+    assert_eq!(
+        result.follow_transactions_per_round,
+        vec![1],
+        "catchup must batch follow commits in one Feldera transaction per round"
+    );
+}
+
+#[tokio::test]
+async fn delta_table_snapshot_and_follow_file_catchup_test() {
+    delta_table_follow_file_test_common(true, DeltaTableTransactionMode::Catchup, false, false)
+        .await
+}
+
+#[tokio::test]
+async fn delta_table_follow_file_catchup_end_version_test() {
+    delta_table_follow_file_test_common(false, DeltaTableTransactionMode::Catchup, false, true)
+        .await
+}
+
+#[tokio::test]
+async fn delta_table_follow_file_catchup_suspend_test() {
+    delta_table_follow_file_test_common(false, DeltaTableTransactionMode::Catchup, true, false)
+        .await
+}
+
+#[tokio::test]
+async fn delta_table_snapshot_and_follow_file_catchup_suspend_test() {
+    delta_table_follow_file_test_common(true, DeltaTableTransactionMode::Catchup, true, false).await
+}
+
+#[tokio::test]
+async fn delta_table_snapshot_and_follow_file_catchup_end_version_test() {
+    delta_table_follow_file_test_common(true, DeltaTableTransactionMode::Catchup, false, true).await
 }
 
 #[tokio::test]
@@ -1751,8 +3085,7 @@ proptest! {
         // Uncomment to inspect output parquet files produced by the test.
         forget(table_dir);
 
-        delta_table_output_test(data.clone(), &table_uri, &HashMap::new(), true, None);
-
+        delta_table_output_test(data.clone(), &table_uri, &HashMap::new(), true, None, false);
 
         // Read delta table unordered.
         let mut json_file = delta_table_snapshot_to_json::<DeltaTestStruct>(
@@ -1889,6 +3222,24 @@ proptest! {
         // // Uncomment to inspect one of the output json files produced by the test.
         // forget(json_file_filtered_by_id);
     }
+
+    /// ```text
+    /// input.json --> [pipeline1]--->delta_table
+    /// ```
+    #[test]
+    fn delta_table_file_output_proptest_index_alias(data in delta_data(20_000))
+    {
+        let table_dir = TempDir::new().unwrap();
+        let table_uri = table_dir.path().display().to_string();
+
+        // Uncomment to inspect output parquet files produced by the test.
+        forget(table_dir);
+
+        delta_table_output_test(data.clone(), &table_uri, &HashMap::new(), true, None, true);
+
+        // forget(json_file_filtered_by_id);
+    }
+
 }
 
 proptest! {
@@ -1912,7 +3263,7 @@ proptest! {
 
         let table_uri = format!("s3://feldera-delta-table-test/{uuid}/");
         // TODO: enable verification when it's supported for S3.
-        delta_table_output_test(data.clone(), &table_uri, &object_store_config, false, None);
+        delta_table_output_test(data.clone(), &table_uri, &object_store_config, false, None, false);
         //delta_table_output_test(data.clone(), &table_uri, &object_store_config, false, None);
 
         let mut json_file = delta_table_snapshot_to_json::<DeltaTestStruct>(

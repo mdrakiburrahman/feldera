@@ -2,7 +2,7 @@
 //! Intervals are differences between dates and/or times
 
 use crate::{
-    Date, SqlDecimal,
+    Date, SqlDecimal, finite_or_null,
     operators::{eq, gt, gte, lt, lte, neq},
     plus_Date_Date_LongInterval__, sign, some_existing_operator, some_function2, some_operator,
     some_polymorphic_function1, some_polymorphic_function2,
@@ -23,10 +23,10 @@ use crate::{Time, Timestamp};
 
 /// A ShortInterval can express a difference between two [Time]
 /// values, two [Date] values, or two [Timestamp] values.  The
-/// representation is a (positive or negative) number of milliseconds.
+/// representation is a (positive or negative) number of microseconds.
 /// While there are functions that can extract nanosecond-precision
 /// values from a ShortInterval, the precision is always limited to
-/// milliseconds.
+/// microseconds.
 #[derive(
     Debug,
     Default,
@@ -111,10 +111,34 @@ impl ShortInterval {
 
     /// Extract the length of the interval in nanoseconds.  The result
     /// can be negative.  The granularity of the representation is
-    /// actually milliseconds, so this function will always return a
-    /// number that is a multiple of 1 million.
+    /// actually microseconds, so this function will always return a
+    /// number that is a multiple of 1000.
     pub fn nanoseconds(&self) -> i64 {
         self.microseconds * 1_000
+    }
+
+    /// Extract the length of the interval in milliseconds.  The
+    /// result can be negative.
+    pub fn seconds(&self) -> i64 {
+        self.microseconds / 1_000_000
+    }
+
+    /// Extract the length of the interval in minutes.  The
+    /// result can be negative.
+    pub fn minutes(&self) -> i64 {
+        self.microseconds / (60 * 1_000_000)
+    }
+
+    /// Extract the length of the interval in minutes.  The
+    /// result can be negative.
+    pub fn hours(&self) -> i64 {
+        self.microseconds / (60 * 60 * 1_000_000i64)
+    }
+
+    /// Extract the length of the interval in minutes.  The
+    /// result can be negative.
+    pub fn days(&self) -> i64 {
+        self.microseconds / (24 * 60 * 60 * 1_000_000i64)
     }
 }
 
@@ -126,55 +150,53 @@ pub fn abs_ShortInterval(value: ShortInterval) -> ShortInterval {
 some_polymorphic_function1!(abs, ShortInterval, ShortInterval, ShortInterval);
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_ShortInterval_u128(value: &ShortInterval) -> u128 {
     value.microseconds as u128
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Date_u128(value: &ShortInterval) -> u128 {
     // express value in days
     (value.microseconds / 1_000_000_i64 / 86400) as u128
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Date_u64(value: &ShortInterval) -> u64 {
     // express value in days
     (value.microseconds / 1_000_000_i64 / 86400) as u64
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Timestamp_u128(value: &ShortInterval) -> u128 {
-    // express value in milliseconds
     value.microseconds as u128
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Timestamp_u64(value: &ShortInterval) -> u64 {
-    // express value in milliseconds
     value.microseconds as u64
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Time_u128(value: &ShortInterval) -> u128 {
     // express value in nanoseconds
     (value.microseconds * 1_000) as u128
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Time_u64(value: &ShortInterval) -> u64 {
     // express value in nanoseconds
     (value.microseconds * 1_000) as u64
@@ -208,16 +230,19 @@ impl<const P: usize, const S: usize> Mul<SqlDecimal<P, S>> for ShortInterval {
     type Output = Self;
 
     fn mul(self, rhs: SqlDecimal<P, S>) -> Self {
-        let us = SqlDecimal::<38, 0>::try_from(self.microseconds).expect(
-            "overflow in short interval multiplication while converting microseconds to DECIMAL",
-        );
+        let us = SqlDecimal::<38, 0>::try_from(self.microseconds).unwrap_or_else(|_| {
+            panic!(
+                "overflow in short interval multiplication while converting {} to DECIMAL",
+                self
+            )
+        });
         let mul = us
             .checked_mul_generic::<P, S, 38, 0>(rhs)
-            .expect("overflow in short interval multiplication");
+            .unwrap_or_else(|| panic!("overflow in INTERVAL multiplication {} * {}", self, rhs));
         Self {
-            microseconds: mul
-                .try_into()
-                .expect("overflow in short interval multiplication: result too large"),
+            microseconds: mul.try_into().unwrap_or_else(|_| {
+                panic!("overflow in INTERVAL multiplication {} * {}", self, rhs)
+            }),
         }
     }
 }
@@ -261,8 +286,14 @@ impl fmt::Display for ShortInterval {
 impl Div<F64> for ShortInterval {
     type Output = Self;
     fn div(self, rhs: F64) -> Self {
-        Self {
-            microseconds: (F64::from(self.microseconds as f64) / rhs).into_inner() as i64,
+        let result = div_null_ShortInterval_d(self, rhs);
+        match result {
+            None => panic!(
+                "overflow while dividing INTERVAL {} / {}",
+                self,
+                rhs.into_inner()
+            ),
+            Some(interval) => interval,
         }
     }
 }
@@ -272,15 +303,19 @@ impl<const P: usize, const S: usize> Div<SqlDecimal<P, S>> for ShortInterval {
     type Output = Self;
 
     fn div(self, rhs: SqlDecimal<P, S>) -> Self {
-        let us = SqlDecimal::<38, 0>::try_from(self.microseconds)
-            .expect("overflow in short interval division while converting microseconds to DECIMAL");
+        let us = SqlDecimal::<38, 0>::try_from(self.microseconds).unwrap_or_else(|_| {
+            panic!(
+                "overflow in short interval division while converting {} to DECIMAL",
+                self
+            )
+        });
         let div = us
             .checked_div_generic::<P, S, 38, 0>(rhs)
-            .expect("overflow in short interval division");
+            .unwrap_or_else(|| panic!("overflow in INTERVAL division {} / {}", self, rhs));
         Self {
             microseconds: div
                 .try_into()
-                .expect("overflow in short interval division: result too large"),
+                .unwrap_or_else(|_| panic!("overflow in INTERVAL division {} / {}", self, rhs)),
         }
     }
 }
@@ -294,7 +329,7 @@ impl Add<ShortInterval> for ShortInterval {
             microseconds: self
                 .microseconds
                 .checked_add(rhs.microseconds)
-                .expect("Overflow during ShortInterval addition"),
+                .unwrap_or_else(|| panic!("overflow in INTERVAL addition {} + {}", self, rhs)),
         }
     }
 }
@@ -308,7 +343,7 @@ impl Sub<ShortInterval> for ShortInterval {
             microseconds: self
                 .microseconds
                 .checked_sub(rhs.microseconds)
-                .expect("Overflow during ShortInterval subtraction"),
+                .unwrap_or_else(|| panic!("overflow in INTERVAL subtraction {} - {}", self, rhs)),
         }
     }
 }
@@ -322,7 +357,7 @@ impl Neg for ShortInterval {
             microseconds: self
                 .microseconds
                 .checked_neg()
-                .expect("Overflow during ShortInterval negation"),
+                .unwrap_or_else(|| panic!("overflow in INTERVAL negation -{}", self)),
         }
     }
 }
@@ -385,6 +420,45 @@ some_polymorphic_function2!(
 );
 
 #[doc(hidden)]
+pub fn div_null_ShortInterval_SqlDecimal<const P: usize, const S: usize>(
+    left: ShortInterval,
+    right: SqlDecimal<P, S>,
+) -> Option<ShortInterval> {
+    let us = SqlDecimal::<38, 0>::try_from(left.microseconds()).ok()?;
+    let div = us.checked_div_generic::<P, S, 38, 0>(right)?;
+    let micros: i64 = div.try_into().ok()?;
+    Some(ShortInterval::from_microseconds(micros))
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_SqlDecimal<const P: usize, const S: usize>(
+    left: Option<ShortInterval>,
+    right: SqlDecimal<P, S>,
+) -> Option<ShortInterval> {
+    let left = left?;
+    div_null_ShortInterval_SqlDecimal(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortInterval_SqlDecimalN<const P: usize, const S: usize>(
+    left: ShortInterval,
+    right: Option<SqlDecimal<P, S>>,
+) -> Option<ShortInterval> {
+    let right = right?;
+    div_null_ShortInterval_SqlDecimal(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_SqlDecimalN<const P: usize, const S: usize>(
+    left: Option<ShortInterval>,
+    right: Option<SqlDecimal<P, S>>,
+) -> Option<ShortInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_ShortInterval_SqlDecimal(left, right)
+}
+
+#[doc(hidden)]
 pub fn times_ShortInterval_i64(left: ShortInterval, right: i64) -> ShortInterval {
     left * right
 }
@@ -423,11 +497,78 @@ pub fn div_ShortInterval_d(left: ShortInterval, right: F64) -> ShortInterval {
 some_polymorphic_function2!(div, ShortInterval, ShortInterval, d, F64, ShortInterval);
 
 #[doc(hidden)]
+pub fn div_null_ShortInterval_d(left: ShortInterval, right: F64) -> Option<ShortInterval> {
+    let div = (left.microseconds() as f64) / right.into_inner();
+    let fin: f64 = finite_or_null(div)?;
+    if fin < i64::MIN as f64 || fin > i64::MAX as f64 {
+        return None;
+    }
+    Some(ShortInterval::from_microseconds(fin as i64))
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_d(left: Option<ShortInterval>, right: F64) -> Option<ShortInterval> {
+    let left = left?;
+    div_null_ShortInterval_d(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortInterval_dN(left: ShortInterval, right: Option<F64>) -> Option<ShortInterval> {
+    let right = right?;
+    div_null_ShortInterval_d(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_dN(
+    left: Option<ShortInterval>,
+    right: Option<F64>,
+) -> Option<ShortInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_ShortInterval_d(left, right)
+}
+
+#[doc(hidden)]
 pub fn div_ShortInterval_i64(left: ShortInterval, right: i64) -> ShortInterval {
     left / right
 }
 
 some_polymorphic_function2!(div, ShortInterval, ShortInterval, i64, i64, ShortInterval);
+
+#[doc(hidden)]
+pub fn div_null_ShortInterval_i64(left: ShortInterval, right: i64) -> Option<ShortInterval> {
+    left.microseconds()
+        .checked_div(right)
+        .map(ShortInterval::from_microseconds)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_i64(
+    left: Option<ShortInterval>,
+    right: i64,
+) -> Option<ShortInterval> {
+    let left = left?;
+    div_null_ShortInterval_i64(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortInterval_i64N(
+    left: ShortInterval,
+    right: Option<i64>,
+) -> Option<ShortInterval> {
+    let right = right?;
+    div_null_ShortInterval_i64(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_i64N(
+    left: Option<ShortInterval>,
+    right: Option<i64>,
+) -> Option<ShortInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_ShortInterval_i64(left, right)
+}
 
 #[doc(hidden)]
 pub fn plus_ShortInterval_ShortInterval_ShortInterval__(
@@ -565,15 +706,19 @@ impl<const P: usize, const S: usize> Mul<SqlDecimal<P, S>> for LongInterval {
     type Output = Self;
 
     fn mul(self, rhs: SqlDecimal<P, S>) -> Self {
-        let months = SqlDecimal::<10, 0>::try_from(self.months)
-            .expect("overflow in long interval multiplication while converting months to DECIMAL");
+        let months = SqlDecimal::<10, 0>::try_from(self.months).unwrap_or_else(|_| {
+            panic!(
+                "overflow in long interval multiplication while converting {} to DECIMAL",
+                self
+            )
+        });
         let mul = months
             .checked_mul_generic::<P, S, 10, 0>(rhs)
-            .expect("overflow in long interval multiplication");
+            .unwrap_or_else(|| panic!("overflow in INTERVAL multiplication {} * {}", self, rhs));
         Self {
-            months: mul
-                .try_into()
-                .expect("overflow in long interval multiplication: result too large"),
+            months: mul.try_into().unwrap_or_else(|_| {
+                panic!("overflow in INTERVAL multiplication {} * {}", self, rhs)
+            }),
         }
     }
 }
@@ -594,8 +739,14 @@ impl Div<F64> for LongInterval {
     type Output = Self;
 
     fn div(self, rhs: F64) -> Self {
-        Self {
-            months: (F64::from(self.months as f64) / rhs).into_inner() as i32,
+        let result = div_null_LongInterval_d(self, rhs);
+        match result {
+            None => panic!(
+                "overflow while dividing INTERVAL {} / {}",
+                self,
+                rhs.into_inner()
+            ),
+            Some(interval) => interval,
         }
     }
 }
@@ -605,15 +756,19 @@ impl<const P: usize, const S: usize> Div<SqlDecimal<P, S>> for LongInterval {
     type Output = Self;
 
     fn div(self, rhs: SqlDecimal<P, S>) -> Self {
-        let months = SqlDecimal::<10, 0>::try_from(self.months)
-            .expect("overflow in long interval division while converting months to DECIMAL");
+        let months = SqlDecimal::<10, 0>::try_from(self.months).unwrap_or_else(|_| {
+            panic!(
+                "overflow in short interval division while converting {} to DECIMAL",
+                self
+            )
+        });
         let div = months
             .checked_div_generic::<P, S, 10, 0>(rhs)
-            .expect("overflow in long interval division");
+            .unwrap_or_else(|| panic!("overflow in INTERVAL division {} / {}", self, rhs));
         Self {
             months: div
                 .try_into()
-                .expect("overflow in long interval division: result too large"),
+                .unwrap_or_else(|_| panic!("overflow in INTERVAL division {} / {}", self, rhs)),
         }
     }
 }
@@ -661,7 +816,7 @@ impl Add<LongInterval> for LongInterval {
             months: self
                 .months
                 .checked_add(rhs.months)
-                .expect("Overflow during LongInterval addition"),
+                .unwrap_or_else(|| panic!("overflow in INTERVAL addition {} + {}", self, rhs)),
         }
     }
 }
@@ -675,7 +830,7 @@ impl Sub<LongInterval> for LongInterval {
             months: self
                 .months
                 .checked_sub(rhs.months)
-                .expect("Overflow during LongInterval subtraction"),
+                .unwrap_or_else(|| panic!("overflow in INTERVAL subtraction {} - {}", self, rhs)),
         }
     }
 }
@@ -689,7 +844,7 @@ impl Neg for LongInterval {
             months: self
                 .months
                 .checked_neg()
-                .expect("Overflow during LongInterval negation"),
+                .unwrap_or_else(|| panic!("overflow in INTERVAL negation -{}", self)),
         }
     }
 }
@@ -740,11 +895,72 @@ pub fn div_LongInterval_i32(left: LongInterval, right: i32) -> LongInterval {
 some_polymorphic_function2!(div, LongInterval, LongInterval, i32, i32, LongInterval);
 
 #[doc(hidden)]
+pub fn div_null_LongInterval_i32(left: LongInterval, right: i32) -> Option<LongInterval> {
+    left.months
+        .checked_div(right)
+        .map(LongInterval::from_months)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_i32(left: Option<LongInterval>, right: i32) -> Option<LongInterval> {
+    let left = left?;
+    div_null_LongInterval_i32(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongInterval_i32N(left: LongInterval, right: Option<i32>) -> Option<LongInterval> {
+    let right = right?;
+    div_null_LongInterval_i32(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_i32N(
+    left: Option<LongInterval>,
+    right: Option<i32>,
+) -> Option<LongInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_LongInterval_i32(left, right)
+}
+
+#[doc(hidden)]
 pub fn div_LongInterval_d(left: LongInterval, right: F64) -> LongInterval {
     left / right
 }
 
 some_polymorphic_function2!(div, LongInterval, LongInterval, d, F64, LongInterval);
+
+#[doc(hidden)]
+pub fn div_null_LongInterval_d(left: LongInterval, right: F64) -> Option<LongInterval> {
+    let div: f64 = (left.months() as f64) / right.into_inner();
+    let fin: f64 = finite_or_null(div)?;
+    if fin < i32::MIN as f64 || fin > i32::MAX as f64 {
+        return None;
+    }
+    Some(LongInterval::from_months(fin as i32))
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_d(left: Option<LongInterval>, right: F64) -> Option<LongInterval> {
+    let left = left?;
+    div_null_LongInterval_d(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongInterval_dN(left: LongInterval, right: Option<F64>) -> Option<LongInterval> {
+    let right = right?;
+    div_null_LongInterval_d(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_dN(
+    left: Option<LongInterval>,
+    right: Option<F64>,
+) -> Option<LongInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_LongInterval_d(left, right)
+}
 
 #[doc(hidden)]
 pub fn div_LongInterval_SqlDecimal<const P: usize, const S: usize>(
@@ -762,6 +978,45 @@ some_polymorphic_function2!(
     SqlDecimal<P, S>,
     LongInterval
 );
+
+#[doc(hidden)]
+pub fn div_null_LongInterval_SqlDecimal<const P: usize, const S: usize>(
+    left: LongInterval,
+    right: SqlDecimal<P, S>,
+) -> Option<LongInterval> {
+    let m = SqlDecimal::<38, 0>::try_from(left.months()).ok()?;
+    let div = m.checked_div_generic::<P, S, 38, 0>(right)?;
+    let months: i32 = div.try_into().ok()?;
+    Some(LongInterval::from_months(months))
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_SqlDecimal<const P: usize, const S: usize>(
+    left: Option<LongInterval>,
+    right: SqlDecimal<P, S>,
+) -> Option<LongInterval> {
+    let left = left?;
+    div_null_LongInterval_SqlDecimal(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongInterval_SqlDecimalN<const P: usize, const S: usize>(
+    left: LongInterval,
+    right: Option<SqlDecimal<P, S>>,
+) -> Option<LongInterval> {
+    let right = right?;
+    div_null_LongInterval_SqlDecimal(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_SqlDecimalN<const P: usize, const S: usize>(
+    left: Option<LongInterval>,
+    right: Option<SqlDecimal<P, S>>,
+) -> Option<LongInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_LongInterval_SqlDecimal(left, right)
+}
 
 #[doc(hidden)]
 pub fn plus_LongInterval_LongInterval_LongInterval__(

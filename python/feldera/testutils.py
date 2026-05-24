@@ -1,6 +1,7 @@
 "Utility functions for writing tests against a Feldera instance."
 
 import os
+import platform
 import re
 import time
 import json
@@ -151,6 +152,21 @@ def log(*args, **kwargs):
     print(prefix, *args, **kwargs)
 
 
+# Cap on rows logged when a view validation fails. A failing TPC-H or test_now run
+# can otherwise emit tens of megabytes on a single line, which blows up CI log capture.
+_ROW_DIFF_LOG_LIMIT = 20
+
+
+def _log_row_diff(label: str, rows: list) -> None:
+    if not rows:
+        return
+    log(
+        f"{label} ({len(rows)} rows; showing first {min(len(rows), _ROW_DIFF_LOG_LIMIT)}):"
+    )
+    for row in rows[:_ROW_DIFF_LOG_LIMIT]:
+        log(json.dumps(row, default=str))
+
+
 def unique_pipeline_name(base_name: str) -> str:
     """
     In CI, multiple tests of different runs can run against the same Feldera instance, we
@@ -174,6 +190,21 @@ def single_host_only(fn):
     return unittest.skipUnless(
         FELDERA_TEST_NUM_HOSTS == 1,
         f"multihost not yet supported for {fn.__name__}, skipping",
+    )(fn)
+
+
+def skip_on_arm64(fn):
+    """Skip the test on Linux aarch64.
+
+    Some native Python wheels (e.g. `deltalake`) bundle a jemalloc built
+    for 4 KB pages and abort on import on Ubuntu's 64 KB-page aarch64
+    kernel used by some CI runners. Tests that depend on such wheels can
+    use this decorator to opt out of running there.
+    """
+    fn._skip_on_arm64 = True
+    return unittest.skipIf(
+        platform.machine() == "aarch64",
+        f"{fn.__name__} skipped on aarch64 (incompatible native wheel)",
     )(fn)
 
 
@@ -215,13 +246,14 @@ def validate_view(pipeline: Pipeline, view: ViewSpec):
                 pipeline.query(f"({view_query}) except (select * from {view.name})")
             )
 
-            if extra_rows:
-                log("Extra rows in Feldera output, but not in the ad hoc query output")
-                log(json.dumps(extra_rows, default=str))
-
-            if missing_rows:
-                log("Extra rows in the ad hoc query output, but not in Feldera output")
-                log(json.dumps(missing_rows, default=str))
+            _log_row_diff(
+                "Extra rows in Feldera output, but not in the ad hoc query output",
+                extra_rows,
+            )
+            _log_row_diff(
+                "Extra rows in the ad hoc query output, but not in Feldera output",
+                missing_rows,
+            )
         except Exception as e:
             log(f"Error querying view '{view.name}': {e}")
             log(f"Ad-hoc Query: {view_query}")
@@ -248,6 +280,7 @@ def build_pipeline(
     tables: dict,
     views: List[ViewSpec],
     resources: Optional[Resources] = None,
+    dev_tweaks: Optional[dict] = None,
 ) -> Pipeline:
     sql = generate_program(tables, views)
 
@@ -261,6 +294,7 @@ def build_pipeline(
             resources=resources,
             workers=FELDERA_TEST_NUM_WORKERS,
             hosts=FELDERA_TEST_NUM_HOSTS,
+            dev_tweaks=dev_tweaks,
         ),
     ).create_or_replace()
 
@@ -297,6 +331,25 @@ def transaction(pipeline: Pipeline, duration_seconds: int):
     log(f"Running transaction for {duration_seconds} seconds")
     pipeline.start_transaction()
     time.sleep(duration_seconds)
+    log("Committing transaction")
+    commit_start = time.monotonic()
+    pipeline.commit_transaction()
+    log(f"Transaction committed in {time.monotonic() - commit_start} seconds")
+
+
+def transaction_num_records(pipeline: Pipeline, num_records: int):
+    """Run a transaction until it ingests a record count or reaches end of input."""
+
+    log(f"Running transaction for {num_records} records or end of input")
+    initial_records = number_of_processed_records(pipeline)
+    pipeline.start_transaction()
+
+    while not check_end_of_input(pipeline):
+        processed_records = number_of_processed_records(pipeline) - initial_records
+        if processed_records >= num_records:
+            break
+        time.sleep(3)
+
     log("Committing transaction")
     commit_start = time.monotonic()
     pipeline.commit_transaction()
@@ -346,12 +399,19 @@ def number_of_processed_records(pipeline: Pipeline) -> int:
     return pipeline.stats().global_metrics.total_processed_records
 
 
+def number_of_input_records(pipeline: Pipeline) -> int:
+    """Get the total_input_records metric."""
+
+    return pipeline.stats().global_metrics.total_input_records
+
+
 def run_workload(
     pipeline_name: str,
     tables: dict,
     views: List[ViewSpec],
     transaction: bool = True,
     stop: bool = True,
+    resources: Optional[Resources] = None,
 ) -> Pipeline:
     """
     Helper to run a pipeline to completion and validate the views afterwards using ad-hoc queries.
@@ -361,41 +421,48 @@ def run_workload(
     frameworks in the `tests` directory.
     """
 
-    pipeline = build_pipeline(pipeline_name, tables, views)
+    pipeline = build_pipeline(pipeline_name, tables, views, resources)
 
-    pipeline.start()
-    start_time = time.monotonic()
-
-    if transaction:
-        try:
-            pipeline.start_transaction()
-        except Exception as e:
-            log(f"Error starting transaction: {e}")
-
-    if transaction:
-        wait_end_of_input(pipeline, timeout_s=3600)
-    else:
-        pipeline.wait_for_completion(force_stop=False, timeout_s=3600)
-
-    elapsed = time.monotonic() - start_time
-    log(f"Data ingested in {elapsed}")
-
-    if transaction:
+    try:
+        pipeline.start()
         start_time = time.monotonic()
-        try:
-            pipeline.commit_transaction(transaction_id=None, wait=True, timeout_s=None)
-            log(f"Commit took {time.monotonic() - start_time}")
-        except Exception as e:
-            log(f"Error committing transaction: {e}")
 
-        log("Waiting for outputs to flush")
-        start_time = time.monotonic()
-        pipeline.wait_for_completion(force_stop=False, timeout_s=3600)
-        log(f"Flushing outputs took {time.monotonic() - start_time}")
+        if transaction:
+            try:
+                pipeline.start_transaction()
+            except Exception as e:
+                log(f"Error starting transaction: {e}")
 
-    validate_outputs(pipeline, tables, views)
+        if transaction:
+            wait_end_of_input(pipeline, timeout_s=3600)
+        else:
+            pipeline.wait_for_completion(force_stop=False, timeout_s=3600)
 
-    if stop:
-        pipeline.stop(force=True)
+        elapsed = time.monotonic() - start_time
+        log(f"Data ingested in {elapsed}")
+
+        if transaction:
+            start_time = time.monotonic()
+            try:
+                pipeline.commit_transaction(
+                    transaction_id=None, wait=True, timeout_s=None
+                )
+                log(f"Commit took {time.monotonic() - start_time}")
+            except Exception as e:
+                log(f"Error committing transaction: {e}")
+
+            log("Waiting for outputs to flush")
+            start_time = time.monotonic()
+            pipeline.wait_for_completion(force_stop=False, timeout_s=3600)
+            log(f"Flushing outputs took {time.monotonic() - start_time}")
+
+        validate_outputs(pipeline, tables, views)
+    finally:
+        if stop:
+            try:
+                pipeline.stop(force=True)
+                pipeline.clear_storage()
+            except Exception as e:
+                log(f"Error during pipeline cleanup: {e}")
 
     return pipeline

@@ -60,6 +60,7 @@ fda shutdown p1 || true
 fda delete --force p1 || true
 fda delete --force p2 || true
 fda clear pudf && fda delete pudf || true
+fda delete --force pclock || true
 fda delete unknown || true
 fda delete --force punknown || true
 fda apikey delete a || true
@@ -83,6 +84,12 @@ fda program set-config p1 --profile dev
 fda program set-config p1 --profile optimized
 fda program config p1
 fda program status p1
+fda events p1
+fda events p1 status
+fda events p1 all
+fda event p1 latest
+fda event p1 latest status
+fda event p1 latest all
 
 fda create pudf program.sql --udf-toml udf.toml --udf-rs udf.rs
 compare_output "fda program get pudf --udf-toml" "cat udf.toml"
@@ -113,6 +120,21 @@ fda connector p1 example unknown start || true
 
 # Adhoc queries
 fda query p1 "SELECT * FROM example"
+# Arrow IPC is the recommended format; verify it produces output and the
+# text-mode pretty-printer downstream of the parser handles it.
+fda --format arrow_ipc query p1 "SELECT * FROM example"
+
+# Runtime errors during query execution must surface as a non-zero exit
+# code in WebSocket mode, otherwise scripts have no way to detect a
+# failure.
+fail_on_success fda query p1 "SELECT 1/0"
+fail_on_success fda --format arrow_ipc query p1 "SELECT 1/0"
+fail_on_success fda --format json query p1 "SELECT 1/0"
+
+# Intermediate `SELECT`s still error today; we plan to support
+# `select; select; ...` once a streaming protocol can frame multiple
+# result sets back to the caller.
+fail_on_success fda query p1 "SELECT 1; SELECT 2"
 
 # Transaction tests
 echo "Testing transaction commands..."
@@ -126,6 +148,45 @@ fda start-transaction p1
 fda commit-transaction p1 --no-wait
 
 fda shutdown p1
+
+# Clock advance smoke test (testing knob).  Uses a dedicated pipeline
+# `pclock` whose SQL references NOW(); the clock connector is only
+# registered when the program contains a NOW() stream.
+echo "Testing clock advance..."
+fda shutdown pclock || true
+fda delete --force pclock || true
+cat > clock.sql <<EOF
+CREATE MATERIALIZED VIEW v AS SELECT NOW() AS t;
+EOF
+fda create pclock clock.sql
+
+# Without `now_http_driven` the pipeline rejects with 400.
+fda start pclock
+sleep 2
+fail_on_success fda clock-advance pclock
+fda shutdown pclock
+
+# Reconfigure for http-driven mode anchored at a fixed RFC 3339 instant.
+fda set-config pclock dev_tweaks '{"now_http_driven": true, "now_offset": "2030-01-01T00:00:00Z"}'
+fda start pclock
+sleep 2
+
+# delta_ms = 0 is a read; pin the anchor (2030-01-01 == 1893456000000 ms).
+fda --format json clock-advance pclock --delta-ms 0 | jq -e '.now_ms == 1893456000000'
+# Explicit forward advance.
+fda clock-advance pclock --delta-ms 60000
+# Omitting --delta-ms advances by one clock_resolution.
+fda clock-advance pclock
+# Aliases resolve to the same command.
+fda set-clock pclock --delta-ms 0
+fda clock-set pclock --delta-ms 0
+# Negative delta is rejected by clap (`u64`).
+fail_on_success fda clock-advance pclock --delta-ms -1
+
+fda shutdown pclock
+fda clear pclock
+fda delete pclock
+rm clock.sql
 
 if $enterprise; then
     enterprise_only=

@@ -27,7 +27,7 @@ use futures::{Stream as AsyncStream, StreamExt};
 use size_of::{Context, SizeOf};
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     marker::PhantomData,
     ops::Deref,
     pin::Pin,
@@ -473,6 +473,9 @@ where
         }
     }
 
+    // It is safe to hold `self.future_outputs.borrow_mut()` across an await
+    // point because the operator is never evaluated reentrantly.
+    #[allow(clippy::await_holding_refcell_ref)]
     fn async_eval(
         self: Rc<Self>,
         prefix: SpineSnapshot<I>,
@@ -503,7 +506,7 @@ where
                 let time = self.circuit.time();
 
                 let mut output_tuples = self.timed_items_factory.default_box();
-                output_tuples.reserve(chunk_size);
+                output_tuples.try_reserve(chunk_size);
 
                 let mut timed_item = self.timed_item_factory.default_box();
 
@@ -552,11 +555,11 @@ where
 
                     start += run_length;
 
-                    self.future_outputs.borrow_mut().entry(batch_time).or_insert_with(|| {
+                    if let Entry::Vacant(vacant) = self.future_outputs.borrow_mut().entry(batch_time) {
                         let mut spine = <Spine<O> as Trace>::new(&self.output_factories);
-                        spine.insert(O::dyn_from_tuples(&self.output_factories, (), &mut batch));
-                        spine
-                    });
+                        spine.insert(O::dyn_from_tuples(&self.output_factories, (), &mut batch)).await;
+                        vacant.insert(spine);
+                    }
                     batch.clear();
                 }
 
@@ -569,7 +572,7 @@ where
                 // Evaluate join in the outer scope, where we don't need to worry about preparing future outputs.
 
                 let mut output_tuples = self.output_factories.weighted_items_factory().default_box();
-                output_tuples.reserve(chunk_size);
+                output_tuples.try_reserve(chunk_size);
                 let mut batcher = O::Batcher::new_batcher(&self.output_factories, ());
 
                 let mut output_tuple = self.output_factories.weighted_item_factory().default_box();
@@ -858,6 +861,8 @@ where
     fn restore(&mut self, _base: &StoragePath) -> Result<(), crate::Error> {
         Ok(())
     }
+
+    fn start_compaction(&mut self) {}
 
     fn eval<'a>(
         &'a mut self,

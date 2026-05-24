@@ -6,20 +6,25 @@ use std::{
     },
 };
 
+use feldera_storage::tokio::TOKIO;
 use proptest::{collection::vec, prelude::*, strategy::BoxedStrategy};
 use size_of::SizeOf;
+use tempfile::tempdir;
 
 use crate::{
     DynZWeight, Runtime, ZWeight,
     algebra::{
-        IndexedZSet, NegByRef, OrdIndexedZSet, OrdIndexedZSetFactories, OrdZSet, OrdZSetFactories,
-        ZBatch, ZSet,
+        AddByRef, IndexedZSet, NegByRef, OrdIndexedZSet, OrdIndexedZSetFactories, OrdZSet,
+        OrdZSetFactories, ZBatch, ZSet,
     },
     circuit::{CircuitConfig, mkconfig},
     dynamic::{DowncastTrait, DynData, DynUnit, DynWeightedPairs, Erase, LeanVec, pair::DynPair},
+    storage::{buffer_cache::CacheStats, file::FilterKind},
     trace::{
-        Batch, BatchReader, BatchReaderFactories, Builder, FileIndexedWSetFactories,
-        FileWSetFactories, GroupFilter, Spine, Trace,
+        Batch, BatchLocation, BatchReader, BatchReaderFactories, Builder, FileIndexedWSetFactories,
+        FileWSetFactories, GroupFilter, ListMerger, Spine, Trace, VecIndexedWSet,
+        VecIndexedWSetFactories, VecKeyBatch, VecKeyBatchFactories, VecValBatch,
+        VecValBatchFactories, VecWSet, VecWSetFactories,
         cursor::{Cursor, CursorPair},
         ord::{
             FileIndexedWSet, FileKeyBatch, FileKeyBatchFactories, FileValBatch,
@@ -31,7 +36,7 @@ use crate::{
             assert_trace_eq, test_batch_sampling, test_trace_sampling,
         },
     },
-    utils::{Tup2, Tup3, Tup4},
+    utils::{Tup1, Tup2, Tup3, Tup4},
 };
 
 use super::Filter;
@@ -205,14 +210,14 @@ fn test_zset_spine<B: ZSet<Key = DynI32>>(
 
         assert_batch_eq(&batch, &ref_batch);
 
-        ref_trace.insert(ref_batch);
+        TOKIO.block_on(ref_trace.insert(ref_batch));
         assert_batch_cursors_eq(
             CursorPair::new(&mut batch.cursor(), &mut trace.cursor()),
             &ref_trace,
             seed,
         );
 
-        trace.insert(batch);
+        TOKIO.block_on(trace.insert(batch));
         test_trace_sampling(&trace);
 
         assert_trace_eq(&trace, &ref_trace);
@@ -256,14 +261,14 @@ fn test_indexed_zset_spine<B: IndexedZSet<Key = DynI32, Val = DynI32>>(
 
         assert_batch_cursors_eq(batch.cursor(), &ref_batch, seed);
 
-        ref_trace.insert(ref_batch);
+        TOKIO.block_on(ref_trace.insert(ref_batch));
         assert_batch_cursors_eq(
             CursorPair::new(&mut batch.cursor(), &mut trace.cursor()),
             &ref_trace,
             seed,
         );
 
-        trace.insert(batch);
+        TOKIO.block_on(trace.insert(batch));
         test_trace_sampling(&trace);
 
         assert_trace_eq(&trace, &ref_trace);
@@ -316,14 +321,14 @@ fn test_val_batch_trace_spine<B: ZBatch<Key = DynI32, Val = DynI32, Time = u32>>
         assert_batch_eq(&batch, &ref_batch);
         assert_batch_cursors_eq(batch.cursor(), &ref_batch, seed);
 
-        ref_trace.insert(ref_batch);
+        TOKIO.block_on(ref_trace.insert(ref_batch));
         assert_batch_cursors_eq(
             CursorPair::new(&mut trace.cursor(), &mut batch.cursor()),
             &ref_trace,
             seed,
         );
 
-        trace.insert(batch);
+        TOKIO.block_on(trace.insert(batch));
 
         assert_trace_eq(&trace, &ref_trace);
         assert_batch_cursors_eq(trace.cursor(), &ref_trace, seed);
@@ -446,14 +451,14 @@ fn test_key_batch_spine<B: ZBatch<Key = DynI32, Val = DynUnit, Time = u32>>(
 
         assert_batch_eq(&batch, &ref_batch);
 
-        ref_trace.insert(ref_batch);
+        TOKIO.block_on(ref_trace.insert(ref_batch));
         assert_batch_cursors_eq(
             CursorPair::new(&mut trace.cursor(), &mut batch.cursor()),
             &ref_trace,
             seed,
         );
 
-        trace.insert(batch);
+        TOKIO.block_on(trace.insert(batch));
 
         assert_trace_eq(&trace, &ref_trace);
 
@@ -550,6 +555,231 @@ fn test_file_indexed_wset_neg_by_ref_preserves_key_bounds() {
     });
 }
 
+#[test]
+fn test_file_indexed_wset_key_bounds() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <FileIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+        let tuples = vec![
+            Tup2(Tup2(-10, 1), 1),
+            Tup2(Tup2(0, 5), -2),
+            Tup2(Tup2(25, 7), 3),
+        ];
+
+        let mut erased_tuples = indexed_zset_tuples(tuples);
+        let batch = FileIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+            &factories,
+            (),
+            &mut erased_tuples,
+        );
+
+        let Some((min, max)) = batch.key_bounds() else {
+            panic!("expected non-empty key bounds");
+        };
+        assert_eq!(*min.downcast_checked::<i32>(), -10);
+        assert_eq!(*max.downcast_checked::<i32>(), 25);
+
+        let empty_batch =
+            <FileIndexedWSet<DynI32, DynI32, DynZWeight> as Batch>::Builder::with_capacity(
+                &factories, 0, 0,
+            )
+            .done();
+        assert!(empty_batch.key_bounds().is_none());
+    });
+}
+
+#[test]
+fn test_file_key_batch_key_bounds() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <FileKeyBatchFactories<DynData, u32, DynZWeight>>::new::<i16, (), ZWeight>();
+        let mut batch = <FileKeyBatch<DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
+            &factories, 3, 3,
+        );
+        for (key, time, weight) in [(-7i16, 1u32, 1i64), (3, 2, -2), (12, 4, 3)] {
+            let weight: ZWeight = weight;
+            batch.push_time_diff(&time, weight.erase());
+            batch.push_val(&());
+            batch.push_key(key.erase());
+        }
+        let batch = batch.done();
+
+        let Some((min, max)) = batch.key_bounds() else {
+            panic!("expected non-empty key bounds");
+        };
+        assert_eq!(*min.downcast_checked::<i16>(), -7);
+        assert_eq!(*max.downcast_checked::<i16>(), 12);
+
+        let empty_batch =
+            <FileKeyBatch<DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
+                &factories, 0, 0,
+            )
+            .done();
+        assert!(empty_batch.key_bounds().is_none());
+    });
+}
+
+#[test]
+fn test_file_val_batch_key_bounds() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <FileValBatchFactories<DynData, DynData, u32, DynZWeight>>::new::<u64, i16, ZWeight>();
+        let mut batch =
+            <FileValBatch<DynData, DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
+                &factories, 3, 3,
+            );
+        for (key, val, time, weight) in [(5u64, -1i16, 1u32, 1i64), (11, 2, 2, -1), (42, 9, 7, 4)] {
+            let weight: ZWeight = weight;
+            batch.push_time_diff(&time, weight.erase());
+            batch.push_val(val.erase());
+            batch.push_key(key.erase());
+        }
+        let batch = batch.done();
+
+        let Some((min, max)) = batch.key_bounds() else {
+            panic!("expected non-empty key bounds");
+        };
+        assert_eq!(*min.downcast_checked::<u64>(), 5);
+        assert_eq!(*max.downcast_checked::<u64>(), 42);
+
+        let empty_batch =
+            <FileValBatch<DynData, DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
+                &factories, 0, 0,
+            )
+            .done();
+        assert!(empty_batch.key_bounds().is_none());
+    });
+}
+
+#[test]
+fn test_file_wset_key_bounds() {
+    run_in_circuit_with_storage(|| {
+        let batch = build_file_wset_tup1_i32(&[-4, 6, 15]);
+
+        let Some((min, max)) = batch.key_bounds() else {
+            panic!("expected non-empty key bounds");
+        };
+        assert_eq!(min.downcast_checked::<Tup1<i32>>(), &Tup1(-4));
+        assert_eq!(max.downcast_checked::<Tup1<i32>>(), &Tup1(15));
+
+        let factories = <FileWSetFactories<DynData, DynZWeight>>::new::<Tup1<i32>, (), ZWeight>();
+        let empty_batch =
+            <FileWSet<DynData, DynZWeight> as Batch>::Builder::with_capacity(&factories, 0, 0)
+                .done();
+        assert!(empty_batch.key_bounds().is_none());
+    });
+}
+
+#[test]
+fn test_vec_indexed_wset_key_bounds() {
+    let factories =
+        <VecIndexedWSetFactories<DynData, DynData, DynZWeight>>::new::<i64, u8, ZWeight>();
+    let mut batch = <VecIndexedWSet<DynData, DynData, DynZWeight> as Batch>::Builder::with_capacity(
+        &factories, 3, 3,
+    );
+    for (key, val, weight) in [(-50i64, 1u8, 1i64), (4, 2, -1), (999, 3, 5)] {
+        let weight: ZWeight = weight;
+        batch.push_val_diff(val.erase(), weight.erase());
+        batch.push_key(key.erase());
+    }
+    let batch = batch.done();
+
+    let Some((min, max)) = batch.key_bounds() else {
+        panic!("expected non-empty key bounds");
+    };
+    assert_eq!(*min.downcast_checked::<i64>(), -50);
+    assert_eq!(*max.downcast_checked::<i64>(), 999);
+
+    let empty_batch =
+        <VecIndexedWSet<DynData, DynData, DynZWeight> as Batch>::Builder::with_capacity(
+            &factories, 0, 0,
+        )
+        .done();
+    assert!(empty_batch.key_bounds().is_none());
+}
+
+#[test]
+fn test_vec_key_batch_key_bounds() {
+    let factories = <VecKeyBatchFactories<DynData, u32, DynZWeight>>::new::<String, (), ZWeight>();
+    let mut batch =
+        <VecKeyBatch<DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(&factories, 3, 3);
+    for (key, time, weight) in [
+        (String::from("ant"), 1u32, 1i64),
+        (String::from("bee"), 2, -3),
+        (String::from("cat"), 7, 4),
+    ] {
+        let weight: ZWeight = weight;
+        batch.push_time_diff(&time, weight.erase());
+        batch.push_val(&());
+        batch.push_key(key.erase());
+    }
+    let batch = batch.done();
+
+    let Some((min, max)) = batch.key_bounds() else {
+        panic!("expected non-empty key bounds");
+    };
+    assert_eq!(min.downcast_checked::<String>(), "ant");
+    assert_eq!(max.downcast_checked::<String>(), "cat");
+
+    let empty_batch =
+        <VecKeyBatch<DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(&factories, 0, 0)
+            .done();
+    assert!(empty_batch.key_bounds().is_none());
+}
+
+#[test]
+fn test_vec_val_batch_key_bounds() {
+    let factories =
+        <VecValBatchFactories<DynData, DynData, u32, DynZWeight>>::new::<u16, i32, ZWeight>();
+    let mut batch =
+        <VecValBatch<DynData, DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
+            &factories, 3, 3,
+        );
+    for (key, val, time, weight) in [(2u16, -8i32, 1u32, 1i64), (10, 4, 2, -2), (70, 9, 9, 3)] {
+        let weight: ZWeight = weight;
+        batch.push_time_diff(&time, weight.erase());
+        batch.push_val(val.erase());
+        batch.push_key(key.erase());
+    }
+    let batch = batch.done();
+
+    let Some((min, max)) = batch.key_bounds() else {
+        panic!("expected non-empty key bounds");
+    };
+    assert_eq!(*min.downcast_checked::<u16>(), 2);
+    assert_eq!(*max.downcast_checked::<u16>(), 70);
+
+    let empty_batch =
+        <VecValBatch<DynData, DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
+            &factories, 0, 0,
+        )
+        .done();
+    assert!(empty_batch.key_bounds().is_none());
+}
+
+#[test]
+fn test_vec_wset_key_bounds() {
+    let factories = <VecWSetFactories<DynData, DynZWeight>>::new::<u8, (), ZWeight>();
+    let mut batch =
+        <VecWSet<DynData, DynZWeight> as Batch>::Builder::with_capacity(&factories, 3, 0);
+    for key in [1u8, 4, 9] {
+        let weight: ZWeight = 1;
+        batch.push_val_diff(&(), weight.erase());
+        batch.push_key(key.erase());
+    }
+    let batch = batch.done();
+
+    let Some((min, max)) = batch.key_bounds() else {
+        panic!("expected non-empty key bounds");
+    };
+    assert_eq!(*min.downcast_checked::<u8>(), 1);
+    assert_eq!(*max.downcast_checked::<u8>(), 9);
+
+    let empty_batch =
+        <VecWSet<DynData, DynZWeight> as Batch>::Builder::with_capacity(&factories, 0, 0).done();
+    assert!(empty_batch.key_bounds().is_none());
+}
+
 proptest! {
     #[test]
     fn test_truncate_key_bounded_memory(batches in kvr_batches_monotone_keys(100, 20, 50, 20, 500)) {
@@ -565,7 +795,7 @@ proptest! {
 
                 test_batch_sampling(&batch);
 
-                trace.insert(batch);
+                TOKIO.block_on(trace.insert(batch));
                 trace.retain_keys(Filter::new(Box::new(move |x| *x.downcast_checked::<i32>() >= ((i * 20) as i32))));
 
                 trace.complete_merges();
@@ -592,7 +822,7 @@ proptest! {
                 trace.retain_values(GroupFilter::Simple(Filter::new(Box::new(
                     move |x: &DynI32| *x.downcast_checked::<i32>() >= ((i * 20) as i32),
                 ))));
-                trace.insert(batch);
+                TOKIO.block_on(trace.insert(batch));
                 trace.complete_merges();
                 // FIXME: Change to 20000 after changing vtable types to pointers.
                 let trace_total_bytes = trace.size_of().total_bytes();
@@ -664,10 +894,10 @@ proptest! {
                 assert_batch_eq(&batch, &ref_batch);
                 assert_batch_cursors_eq(batch.cursor(), &ref_batch, seed);
 
-                ref_trace.insert(ref_batch);
+                TOKIO.block_on(ref_trace.insert(ref_batch));
                 assert_batch_cursors_eq(CursorPair::new(&mut batch.cursor(), &mut trace.cursor()), &ref_trace, seed);
 
-                trace.insert(batch);
+                TOKIO.block_on(trace.insert(batch));
                 test_trace_sampling(&trace);
 
                 assert_trace_eq(&trace, &ref_trace);
@@ -698,10 +928,10 @@ proptest! {
                 assert_batch_eq(&batch, &ref_batch);
                 assert_batch_cursors_eq(batch.cursor(), &ref_batch, seed);
 
-                ref_trace.insert(ref_batch);
+                TOKIO.block_on(ref_trace.insert(ref_batch));
                 assert_batch_cursors_eq(CursorPair::new(&mut batch.cursor(), &mut trace.cursor()), &ref_trace, seed);
 
-                trace.insert(batch);
+                TOKIO.block_on(trace.insert(batch));
                 test_trace_sampling(&trace);
 
                 assert_trace_eq(&trace, &ref_trace);
@@ -771,10 +1001,10 @@ proptest! {
                 assert_batch_eq(&batch, &ref_batch);
                 assert_batch_cursors_eq(batch.cursor(), &ref_batch, seed);
 
-                ref_trace.insert(ref_batch);
+                TOKIO.block_on(ref_trace.insert(ref_batch));
                 assert_batch_cursors_eq(CursorPair::new(&mut trace.cursor(), &mut batch.cursor()), &ref_trace, seed);
 
-                trace.insert(batch);
+                TOKIO.block_on(trace.insert(batch));
 
                 assert_trace_eq(&trace, &ref_trace);
                 assert_batch_cursors_eq(trace.cursor(), &ref_trace, seed);
@@ -804,10 +1034,10 @@ proptest! {
                 assert_batch_eq(&batch, &ref_batch);
                 assert_batch_cursors_eq(batch.cursor(), &ref_batch, seed);
 
-                ref_trace.insert(ref_batch);
+                TOKIO.block_on(ref_trace.insert(ref_batch));
                 assert_batch_cursors_eq(CursorPair::new(&mut trace.cursor(), &mut batch.cursor()), &ref_trace, seed);
 
-                trace.insert(batch);
+                TOKIO.block_on(trace.insert(batch));
 
                 assert_trace_eq(&trace, &ref_trace);
                 assert_batch_cursors_eq(trace.cursor(), &ref_trace, seed);
@@ -827,7 +1057,17 @@ fn run_in_circuit_with_storage<F>(f: F)
 where
     F: FnOnce() + Clone + Send + 'static,
 {
-    let (_temp_dir, config) = mkconfig();
+    let _temp_dir = tempdir().expect("Can't create temp dir for storage");
+    run_in_circuit_with_storage_config(mkconfig(_temp_dir.path()), f);
+}
+
+/// Like [`run_in_circuit_with_storage`], but lets the caller supply the
+/// `CircuitConfig` (e.g. to flip `dev_tweaks` flags). Storage-backing for
+/// the config is the caller's responsibility.
+fn run_in_circuit_with_storage_config<F>(config: CircuitConfig, f: F)
+where
+    F: FnOnce() + Clone + Send + 'static,
+{
     let count = Arc::new(AtomicUsize::new(0));
     Runtime::init_circuit(config, {
         let count = count.clone();
@@ -841,6 +1081,563 @@ where
 
     // Make sure that the callback executes exactly once.
     assert_eq!(count.load(Ordering::Relaxed), 1);
+}
+
+fn total_cache_accesses(stats: CacheStats) -> u64 {
+    stats
+        .0
+        .iter()
+        .map(|(_, accesses)| accesses.iter().map(|(_, counts)| counts.count).sum::<u64>())
+        .sum()
+}
+
+fn build_file_wset_u32(keys: &[u32]) -> FileWSet<DynData, DynZWeight> {
+    let factories = <FileWSetFactories<DynData, DynZWeight>>::new::<u32, (), ZWeight>();
+    let mut builder =
+        <FileWSet<DynData, DynZWeight> as Batch>::Builder::with_capacity(&factories, keys.len(), 0);
+
+    for key in keys {
+        let weight: ZWeight = 1;
+        builder.push_time_diff(&(), weight.erase());
+        builder.push_key(key.erase());
+    }
+
+    builder.done()
+}
+
+fn build_file_wset_tup1_i32(keys: &[i32]) -> FileWSet<DynData, DynZWeight> {
+    let factories = <FileWSetFactories<DynData, DynZWeight>>::new::<Tup1<i32>, (), ZWeight>();
+    let mut builder =
+        <FileWSet<DynData, DynZWeight> as Batch>::Builder::with_capacity(&factories, keys.len(), 0);
+
+    for key in keys {
+        let weight: ZWeight = 1;
+        builder.push_time_diff(&(), weight.erase());
+        builder.push_key(Tup1(*key).erase());
+    }
+
+    builder.done()
+}
+
+fn build_fallback_wset_i32(keys: &[i32]) -> crate::trace::FallbackWSet<DynI32, DynZWeight> {
+    let factories =
+        <crate::trace::FallbackWSetFactories<DynI32, DynZWeight>>::new::<i32, (), ZWeight>();
+    let mut erased_tuples = zset_tuples(keys.iter().copied().map(|key| Tup2(key, 1)).collect());
+    crate::trace::FallbackWSet::<DynI32, DynZWeight>::dyn_from_tuples(
+        &factories,
+        (),
+        &mut erased_tuples,
+    )
+}
+
+#[test]
+fn test_file_wset_roaring_u32_seek_key_exact_skips_absent_reads() {
+    let _temp_dir = tempdir().expect("Can't create temp dir for storage");
+    let mut config = mkconfig(_temp_dir.path());
+    config.dev_tweaks.enable_roaring = Some(true);
+
+    run_in_circuit_with_storage_config(config, move || {
+        let batch = build_file_wset_u32(&[1, 3, 7]);
+        let mut cursor = batch.cursor();
+        let before = total_cache_accesses(batch.cache_stats());
+
+        let missing = 2u32;
+        assert!(!cursor.seek_key_exact(missing.erase(), None));
+        assert_eq!(total_cache_accesses(batch.cache_stats()), before);
+
+        let present = 3u32;
+        assert!(cursor.seek_key_exact(present.erase(), None));
+    });
+}
+
+#[test]
+fn test_file_wset_tup1_i32_roaring_seek_key_exact_skips_absent_reads() {
+    let _temp_dir = tempdir().expect("Can't create temp dir for storage");
+    let mut config = mkconfig(_temp_dir.path());
+    config.dev_tweaks.enable_roaring = Some(true);
+
+    run_in_circuit_with_storage_config(config, move || {
+        let batch = build_file_wset_tup1_i32(&[-7, 1, 3]);
+        let mut cursor = batch.cursor();
+        let before = total_cache_accesses(batch.cache_stats());
+
+        let missing = Tup1(2i32);
+        assert!(!cursor.seek_key_exact(missing.erase(), None));
+        assert_eq!(total_cache_accesses(batch.cache_stats()), before);
+
+        let present = Tup1(3i32);
+        assert!(cursor.seek_key_exact(present.erase(), None));
+    });
+}
+
+#[test]
+fn test_file_wset_roaring_filter_rebuilt_after_merge() {
+    let _temp_dir = tempdir().expect("Can't create temp dir for storage");
+    let mut config = mkconfig(_temp_dir.path());
+    config.dev_tweaks.enable_roaring = Some(true);
+
+    run_in_circuit_with_storage_config(config, move || {
+        let lhs = build_file_wset_u32(&[1, 5]);
+        let rhs = build_file_wset_u32(&[3, 7]);
+        let merged = lhs.add_by_ref(&rhs);
+
+        let mut cursor = merged.cursor();
+        let before = total_cache_accesses(merged.cache_stats());
+
+        let missing = 4u32;
+        assert!(!cursor.seek_key_exact(missing.erase(), None));
+        assert_eq!(total_cache_accesses(merged.cache_stats()), before);
+
+        let present = 7u32;
+        assert!(cursor.seek_key_exact(present.erase(), None));
+    });
+}
+
+#[test]
+fn test_fallback_wset_roaring_filter_rebuilt_after_storage_merge() {
+    let _temp_dir = tempdir().expect("Can't create temp dir for storage");
+    let mut config = mkconfig(_temp_dir.path());
+    config.dev_tweaks.enable_roaring = Some(true);
+    config.storage.as_mut().unwrap().options.min_storage_bytes = Some(0);
+
+    run_in_circuit_with_storage_config(config, move || {
+        let lhs = build_fallback_wset_i32(&[1, 5]);
+        let rhs = build_fallback_wset_i32(&[3, 7]);
+        let factories =
+            <crate::trace::FallbackWSetFactories<DynI32, DynZWeight>>::new::<i32, (), ZWeight>();
+        let merged: crate::trace::FallbackWSet<DynI32, DynZWeight> = ListMerger::merge(
+            &factories,
+            <crate::trace::FallbackWSet<DynI32, DynZWeight> as Batch>::Builder::for_merge(
+                &factories,
+                [&lhs, &rhs],
+                Some(BatchLocation::Storage),
+            ),
+            vec![lhs.merge_cursor(None, None), rhs.merge_cursor(None, None)],
+        );
+
+        assert_eq!(merged.membership_filter_kind(), FilterKind::Roaring);
+
+        let mut cursor = merged.cursor();
+        let before = total_cache_accesses(merged.cache_stats());
+
+        let missing = 4i32;
+        assert!(!cursor.seek_key_exact(missing.erase(), None));
+        assert_eq!(total_cache_accesses(merged.cache_stats()), before);
+    });
+}
+
+/// Builds a `FallbackIndexedWSet` over `(key, value, weight)` triples.
+fn build_fallback_indexed_wset_i32(
+    tuples: Vec<Tup2<Tup2<i32, i32>, ZWeight>>,
+) -> crate::trace::FallbackIndexedWSet<DynI32, DynI32, DynZWeight> {
+    let factories = <crate::trace::FallbackIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<
+        i32,
+        i32,
+        ZWeight,
+    >();
+    let mut erased = indexed_zset_tuples(tuples);
+    crate::trace::FallbackIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+        &factories,
+        (),
+        &mut erased,
+    )
+}
+
+/// Builds a `FallbackIndexedWSet` and re-routes it to the requested storage
+/// tier, regardless of the runtime's `min_step_storage_bytes` default
+/// that gives more control over batch location.
+fn build_fallback_indexed_wset_i32_at(
+    tuples: Vec<Tup2<Tup2<i32, i32>, ZWeight>>,
+    location: BatchLocation,
+) -> crate::trace::FallbackIndexedWSet<DynI32, DynI32, DynZWeight> {
+    let factories = <crate::trace::FallbackIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<
+        i32,
+        i32,
+        ZWeight,
+    >();
+    let initial = build_fallback_indexed_wset_i32(tuples);
+    let builder = <crate::trace::FallbackIndexedWSet<
+        DynI32,
+        DynI32,
+        DynZWeight,
+    > as Batch>::Builder::for_merge(&factories, [&initial], Some(location));
+    ListMerger::merge(&factories, builder, vec![initial.merge_cursor(None, None)])
+}
+
+/// Strategy for the storage tier of a single proptest input batch.
+///
+/// Each batch independently picks `Memory` or `Storage` so a single test
+/// case typically runs the merger on a mix of cursor types.
+/// Bias toward `Storage`.
+fn batch_location_strategy() -> impl Strategy<Value = BatchLocation> {
+    prop_oneof![
+        2 => Just(BatchLocation::Storage),
+        1 => Just(BatchLocation::Memory),
+    ]
+}
+
+/// Strategy that produces a single batch's worth of `(key, value, weight)`
+/// triples with i32 keys spanning negative and positive ranges.
+fn merge_proptest_batch(max_tuples: usize) -> BoxedStrategy<Vec<Tup2<Tup2<i32, i32>, ZWeight>>> {
+    vec(
+        (-150_000..150_000i32, 0..32i32, -3..=3i64).prop_map(|(k, v, w)| Tup2(Tup2(k, v), w)),
+        0..=max_tuples,
+    )
+    .boxed()
+}
+
+/// Dense strategy: keys in `0..200` with up to 80 tuples per batch. Designed
+/// to maximize per-batch overlap and weight cancellation between merge inputs.
+fn merge_proptest_batch_dense(
+    max_tuples: usize,
+) -> BoxedStrategy<Vec<Tup2<Tup2<i32, i32>, ZWeight>>> {
+    vec(
+        (0..200i32, 0..16i32, -3..=3i64).prop_map(|(k, v, w)| Tup2(Tup2(k, v), w)),
+        0..=max_tuples,
+    )
+    .boxed()
+}
+
+/// Which membership-filter strategies the runtime is allowed to choose from.
+/// The merger picks one of these per output batch via `FilterPlan::decide_filter`.
+#[derive(Copy, Clone, Debug)]
+enum FilterConfig {
+    /// Bloom only: roaring disabled.
+    BloomOnly,
+    /// Roaring only: bloom disabled (false-positive rate forced to zero).
+    RoaringOnly,
+    /// Both enabled: the lookup predictor picks per output batch.
+    Both,
+    /// Neither enabled: file batches are written without a membership filter,
+    /// so `seek_key_exact` always reads the data block.
+    Neither,
+}
+
+impl FilterConfig {
+    /// Sets the dev tweaks that select this filter configuration.
+    fn apply(self, config: &mut CircuitConfig) {
+        match self {
+            Self::BloomOnly => {
+                config.dev_tweaks.enable_roaring = Some(false);
+            }
+            Self::RoaringOnly => {
+                config.dev_tweaks.enable_roaring = Some(true);
+                config.dev_tweaks.bloom_false_positive_rate = Some(0.0);
+            }
+            Self::Both => {
+                config.dev_tweaks.enable_roaring = Some(true);
+            }
+            Self::Neither => {
+                config.dev_tweaks.enable_roaring = Some(false);
+                config.dev_tweaks.bloom_false_positive_rate = Some(0.0);
+            }
+        }
+    }
+
+    /// Filter kinds the merged batch is allowed to end up with for this
+    /// configuration. `None` is always allowed because empty merges or merges
+    /// without a usable bounds plan get no filter.
+    fn allowed_filter_kinds(self) -> &'static [FilterKind] {
+        match self {
+            Self::BloomOnly => &[FilterKind::None, FilterKind::Bloom],
+            Self::RoaringOnly => &[FilterKind::None, FilterKind::Roaring],
+            Self::Both => &[FilterKind::None, FilterKind::Bloom, FilterKind::Roaring],
+            Self::Neither => &[FilterKind::None],
+        }
+    }
+}
+
+/// Per-input batch shape: the tuples to feed in plus the storage tier the
+/// input batch should reside in before the merger reads it.
+type MergeInputBatches = Vec<(Vec<Tup2<Tup2<i32, i32>, ZWeight>>, BatchLocation)>;
+
+/// Asserts that `merged.cursor().seek_key_exact` agrees with `expected` for
+/// every key present in `expected` and for every probe key in `extra_probes`.
+///
+/// Each probe runs on a fresh cursor in an order shuffled with a fixed
+/// seed, so we exercise the membership-filter and data-block lookup paths
+/// from a clean cursor state rather than reusing a single forward-walking
+/// cursor.
+fn assert_seek_key_exact_matches<B>(
+    merged: &B,
+    expected: &TestBatch<DynI32, DynI32, (), DynZWeight>,
+    extra_probes: impl IntoIterator<Item = i32>,
+    seed: u64,
+) where
+    B: BatchReader<Key = DynI32, Val = DynI32, Time = (), R = DynZWeight>,
+{
+    use rand::SeedableRng;
+    use rand::seq::SliceRandom;
+    use rand_chacha::ChaChaRng;
+    use std::collections::BTreeSet;
+
+    let mut present: BTreeSet<i32> = BTreeSet::new();
+    let mut probe = expected.cursor();
+    while probe.key_valid() {
+        present.insert(*probe.key().downcast_checked::<i32>());
+        probe.step_key();
+    }
+
+    // Deduplicate keys, then collect into a vector we can shuffle.
+    let probe_set: BTreeSet<i32> = present.iter().copied().chain(extra_probes).collect();
+    let mut probes: Vec<i32> = probe_set.into_iter().collect();
+    let mut rng = ChaChaRng::seed_from_u64(seed);
+    probes.shuffle(&mut rng);
+
+    for &k in &probes {
+        let mut cursor = merged.cursor();
+        let want = present.contains(&k);
+        let got = cursor.seek_key_exact(k.erase(), None);
+        assert_eq!(
+            got, want,
+            "seek_key_exact({k}) on a fresh cursor: expected {want}, got {got}",
+        );
+    }
+}
+
+/// Shared body for `indexed_wset_storage_merges_*` proptests. Generates
+/// inputs as a vec/file mix, runs `ListMerger::merge` to file storage, and
+/// validates the merged batch against a `TestBatch` reference. The input
+/// batches are reduced by an optional key filter `retain_above`.
+fn run_indexed_wset_storage_merges(
+    batches: MergeInputBatches,
+    retain_above: Option<i32>,
+    fc: FilterConfig,
+) {
+    let _temp_dir = tempdir().expect("Can't create temp dir for storage");
+    let mut config = mkconfig(_temp_dir.path());
+    fc.apply(&mut config);
+    // `min_storage_bytes` forces the merged batch to file; per-input tiers
+    // come from `build_fallback_indexed_wset_i32_at`.
+    config.storage.as_mut().unwrap().options.min_storage_bytes = Some(0);
+
+    run_in_circuit_with_storage_config(config, move || {
+        let factories =
+            <crate::trace::FallbackIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<
+                i32,
+                i32,
+                ZWeight,
+            >();
+
+        // Build inputs as a mix of vec-backed and file-backed fallback
+        // batches, as picked by `batch_location_strategy` per case.
+        let inputs: Vec<crate::trace::FallbackIndexedWSet<DynI32, DynI32, DynZWeight>> = batches
+            .iter()
+            .map(|(tuples, loc)| build_fallback_indexed_wset_i32_at(tuples.clone(), *loc))
+            .collect();
+
+        // Sanity check that each input batch resides where we requested it to be.
+        for (input, (_tuples, requested_loc)) in inputs.iter().zip(batches.iter()) {
+            if input.key_count() > 0 {
+                assert_eq!(input.location(), *requested_loc);
+            }
+        }
+
+        // Build a `TestBatch` reference from the union of input tuples,
+        // applying the same key filter.
+        let key_filter: Option<Filter<DynI32>> = retain_above.map(|threshold| {
+            Filter::new(Box::new(move |k: &DynI32| {
+                *k.downcast_checked::<i32>() > threshold
+            }))
+        });
+        let filtered_tuples: Vec<Tup2<Tup2<i32, i32>, ZWeight>> = batches
+            .iter()
+            .flat_map(|(tuples, _loc)| tuples.iter().copied())
+            .filter(|Tup2(Tup2(k, _), _)| retain_above.is_none_or(|threshold| *k > threshold))
+            .collect();
+        let mut expected_erased = indexed_zset_tuples(filtered_tuples);
+        let expected: TestBatch<DynI32, DynI32, (), DynZWeight> =
+            TestBatch::dyn_from_tuples(&TestBatchFactories::new(), (), &mut expected_erased);
+
+        // Force the merge through the file-backed builder.
+        let input_refs: Vec<&_> = inputs.iter().collect();
+        let builder = <crate::trace::FallbackIndexedWSet<
+            DynI32,
+            DynI32,
+            DynZWeight,
+        > as Batch>::Builder::for_merge(
+            &factories,
+            input_refs,
+            Some(BatchLocation::Storage),
+        );
+        let cursors: Vec<_> = inputs
+            .iter()
+            .map(|b| b.merge_cursor(key_filter.clone(), None))
+            .collect();
+        let merged: crate::trace::FallbackIndexedWSet<DynI32, DynI32, DynZWeight> =
+            ListMerger::merge(&factories, builder, cursors);
+
+        // Sanity check that destination forces file storage and that the
+        // merged batch's filter kind is consistent with the chosen config.
+        assert_eq!(merged.location(), BatchLocation::Storage);
+        let kind = merged.membership_filter_kind();
+        assert!(
+            fc.allowed_filter_kinds().contains(&kind),
+            "filter kind {kind:?} is not allowed under {fc:?}",
+        );
+        assert_batch_eq(&merged, &expected);
+
+        // Check some absent probes across the input range.
+        let absent_probes = (-150_000i32..=150_000).step_by(7_500);
+        assert_seek_key_exact_matches(&merged, &expected, absent_probes, 42);
+    });
+}
+
+/// Dense-key sibling of `run_indexed_wset_storage_merges`. Same merge plumbing
+/// but with the `0..200` key domain so we probe every possible key in
+/// `seek_key_exact` and so per-batch overlap is high.
+fn run_indexed_wset_storage_merges_dense(batches: MergeInputBatches, fc: FilterConfig) {
+    let _temp_dir = tempdir().expect("Can't create temp dir for storage");
+    let mut config = mkconfig(_temp_dir.path());
+    fc.apply(&mut config);
+    config.storage.as_mut().unwrap().options.min_storage_bytes = Some(0);
+
+    run_in_circuit_with_storage_config(config, move || {
+        let factories =
+            <crate::trace::FallbackIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<
+                i32,
+                i32,
+                ZWeight,
+            >();
+
+        let inputs: Vec<crate::trace::FallbackIndexedWSet<DynI32, DynI32, DynZWeight>> = batches
+            .iter()
+            .map(|(tuples, loc)| build_fallback_indexed_wset_i32_at(tuples.clone(), *loc))
+            .collect();
+
+        for (input, (_tuples, requested_loc)) in inputs.iter().zip(batches.iter()) {
+            if input.key_count() > 0 {
+                assert_eq!(input.location(), *requested_loc);
+            }
+        }
+
+        let mut expected_erased = indexed_zset_tuples(
+            batches
+                .iter()
+                .flat_map(|(t, _l)| t.iter().copied())
+                .collect(),
+        );
+        let expected: TestBatch<DynI32, DynI32, (), DynZWeight> =
+            TestBatch::dyn_from_tuples(&TestBatchFactories::new(), (), &mut expected_erased);
+
+        let input_refs: Vec<&_> = inputs.iter().collect();
+        let builder = <crate::trace::FallbackIndexedWSet<
+            DynI32,
+            DynI32,
+            DynZWeight,
+        > as Batch>::Builder::for_merge(
+            &factories,
+            input_refs,
+            Some(BatchLocation::Storage),
+        );
+        let cursors: Vec<_> = inputs.iter().map(|b| b.merge_cursor(None, None)).collect();
+        let merged: crate::trace::FallbackIndexedWSet<DynI32, DynI32, DynZWeight> =
+            ListMerger::merge(&factories, builder, cursors);
+
+        assert_eq!(merged.location(), BatchLocation::Storage);
+        let kind = merged.membership_filter_kind();
+        assert!(
+            fc.allowed_filter_kinds().contains(&kind),
+            "filter kind {kind:?} is not allowed under {fc:?}",
+        );
+
+        assert_batch_eq(&merged, &expected);
+
+        // Key domain is `0..200`; probe every value to cover present and
+        // absent paths exhaustively.
+        assert_seek_key_exact_matches(&merged, &expected, 0..200i32, 42);
+    });
+}
+
+proptest! {
+    // 32 cases per test × 8 tests = 256 cases per `cargo test` run. CI runs
+    // the suite many times across PRs so cumulative coverage compounds.
+    // Override with `PROPTEST_CASES=N` for occasional deeper sweeps.
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn indexed_wset_storage_merges_bloom_only(
+        batches in vec(
+            (merge_proptest_batch(1_000), batch_location_strategy()),
+            1..=24usize,
+        ),
+        retain_above in proptest::option::of(-150_000..150_000i32),
+    ) {
+        run_indexed_wset_storage_merges(batches, retain_above, FilterConfig::BloomOnly);
+    }
+
+    #[test]
+    fn indexed_wset_storage_merges_roaring_only(
+        batches in vec(
+            (merge_proptest_batch(1_000), batch_location_strategy()),
+            1..=24usize,
+        ),
+        retain_above in proptest::option::of(-150_000..150_000i32),
+    ) {
+        run_indexed_wset_storage_merges(batches, retain_above, FilterConfig::RoaringOnly);
+    }
+
+    #[test]
+    fn indexed_wset_storage_merges_both(
+        batches in vec(
+            (merge_proptest_batch(1_000), batch_location_strategy()),
+            1..=24usize,
+        ),
+        retain_above in proptest::option::of(-150_000..150_000i32),
+    ) {
+        run_indexed_wset_storage_merges(batches, retain_above, FilterConfig::Both);
+    }
+
+    #[test]
+    fn indexed_wset_storage_merges_neither(
+        batches in vec(
+            (merge_proptest_batch(1_000), batch_location_strategy()),
+            1..=24usize,
+        ),
+        retain_above in proptest::option::of(-150_000..150_000i32),
+    ) {
+        run_indexed_wset_storage_merges(batches, retain_above, FilterConfig::Neither);
+    }
+
+    #[test]
+    fn indexed_wset_storage_merges_dense_bloom_only(
+        batches in vec(
+            (merge_proptest_batch_dense(100), batch_location_strategy()),
+            1..=10usize,
+        ),
+    ) {
+        run_indexed_wset_storage_merges_dense(batches, FilterConfig::BloomOnly);
+    }
+
+    #[test]
+    fn indexed_wset_storage_merges_dense_roaring_only(
+        batches in vec(
+            (merge_proptest_batch_dense(100), batch_location_strategy()),
+            1..=10usize,
+        ),
+    ) {
+        run_indexed_wset_storage_merges_dense(batches, FilterConfig::RoaringOnly);
+    }
+
+    #[test]
+    fn indexed_wset_storage_merges_dense_both(
+        batches in vec(
+            (merge_proptest_batch_dense(100), batch_location_strategy()),
+            1..=10usize,
+        ),
+    ) {
+        run_indexed_wset_storage_merges_dense(batches, FilterConfig::Both);
+    }
+
+    #[test]
+    fn indexed_wset_storage_merges_dense_neither(
+        batches in vec(
+            (merge_proptest_batch_dense(100), batch_location_strategy()),
+            1..=10usize,
+        ),
+    ) {
+        run_indexed_wset_storage_merges_dense(batches, FilterConfig::Neither);
+    }
 }
 
 proptest! {

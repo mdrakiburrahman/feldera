@@ -1,13 +1,13 @@
 use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
 use proptest::collection::vec;
 use proptest::prelude::*;
-use std::hash::Hasher;
-use tempfile::{TempDir, tempdir};
+use std::{hash::Hasher, path::Path};
+use tempfile::tempdir;
 
 use crate::{
     Circuit, IndexedZSetHandle, OrdIndexedZSet, OrdZSet, OutputHandle, RootCircuit, Runtime,
     ZWeight,
-    circuit::{CircuitConfig, CircuitStorageConfig, GlobalNodeId},
+    circuit::{CircuitConfig, CircuitStorageConfig, Mode},
     default_hasher,
     dynamic::{Data, DowncastTrait as _},
     operator::{
@@ -58,12 +58,13 @@ fn accumulate_trace_with_balancer_test_circuit(
     circuit: &mut RootCircuit,
 ) -> AnyResult<(
     IndexedZSetHandle<u64, u64>,
-    GlobalNodeId,
+    String,
     OutputHandle<SpineSnapshot<OrdIndexedZSet<u64, u64>>>,
     OutputHandle<OrdIndexedZSet<u64, u64>>,
 )> {
     let (input, input_handle) = circuit.add_input_indexed_zset::<u64, u64>();
-    let input_node_id = input.origin_node_id().clone();
+    input.set_persistent_id(Some("input"));
+    let input_node_id = "input".to_string();
 
     let (balanced_accumulator, balanced_trace) = input.accumulate_trace_balanced();
 
@@ -91,23 +92,27 @@ fn accumulate_trace_with_balancer_test_circuit(
 type JoinTestCircuitResult = (
     IndexedZSetHandle<u64, u64>,
     IndexedZSetHandle<u64, u64>,
-    GlobalNodeId,
-    GlobalNodeId,
+    String,
+    String,
     OutputHandle<OrdZSet<Tup3<u64, u64, Option<u64>>>>,
 );
 
 fn join_with_balancer_test_circuit(circuit: &mut RootCircuit) -> AnyResult<JoinTestCircuitResult> {
     let (left_input, left_input_handle) = circuit.add_input_indexed_zset::<u64, u64>();
     let (right_input, right_input_handle) = circuit.add_input_indexed_zset::<u64, u64>();
-    let left_input_node_id = left_input.origin_node_id().clone();
-    let right_input_node_id = right_input.origin_node_id().clone();
+    left_input.set_persistent_id(Some("left_input"));
+    let left_input_node_id = "left_input".to_string();
+
+    right_input.set_persistent_id(Some("right_input"));
+    let right_input_node_id = "right_input".to_string();
 
     // let balanced_stream_output = balanced_stream.accumulate_output();
     let join_output_handle = left_input
         .join_balanced_inner(&right_input, |key, v1, v2| Tup3(*key, *v1, Some(*v2)))
+        .set_persistent_id(Some("join_output"))
         .accumulate_integrate_trace()
         .apply(|trace| trace.ro_snapshot().consolidate())
-        .output();
+        .output_persistent(Some("output"));
 
     Ok((
         left_input_handle,
@@ -125,8 +130,8 @@ fn left_join_with_balancer_test_circuit(
 ) -> AnyResult<(
     IndexedZSetHandle<u64, u64>,
     IndexedZSetHandle<u64, u64>,
-    GlobalNodeId,
-    GlobalNodeId,
+    String,
+    String,
     OutputHandle<OrdZSet<Tup3<u64, u64, Option<u64>>>>,
 )> {
     let (left_input, left_input_handle) = circuit.add_input_indexed_zset::<u64, u64>();
@@ -134,15 +139,19 @@ fn left_join_with_balancer_test_circuit(
 
     let right_input = right_input.map_index(|(k, v)| (k.clone(), Some(v.clone())));
 
-    let left_input_node_id = left_input.origin_node_id().clone();
-    let right_input_node_id = right_input.origin_node_id().clone();
+    left_input.set_persistent_id(Some("left_input"));
+    let left_input_node_id = "left_input".to_string();
+
+    right_input.set_persistent_id(Some("right_input"));
+    let right_input_node_id = "right_input".to_string();
 
     // let balanced_stream_output = balanced_stream.accumulate_output();
     let join_output_handle = left_input
         .left_join_balanced_inner(&right_input, |key, v1, v2| Tup3(*key, *v1, *v2))
+        .set_persistent_id(Some("join_output"))
         .accumulate_integrate_trace()
         .apply(|trace| trace.ro_snapshot().consolidate())
-        .output();
+        .output_persistent(Some("output"));
 
     Ok((
         left_input_handle,
@@ -194,39 +203,63 @@ fn circular_dependency_test_circuit(
     let (left_input, left_input_handle) = circuit.add_input_indexed_zset::<u64, u64>();
     let (right_input, right_input_handle) = circuit.add_input_indexed_zset::<u64, u64>();
 
-    let s2 = left_input.map_index(|(k, v)| (k.clone(), v.clone()));
-    let s3 = right_input.map_index(|(k, v)| (k.clone(), v.clone()));
-    let s5 = left_input.map_index(|(k, v)| (k.clone(), v.clone()));
-    let s6 = right_input.map_index(|(k, v)| (k.clone(), v.clone()));
+    let s2 = left_input
+        .map_index(|(k, v)| (k.clone(), v.clone()))
+        .set_persistent_id(Some("s2"));
+    let s3 = right_input
+        .map_index(|(k, v)| (k.clone(), v.clone()))
+        .set_persistent_id(Some("s3"));
+    let s5 = left_input
+        .map_index(|(k, v)| (k.clone(), v.clone()))
+        .set_persistent_id(Some("s5"));
+    let s6 = right_input
+        .map_index(|(k, v)| (k.clone(), v.clone()))
+        .set_persistent_id(Some("s6"));
 
-    let s1 = s5.join_index_balanced_inner(&s6, |key, v1, v2| Some((*key, Tup2(*v1, *v2))));
-    let s4 = s2.join_index_balanced_inner(&s3, |key, v1, v2| Some((*key, Tup2(*v1, *v2))));
-    let s7 = s4.join_index_balanced_inner(&s5, |key, Tup2(v1, v2), v3| {
-        Some((*key, Tup3(*v1, *v2, *v3)))
-    });
-    let s8 = s2.join_index_balanced_inner(&s1, |key, v1, Tup2(v2, v3)| {
-        Some((*key, Tup3(*v1, *v2, *v3)))
-    });
+    let s1 = s5
+        .join_index_balanced_inner(&s6, |key, v1, v2| Some((*key, Tup2(*v1, *v2))))
+        .set_persistent_id(Some("s1"));
+    let s4 = s2
+        .join_index_balanced_inner(&s3, |key, v1, v2| Some((*key, Tup2(*v1, *v2))))
+        .set_persistent_id(Some("s4"));
+    let s7 = s4
+        .join_index_balanced_inner(&s5, |key, Tup2(v1, v2), v3| {
+            Some((*key, Tup3(*v1, *v2, *v3)))
+        })
+        .set_persistent_id(Some("s7"));
+    let s8 = s2
+        .join_index_balanced_inner(&s1, |key, v1, Tup2(v2, v3)| {
+            Some((*key, Tup3(*v1, *v2, *v3)))
+        })
+        .set_persistent_id(Some("s8"));
 
-    let output1 = s1.accumulate_output();
-    let output4 = s4.accumulate_output();
-    let output7 = s7.accumulate_output();
-    let output8 = s8.accumulate_output();
+    let output1 = s1.accumulate_output_persistent(Some("output1"));
+    let output4 = s4.accumulate_output_persistent(Some("output4"));
+    let output7 = s7.accumulate_output_persistent(Some("output7"));
+    let output8 = s8.accumulate_output_persistent(Some("output8"));
 
     // Reference outputs computed using regular joins.
-    let s1_ref = s5.join_index(&s6, |key, v1, v2| Some((*key, Tup2(*v1, *v2))));
-    let s4_ref = s2.join_index(&s3, |key, v1, v2| Some((*key, Tup2(*v1, *v2))));
-    let s7_ref = s4.join_index(&s5, |key, Tup2(v1, v2), v3| {
-        Some((*key, Tup3(*v1, *v2, *v3)))
-    });
-    let s8_ref = s2.join_index(&s1, |key, v1, Tup2(v2, v3)| {
-        Some((*key, Tup3(*v1, *v2, *v3)))
-    });
+    let s1_ref = s5
+        .join_index(&s6, |key, v1, v2| Some((*key, Tup2(*v1, *v2))))
+        .set_persistent_id(Some("s1_ref"));
+    let s4_ref = s2
+        .join_index(&s3, |key, v1, v2| Some((*key, Tup2(*v1, *v2))))
+        .set_persistent_id(Some("s4_ref"));
+    let s7_ref = s4
+        .join_index(&s5, |key, Tup2(v1, v2), v3| {
+            Some((*key, Tup3(*v1, *v2, *v3)))
+        })
+        .set_persistent_id(Some("s7_ref"));
+    let s8_ref = s2
+        .join_index(&s1, |key, v1, Tup2(v2, v3)| {
+            Some((*key, Tup3(*v1, *v2, *v3)))
+        })
+        .set_persistent_id(Some("s8_ref"));
 
-    let output1_ref = s1_ref.accumulate_output();
-    let output4_ref = s4_ref.accumulate_output();
-    let output7_ref = s7_ref.accumulate_output();
-    let output8_ref = s8_ref.accumulate_output();
+    let output1_ref = s1_ref.accumulate_output_persistent(Some("output1_ref"));
+    let output4_ref = s4_ref.accumulate_output_persistent(Some("output4_ref"));
+    let output7_ref = s7_ref.accumulate_output_persistent(Some("output7_ref"));
+    let output8_ref = s8_ref.accumulate_output_persistent(Some("output8_ref"));
 
     Ok((
         left_input_handle,
@@ -251,7 +284,8 @@ fn test_accumulate_trace_with_balancer(
         Runtime::init_circuit(
             CircuitConfig::from(workers)
                 .with_splitter_chunk_size_records(2)
-                .with_balancer_min_absolute_improvement_threshold(0),
+                .with_balancer_min_absolute_improvement_threshold(0)
+                .with_mode(Mode::Persistent),
             accumulate_trace_with_balancer_test_circuit,
         )
         .unwrap();
@@ -264,8 +298,8 @@ fn test_accumulate_trace_with_balancer(
 
     let mut previous_policy = PartitioningPolicy::Shard;
 
-    for (step, (policy, batch)) in batches.iter().enumerate() {
-        println!("step: {}", step);
+    for (_step, (policy, batch)) in batches.iter().enumerate() {
+        //println!("step: {}", step);
 
         circuit
             .set_balancer_hint(&input_node_id, BalancerHint::Policy(Some(*policy)))
@@ -374,23 +408,21 @@ struct JoinTestStep {
     expected_right_policy: Option<PartitioningPolicy>,
 }
 
-pub(crate) fn mkconfig(workers: usize) -> (TempDir, CircuitConfig) {
-    let temp = tempdir().expect("Can't create temp dir for storage");
-
-    let storage = CircuitStorageConfig::for_config(
-        StorageConfig {
-            path: temp.path().to_string_lossy().into_owned(),
-            cache: StorageCacheConfig::default(),
-        },
-        StorageOptions::default(),
-    )
-    .unwrap();
-
-    let cconf = CircuitConfig::from(workers)
+fn mkconfig(path: &Path, workers: usize) -> CircuitConfig {
+    CircuitConfig::from(workers)
         .with_splitter_chunk_size_records(2)
         .with_balancer_min_absolute_improvement_threshold(0)
-        .with_storage(storage);
-    (temp, cconf)
+        .with_storage(Some(
+            CircuitStorageConfig::for_config(
+                StorageConfig {
+                    path: path.to_string_lossy().into_owned(),
+                    cache: StorageCacheConfig::default(),
+                },
+                StorageOptions::default(),
+            )
+            .unwrap(),
+        ))
+        .with_mode(Mode::Persistent)
 }
 
 fn test_join_with_balancer(
@@ -399,6 +431,7 @@ fn test_join_with_balancer(
     checkpoints: bool,
     inputs: Vec<JoinTestStep>,
     left_join: bool,
+    auto_rebalance: bool,
 ) {
     init_test_logger();
 
@@ -409,7 +442,7 @@ fn test_join_with_balancer(
     assert!(inputs.last().unwrap().expected_left_policy.is_some());
     assert!(inputs.last().unwrap().expected_right_policy.is_some());
 
-    let (_temp, mut cconf) = mkconfig(workers);
+    let temp = tempdir().expect("Can't create temp dir for storage");
 
     let constructor = if left_join {
         left_join_with_balancer_test_circuit
@@ -426,7 +459,8 @@ fn test_join_with_balancer(
             mut right_input_node_id,
             mut output_integral_handle,
         ),
-    ) = Runtime::init_circuit(cconf.clone(), constructor).unwrap();
+    ) = Runtime::init_circuit(mkconfig(temp.path(), workers), constructor).unwrap();
+    circuit.set_auto_rebalance(auto_rebalance).unwrap();
 
     let mut all_left_tuples: Vec<Tup2<Tup2<u64, u64>, ZWeight>> = vec![];
     let mut all_right_tuples: Vec<Tup2<Tup2<u64, u64>, ZWeight>> = vec![];
@@ -436,7 +470,7 @@ fn test_join_with_balancer(
     }
 
     for (
-        step,
+        _step,
         JoinTestStep {
             left,
             right,
@@ -447,25 +481,31 @@ fn test_join_with_balancer(
         },
     ) in inputs.iter().enumerate()
     {
-        println!(
-            "step: {} (left_policy_hint: {:?}, right_policy_hint: {:?})",
-            step, left_policy_hint, right_policy_hint
-        );
+        // println!(
+        //     "step: {} (left_policy_hint: {:?}, right_policy_hint: {:?})",
+        //     step, left_policy_hint, right_policy_hint
+        // );
 
-        circuit
-            .set_balancer_hints(vec![
-                (left_input_node_id.clone(), BalancerHint::Policy(None)),
-                (right_input_node_id.clone(), BalancerHint::Policy(None)),
-            ])
-            .unwrap();
+        if auto_rebalance {
+            circuit
+                .set_balancer_hints(vec![
+                    (left_input_node_id.clone(), BalancerHint::Policy(None)),
+                    (right_input_node_id.clone(), BalancerHint::Policy(None)),
+                ])
+                .unwrap();
+        }
 
-        if let Some(left_policy_hint) = left_policy_hint {
+        if let Some(left_policy_hint) = left_policy_hint
+            && auto_rebalance
+        {
             circuit
                 .set_balancer_hint(&left_input_node_id, BalancerHint::Policy(*left_policy_hint))
                 .unwrap();
         }
 
-        if let Some(right_policy_hint) = right_policy_hint {
+        if let Some(right_policy_hint) = right_policy_hint
+            && auto_rebalance
+        {
             circuit
                 .set_balancer_hint(
                     &right_input_node_id,
@@ -514,12 +554,15 @@ fn test_join_with_balancer(
                 .map(|worker| output_integral_handle.take_from_worker(worker).unwrap())
                 .collect();
 
-            let current_policies = circuit.get_current_balancer_policy().unwrap();
-            let current_left_policy = current_policies.get(&left_input_node_id).unwrap();
-            let current_right_policy = current_policies.get(&right_input_node_id).unwrap();
+            let current_left_policy = circuit
+                .get_current_balancer_policy(&left_input_node_id)
+                .unwrap();
+            let current_right_policy = circuit
+                .get_current_balancer_policy(&right_input_node_id)
+                .unwrap();
 
-            assert_eq!(current_left_policy, &expected_left_policy.unwrap());
-            assert_eq!(current_right_policy, &expected_right_policy.unwrap());
+            assert_eq!(current_left_policy, expected_left_policy.unwrap());
+            assert_eq!(current_right_policy, expected_right_policy.unwrap());
             assert_eq!(output_trace, expected_output);
 
             if checkpoints {
@@ -528,6 +571,7 @@ fn test_join_with_balancer(
                 circuit.kill().unwrap();
 
                 // start from the checkpoint
+                let mut cconf = mkconfig(temp.path(), workers);
                 cconf.storage.as_mut().unwrap().init_checkpoint = Some(cpm.uuid);
 
                 (
@@ -539,7 +583,7 @@ fn test_join_with_balancer(
                         right_input_node_id,
                         output_integral_handle,
                     ),
-                ) = Runtime::init_circuit(cconf.clone(), constructor).unwrap();
+                ) = Runtime::init_circuit(cconf, constructor).unwrap();
             }
         }
     }
@@ -582,7 +626,7 @@ fn test_circular_dependency(
     // Can't make checkpoints mid-transaction.
     assert!(!(checkpoints && transaction));
 
-    let (_temp, mut cconf) = mkconfig(num_workers);
+    let temp = tempdir().expect("Can't create temp dir for storage");
 
     let (
         mut circuit,
@@ -598,14 +642,18 @@ fn test_circular_dependency(
             mut output_handle7_ref,
             mut output_handle8_ref,
         ),
-    ) = Runtime::init_circuit(cconf.clone(), circular_dependency_test_circuit).unwrap();
+    ) = Runtime::init_circuit(
+        mkconfig(temp.path(), num_workers),
+        circular_dependency_test_circuit,
+    )
+    .unwrap();
 
     if transaction {
         circuit.start_transaction().unwrap();
     }
 
-    for (step, (left, right)) in inputs.iter().enumerate() {
-        println!("step: {step}");
+    for (_step, (left, right)) in inputs.iter().enumerate() {
+        // println!("step: {step}");
 
         // println!("insertions: {:?}", insertions);
 
@@ -646,6 +694,7 @@ fn test_circular_dependency(
                 circuit.kill().unwrap();
 
                 // start from the checkpoint
+                let mut cconf = mkconfig(temp.path(), num_workers);
                 cconf.storage.as_mut().unwrap().init_checkpoint = Some(cpm.uuid);
 
                 (
@@ -662,7 +711,7 @@ fn test_circular_dependency(
                         output_handle7_ref,
                         output_handle8_ref,
                     ),
-                ) = Runtime::init_circuit(cconf.clone(), circular_dependency_test_circuit).unwrap();
+                ) = Runtime::init_circuit(cconf, circular_dependency_test_circuit).unwrap();
             }
         }
     }
@@ -1013,10 +1062,95 @@ fn test_accumulate_trace_with_balancer_round_robin_big_step() {
     test_accumulate_trace_with_balancer(4, true, round_robin_integrate_workload());
 }
 
+#[test]
+fn test_accumulate_trace_with_balancer_policy_returns_to_trace_policy() {
+    // The integral is rebalanced at commit using the policy captured on the first
+    // policy change in the transaction. A long transaction can still see later
+    // policy changes before commit; if the policy changes Shard -> Broadcast -> Shard,
+    // the final policy matches the original trace policy. This used to panic when
+    // the sender assumed that the saved trace policy and current policy must differ.
+    let workers = 4;
+    let (mut circuit, (input_handle, input_node_id, output_delta, output_trace)) =
+        Runtime::init_circuit(
+            CircuitConfig::from(workers)
+                .with_splitter_chunk_size_records(2)
+                .with_balancer_min_absolute_improvement_threshold(0)
+                .with_mode(Mode::Persistent),
+            accumulate_trace_with_balancer_test_circuit,
+        )
+        .unwrap();
+
+    circuit
+        .set_balancer_hint(
+            &input_node_id,
+            BalancerHint::Policy(Some(PartitioningPolicy::Shard)),
+        )
+        .unwrap();
+    input_handle.push(0, (0, 1));
+    circuit.transaction().unwrap();
+    for worker in 0..workers {
+        output_delta.take_from_worker(worker).unwrap();
+        output_trace.take_from_worker(worker).unwrap();
+    }
+
+    circuit.start_transaction().unwrap();
+
+    circuit
+        .set_balancer_hint(
+            &input_node_id,
+            BalancerHint::Policy(Some(PartitioningPolicy::Broadcast)),
+        )
+        .unwrap();
+    input_handle.push(1, (0, 1));
+    circuit.step().unwrap();
+
+    circuit
+        .set_balancer_hint(
+            &input_node_id,
+            BalancerHint::Policy(Some(PartitioningPolicy::Shard)),
+        )
+        .unwrap();
+    input_handle.push(2, (0, 1));
+    circuit.step().unwrap();
+
+    circuit.commit_transaction().unwrap();
+
+    let expected_output_delta = balance_batch(
+        &OrdIndexedZSet::from_tuples((), vec![Tup2(Tup2(1, 0), 1), Tup2(Tup2(2, 0), 1)]),
+        PartitioningPolicy::Shard,
+        workers,
+    );
+    let expected_output_trace = balance_batch(
+        &OrdIndexedZSet::from_tuples(
+            (),
+            vec![
+                Tup2(Tup2(0, 0), 1),
+                Tup2(Tup2(1, 0), 1),
+                Tup2(Tup2(2, 0), 1),
+            ],
+        ),
+        PartitioningPolicy::Shard,
+        workers,
+    );
+    let output_delta: Vec<_> = (0..workers)
+        .map(|worker| output_delta.take_from_worker(worker).unwrap().consolidate())
+        .collect();
+    let output_trace: Vec<_> = (0..workers)
+        .map(|worker| output_trace.take_from_worker(worker).unwrap())
+        .collect();
+
+    assert_eq!(
+        circuit.get_current_balancer_policy(&input_node_id).unwrap(),
+        PartitioningPolicy::Shard
+    );
+    assert_eq!(output_delta, expected_output_delta);
+    assert_eq!(output_trace, expected_output_trace);
+}
+
 /// Join a large left collection with a small right collection. Both are skewed.
 /// The balancer should balance the left collection using Policy::Balance and the
 /// right collection using Policy::Broadcast.
-fn test_skewed_join_left(left_join: bool) {
+fn test_skewed_join_left(left_join: bool, auto_rebalance: bool) {
     let num_partitions = 4;
 
     let mut test_steps = vec![];
@@ -1045,29 +1179,90 @@ fn test_skewed_join_left(left_join: bool) {
             right: right_batch,
             left_policy_hint: None,
             right_policy_hint: None,
-            expected_left_policy: if i >= 5 {
+            expected_left_policy: if !auto_rebalance {
+                Some(PartitioningPolicy::Shard)
+            } else if i >= 5 {
                 Some(PartitioningPolicy::Balance)
             } else {
                 None
             },
-            expected_right_policy: if i >= 5 {
+            expected_right_policy: if !auto_rebalance {
+                Some(PartitioningPolicy::Shard)
+            } else if i >= 5 {
                 Some(PartitioningPolicy::Broadcast)
             } else {
                 None
             },
         });
     }
-    test_join_with_balancer(num_partitions, false, false, test_steps, left_join);
+    test_join_with_balancer(
+        num_partitions,
+        false,
+        false,
+        test_steps,
+        left_join,
+        auto_rebalance,
+    );
+}
+
+#[test]
+fn test_slow_skew() {
+    let num_partitions = 4;
+
+    let mut test_steps = vec![];
+
+    // Several evenly distributed batches. Expected policy: (Shard, Shard)
+    for _ in 0..10 {
+        let left_batch = generate_skewed_batch(num_partitions, 20, 1);
+        let right_batch = generate_skewed_batch(num_partitions, 10, 1);
+        test_steps.push(JoinTestStep {
+            left: left_batch,
+            right: right_batch,
+            left_policy_hint: None,
+            right_policy_hint: None,
+            expected_left_policy: Some(PartitioningPolicy::Shard),
+            expected_right_policy: Some(PartitioningPolicy::Shard),
+        });
+    }
+
+    // Introduce skew. Expected policy: (Balance, Broadcast)
+
+    for i in 0..100 {
+        let left_batch = generate_skewed_batch(num_partitions, 5, 5);
+        let right_batch = generate_skewed_batch(num_partitions, 1, 1);
+        test_steps.push(JoinTestStep {
+            left: left_batch,
+            right: right_batch,
+            left_policy_hint: None,
+            right_policy_hint: None,
+            expected_left_policy: if i >= 80 {
+                Some(PartitioningPolicy::Balance)
+            } else {
+                None
+            },
+            expected_right_policy: if i >= 80 {
+                Some(PartitioningPolicy::Broadcast)
+            } else {
+                None
+            },
+        });
+    }
+    test_join_with_balancer(num_partitions, false, false, test_steps, false, true);
 }
 
 #[test]
 fn test_skewed_inner_join_left() {
-    test_skewed_join_left(false);
+    test_skewed_join_left(false, true);
+}
+
+#[test]
+fn test_skewed_inner_join_left_disable_auto_rebalance() {
+    test_skewed_join_left(false, false);
 }
 
 #[test]
 fn test_skewed_left_join_no_checkpoints() {
-    test_skewed_join_left(true);
+    test_skewed_join_left(true, true);
 }
 
 /// Join a small left collection with a large right collection. Both are skewed.
@@ -1123,7 +1318,14 @@ fn test_skewed_join_right(checkpoints: bool, left_join: bool) {
             },
         });
     }
-    test_join_with_balancer(num_partitions, false, checkpoints, test_steps, left_join);
+    test_join_with_balancer(
+        num_partitions,
+        false,
+        checkpoints,
+        test_steps,
+        left_join,
+        true,
+    );
 }
 
 #[test]
@@ -1191,22 +1393,22 @@ proptest! {
 
     #[test]
     fn proptest_join_with_balancer_small_step(inputs in generate_join_test_data(10, 10, 10, 30)) {
-        test_join_with_balancer(4, false, false, inputs, false);
+        test_join_with_balancer(4, false, false, inputs, false, true);
     }
 
     #[test]
     fn proptest_join_with_balancer_big_step(inputs in generate_join_test_data(10, 10, 10, 40)) {
-        test_join_with_balancer(4, true, false, inputs, false);
+        test_join_with_balancer(4, true, false, inputs, false, true);
     }
 
     #[test]
     fn proptest_left_join_with_balancer_small_step(inputs in generate_left_join_test_data(200, 10, 10, 30)) {
-        test_join_with_balancer(4, false, false, inputs, true);
+        test_join_with_balancer(4, false, false, inputs, true, true);
     }
 
     #[test]
     fn proptest_left_join_with_balancer_big_step(inputs in generate_left_join_test_data(200, 10, 10, 40)) {
-        test_join_with_balancer(4, true, false, inputs, true);
+        test_join_with_balancer(4, true, false, inputs, true, true);
     }
 
 }

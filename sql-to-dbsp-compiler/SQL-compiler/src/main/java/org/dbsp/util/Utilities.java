@@ -62,10 +62,12 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -308,6 +310,8 @@ public class Utilities {
         return value;
     }
 
+    /** Print a ResultSet obtained from some database. */
+    @SuppressWarnings("unused")
     public static void showResultSet(ResultSet result, PrintStream out)
             throws SQLException {
         int columnCount = result.getMetaData().getColumnCount();
@@ -428,10 +432,16 @@ public class Utilities {
 
     public static void createEmptyFile(Path path) {
         try {
+            File parent = path.getParent().toFile();
+            if (!parent.exists()) {
+                Files.createDirectories(path.getParent());
+            }
             PrintStream outputStream = new PrintStream(Files.newOutputStream(path));
             outputStream.println();
             outputStream.close();
-        } catch (IOException ignored) {}
+        } catch (IOException e) {
+            throw new RuntimeException("Cannot create file " + path + ": " + e.getMessage());
+        }
     }
 
     public static void runProcess(String directory, String... commands) throws IOException, InterruptedException {
@@ -649,5 +659,18 @@ public class Utilities {
     /** True if the CI environment variable is set */
     public static boolean inCI() {
         return System.getenv("CI") != null;
+    }
+
+    /** Convert str to title case: capital followed by lowercase */
+    public static String titleCase(String str) {
+        if (str.isEmpty())
+            return str;
+        return str.substring(0, 1).toUpperCase(Locale.ENGLISH) +
+                str.substring(1).toLowerCase(Locale.ENGLISH);
+    }
+
+    /** Return the number of times 'pattern' occurs in 'string' (non-overlapping matches) */
+    public static int countMatches(String string, String pattern) {
+        return string.split(Pattern.quote(pattern), -1).length - 1;
     }
 }

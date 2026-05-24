@@ -196,7 +196,8 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
             case TUPLE, RAW_TUPLE -> {
                 DBSPTypeTupleBase tuple = destinationType.to(DBSPTypeTupleBase.class);
                 DBSPExpression[] fields = new DBSPExpression[tuple.size()];
-                DBSPExpression safeSource = source.unwrapIfNullable("Cast to non-nullable type applied to NULL value");
+                DBSPExpression safeSource = source.unwrapIfNullable(
+                        node, "Cast to non-nullable type applied to NULL value");
                 for (int i = 0; i < tuple.size(); i++) {
                     if (source.is(DBSPBaseTupleExpression.class) &&
                             source.to(DBSPBaseTupleExpression.class).isNull()) {
@@ -479,6 +480,8 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                 expressionResultType = DBSPTypeDecimal.getDefault().withMayBeNull(anyNull);  // no limits
             if (commonBase.is(IsDateType.class) && opcode == DBSPOpcode.SUB) {
                 expressionResultType = type;
+            } else if (opcode == DBSPOpcode.DIV_NULL) {
+                expressionResultType = type;
             } else if (opcode == DBSPOpcode.BW_AND ||
                     opcode == DBSPOpcode.BW_OR || opcode == DBSPOpcode.XOR ||
                     opcode == DBSPOpcode.MAX || opcode == DBSPOpcode.MIN ||
@@ -514,12 +517,16 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                 // Result is always NULL - evaluate to the NULL literal directly
                 return DBSPLiteral.none(type);
             }
-            if (opcode == DBSPOpcode.MUL || opcode == DBSPOpcode.DIV) {
+            if (opcode == DBSPOpcode.MUL || opcode == DBSPOpcode.DIV || opcode == DBSPOpcode.DIV_INTERVAL_NULL) {
                 // Multiplication between an interval and a numeric value.
                 if (leftType.is(IsIntervalType.class) || rightType.is(IsIntervalType.class)) {
                     // swap operands so that the numeric operand is always right
-                    opcode = opcode == DBSPOpcode.MUL ? DBSPOpcode.INTERVAL_MUL : DBSPOpcode.INTERVAL_DIV;
-                    if (rightType.is(IsIntervalType.class)) {
+                    opcode = switch (opcode) {
+                        case MUL -> DBSPOpcode.MUL_INTERVAL;
+                        case DIV -> DBSPOpcode.DIV_INTERVAL;
+                        default -> opcode;
+                    };
+                    if (rightType.is(IsIntervalType.class) && opcode == DBSPOpcode.MUL_INTERVAL) {
                         if (leftType.is(IsIntervalType.class)) {
                             throw new CompilationError("Operation " + opcode + " between intervals not supported", node);
                         }
@@ -1186,6 +1193,26 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
             case OTHER_FUNCTION: {
                 String opName = call.op.getName().toLowerCase();
                 switch (opName) {
+                    case "xxhash": {
+                        String opName1 = getCallName(call);
+                        validateArgCount(node, opName1, ops.size(), 2);
+                        DBSPExpression expr = this.strictnessCheck(ops, type);
+                        if (expr != null)
+                            return expr;
+                        DBSPExpression arg1 = ops.get(1);
+                        ops.set(1, arg1.cast(arg1.getNode(),
+                                DBSPTypeInteger.getType(CalciteObject.EMPTY, INT64, arg1.getType().mayBeNull),
+                                DBSPCastExpression.CastType.SqlUnsafe));
+                        return compilePolymorphicFunction(true, call, node, type, ops, 2);
+                    }
+                    case "finite_or_null": {
+                        return compilePolymorphicFunction(false, call, node, type, ops, 1);
+                    }
+                    case "div_null": {
+                        DBSPOpcode code = ops.get(0).getType().is(IsIntervalType.class) ?
+                                DBSPOpcode.DIV_INTERVAL_NULL : DBSPOpcode.DIV_NULL;
+                        return makeBinaryExpression(node, type, code, ops);
+                    }
                     case "trunc":
                     case "truncate":
                     case "round": {
@@ -2060,7 +2087,7 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                     final DBSPExpression castOp;
                     if (op.getType().sameTypeIgnoringNullability(type) &&
                             op.getType().mayBeNull && !type.mayBeNull) {
-                        castOp = op.neverFailsUnwrap();
+                        castOp = op.neverFailsUnwrap(node);
                     } else {
                         castOp = op.cast(node, type, DBSPCastExpression.CastType.SqlUnsafe);
                     }

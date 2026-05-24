@@ -69,6 +69,8 @@ public class DBSPRankOperator extends DBSPUnaryOperator
         this.projectionFunc = projectionFunc;
         this.rankCmpFunc = rankCmpFunc;
         this.outputProducer = outputProducer;
+        // ROW_NUMBER has its own operator
+        Utilities.enforce(numbering != DBSPIndexedTopKOperator.Numbering.ROW_NUMBER);
         Utilities.enforce(comparator.is(DBSPComparatorExpression.class) ||
                 comparator.is(DBSPPathExpression.class));
         Utilities.enforce(comparator.to(DBSPComparatorExpression.class).comparedValueType().sameType(valueType));

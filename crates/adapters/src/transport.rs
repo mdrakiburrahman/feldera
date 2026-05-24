@@ -117,8 +117,9 @@ pub fn input_transport_config_to_endpoint(
         | TransportConfig::DeltaTableInput(_)
         | TransportConfig::DeltaTableOutput(_)
         | TransportConfig::PostgresInput(_)
+        | TransportConfig::PostgresCdcInput(_)
         | TransportConfig::PostgresOutput(_)
-        | TransportConfig::HttpOutput
+        | TransportConfig::HttpOutput(_)
         | TransportConfig::RedisOutput(_)
         | TransportConfig::IcebergInput(_) => return Ok(None),
     };

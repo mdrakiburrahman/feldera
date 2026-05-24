@@ -4,7 +4,7 @@ use crate::{
     circuit::{
         metadata::{BatchSizeStats, INPUT_BATCHES_STATS, OUTPUT_BATCHES_STATS, OperatorMeta},
         operator_traits::Operator,
-        splitter_output_chunk_size,
+        splitter_output_chunk_size, splitter_output_first_chunk_size,
     },
     dynamic::Erase,
     operator::{
@@ -89,6 +89,37 @@ where
     let result = circuit.add_nary_operator(
         StreamingNaryWrapper::new(AccumulateConcatZSets::new(input_factories, &polarities)),
         &accumulated_streams,
+    );
+
+    if sharded {
+        result.mark_sharded();
+    }
+
+    result
+}
+
+/// Concatenates a collection of accumulated streams.
+pub fn dyn_concat_accumulated<C, Z, I>(input_factories: &Z::Factories, streams: I) -> Stream<C, Z>
+where
+    C: Circuit,
+    Z: IndexedZSet,
+    I: IntoIterator<Item = (Stream<C, Option<Spine<Z>>>, bool)>,
+{
+    let (streams, polarities): (Vec<_>, Vec<_>) = streams.into_iter().unzip();
+
+    let streams = streams
+        .into_iter()
+        .map(|stream| stream.try_sharded_version())
+        .collect::<Vec<_>>();
+    assert!(!streams.is_empty());
+
+    let sharded = streams.iter().all(|stream| stream.is_sharded());
+
+    let circuit = streams[0].circuit();
+
+    let result = circuit.add_nary_operator(
+        StreamingNaryWrapper::new(AccumulateConcatZSets::new(input_factories, &polarities)),
+        &streams,
     );
 
     if sharded {
@@ -223,7 +254,10 @@ impl<Z: IndexedZSet> StreamingNaryOperator<Option<Spine<Z>>, Z> for AccumulateCo
             let chunk_size = splitter_output_chunk_size();
             let cursors = snapshots.into_iter().enumerate().map(|(i, snapshot)| CursorWithPolarity::new(snapshot.cursor(), self.polarity[i])).collect::<Vec<_>>();
 
-            let mut builder = Z::Builder::with_capacity(&factories, chunk_size, chunk_size);
+            // Limit the initial capacity of the builder in case the chunk size
+            // is bigger than memory (e.g. `usize::MAX`).
+            let capacity = splitter_output_first_chunk_size();
+            let mut builder = Z::Builder::with_capacity(&factories, capacity, capacity);
             let mut cursor = CursorList::new(factories.weight_factory(), cursors);
 
             let mut has_val = false;

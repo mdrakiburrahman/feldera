@@ -1,3 +1,4 @@
+import gzip
 import io
 import json
 import os
@@ -6,7 +7,6 @@ import tempfile
 import time
 import unittest
 import zipfile
-import gzip
 
 import pandas as pd
 
@@ -92,6 +92,17 @@ class TestPipeline(SharedTestPipeline):
         assert stats.get("inputs") is not None
         assert stats.get("outputs") is not None
 
+    def test_start_compaction(self):
+        self.pipeline.start()
+        self.pipeline.input_json("tbl", [{"id": 1}, {"id": 2}])
+
+        before = list(self.pipeline.query("SELECT COUNT(*) AS num_rows FROM v0"))
+        self.pipeline.start_compaction()
+        self.pipeline.start_compaction()
+        after = list(self.pipeline.query("SELECT COUNT(*) AS num_rows FROM v0"))
+
+        assert after == before
+
     def test_case_sensitive_views_listen(self):
         self.pipeline.start_paused()
 
@@ -166,6 +177,36 @@ class TestPipeline(SharedTestPipeline):
         expected = [{"id": 2}, {"id": 1}]
         got = list(resp)
         self.assertCountEqual(got, expected)
+
+    def test_adhoc_query_arrow(self):
+        import pyarrow as pa
+
+        data = "1\n2\n"
+        self.pipeline.start()
+        TEST_CLIENT.push_to_pipeline(self.pipeline.name, "tbl", "csv", data)
+
+        expected_rows = list(
+            TEST_CLIENT.query_as_json(
+                self.pipeline.name,
+                "SELECT * FROM tbl ORDER BY id",
+            )
+        )
+        expected_ids = [row["id"] for row in expected_rows]
+
+        batches_client = list(
+            TEST_CLIENT.query_as_arrow(
+                self.pipeline.name,
+                "SELECT * FROM tbl ORDER BY id",
+            )
+        )
+        table_client = pa.Table.from_batches(batches_client)
+        assert table_client.column("id").to_pylist() == expected_ids
+
+        batches_pipeline = list(
+            self.pipeline.query_arrow("SELECT * FROM tbl ORDER BY id")
+        )
+        table_pipeline = pa.Table.from_batches(batches_pipeline)
+        assert table_pipeline.column("id").to_pylist() == expected_ids
 
     def test_local(self):
         """
@@ -347,8 +388,10 @@ class TestPipeline(SharedTestPipeline):
         self.pipeline.input_json("tbl", data, wait=False)
         wait_for_condition(
             "pipeline stops with deployment error after worker panic",
-            lambda: self.pipeline.status() == PipelineStatus.STOPPED
-            and len(self.pipeline.deployment_error()) > 0,
+            lambda: (
+                self.pipeline.status() == PipelineStatus.STOPPED
+                and len(self.pipeline.deployment_error()) > 0
+            ),
             timeout_s=20.0,
             poll_interval_s=1.0,
         )
@@ -779,6 +822,7 @@ class TestPipeline(SharedTestPipeline):
         )
 
         # Verify egress data includes both values with insert_delete markers
+        self.pipeline.wait_for_idle()
         egress_result = out.to_dict()
         expected_egress = [
             {"c1": "test_value", "insert_delete": 1},

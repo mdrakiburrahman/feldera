@@ -28,6 +28,7 @@ use async_stream::stream;
 use feldera_storage::{FileCommitter, StoragePath};
 use futures::Stream as AsyncStream;
 use rkyv::Deserialize;
+use rkyv::bytecheck;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
@@ -85,6 +86,7 @@ where
 
 /// A window that is serialized to a file.
 #[derive(rkyv::Serialize, rkyv::Deserialize, rkyv::Archive)]
+#[archive_attr(derive(rkyv::CheckBytes))]
 struct CommittedWindow {
     window: Option<(Vec<u8>, Vec<u8>)>,
 }
@@ -209,8 +211,19 @@ where
 
         let window_path = Self::checkpoint_file(base, persistent_id);
         let content = Runtime::storage_backend().unwrap().read(&window_path)?;
-        let archived = unsafe { rkyv::archived_root::<CommittedWindow>(&content) };
-        let committed: CommittedWindow = archived.deserialize(&mut rkyv::Infallible).unwrap();
+        let archived = rkyv::check_archived_root::<CommittedWindow>(&content).map_err(|e| {
+            crate::circuit::checkpointer::checkpoint_invalid_data_error(
+                "Window checkpoint validation failed",
+                format!("{window_path}: {e}"),
+            )
+        })?;
+        let committed: CommittedWindow =
+            archived.deserialize(&mut rkyv::Infallible).map_err(|e| {
+                crate::circuit::checkpointer::checkpoint_invalid_data_error(
+                    "Window checkpoint deserialize failed",
+                    format!("{window_path}: {e:?}"),
+                )
+            })?;
 
         *self.window.borrow_mut() = committed.window.map(|(a, b)| {
             // Serialize the window bounds back into the key.
@@ -362,7 +375,7 @@ where
             // keys in each component below.  For this, we need to extend
             // `Cursor::seek` to return the number of keys skipped over by the search.
             let mut tuples = self.factories.weighted_items_factory().default_box();
-            tuples.reserve(chunk_size);
+            tuples.try_reserve(chunk_size);
 
             let mut tuple = self.factories.weighted_item_factory().default_box();
             let mut key = self.factories.key_factory().default_box();
@@ -514,6 +527,7 @@ mod test {
     use anyhow::Error as AnyError;
     use size_of::SizeOf;
     use std::vec;
+    use tempfile::tempdir;
 
     type Time = u64;
 
@@ -980,7 +994,7 @@ mod test {
     /// This test exercises the checkpoint/restore path of the Window operator.
     #[test]
     fn window_checkpointing() {
-        let (_temp, mut cconf) = mkconfig();
+        let _temp = tempdir().expect("Can't create temp dir for storage");
 
         let mut input = vec![
             vec![
@@ -1021,11 +1035,15 @@ mod test {
             ]
             .into_iter();
 
+        let mut checkpoint = None;
         for clock in 1000..1006 {
             println!("clock: {clock}");
 
+            let mut cconf = mkconfig(_temp.path());
+            cconf.storage.as_mut().unwrap().init_checkpoint = checkpoint;
+
             let (mut circuit, (bounds_handle, index1_handle, output_handle)) =
-                Runtime::init_circuit(&cconf, move |circuit| {
+                Runtime::init_circuit(cconf, move |circuit| {
                     let (bounds, bounds_handle) = circuit.add_input_stream::<(Time, Time)>();
                     let (index1, index1_handle) = circuit.add_input_indexed_zset::<Time, String>();
 
@@ -1053,7 +1071,7 @@ mod test {
             );
 
             let cpm = circuit.checkpoint().run().unwrap();
-            cconf.storage.as_mut().unwrap().init_checkpoint = Some(cpm.uuid);
+            checkpoint = Some(cpm.uuid);
             circuit.kill().unwrap();
         }
     }

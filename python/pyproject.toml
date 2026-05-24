@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "feldera"
 readme = "README.md"
 description = "The feldera python client"
-version = "0.290.0"
+version = "0.300.0"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
@@ -28,7 +28,10 @@ dependencies = [
     "pretty-errors",
     "ruff>=0.6.9",
     "PyJWT>=2.12.0",
+    "tenacity>=9.1.4",
+    "pyarrow>=24.0",
 ]
+
 [project.urls]
 Homepage = "https://www.feldera.com"
 Documentation = "https://docs.feldera.com/python"
@@ -43,7 +46,8 @@ dev = [
     "sphinx-rtd-theme==2.0.0",
     "sphinx==7.3.7",
     "simplejson==3.20.1",
-    "confluent-kafka>=2.2.0"
+    "confluent-kafka>=2.2.0",
+    "deltalake>=1.5.0",
 ]
 
 [tool.pytest.ini_options]

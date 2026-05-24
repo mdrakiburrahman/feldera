@@ -7,10 +7,15 @@
   import LineBanner, { BannerButton } from '$lib/components/layout/LineBanner.svelte'
   import NavigationExtras from '$lib/components/layout/NavigationExtras.svelte'
   import OverlayDrawer from '$lib/components/layout/OverlayDrawer.svelte'
+  import AuthErrorToast from '$lib/components/other/AuthErrorToast.svelte'
   import BookADemo from '$lib/components/other/BookADemo.svelte'
   import CreatePipelineButton from '$lib/components/pipelines/CreatePipelineButton.svelte'
   import { useInterval } from '$lib/compositions/common/useInterval.svelte'
-  import { useClusterHealth } from '$lib/compositions/health/useClusterHealth.svelte'
+  import { fetchConfigs } from '$lib/compositions/configCache'
+  import {
+    useClusterHealth,
+    useRefreshClusterHealth
+  } from '$lib/compositions/health/useClusterHealth.svelte'
   import { useAdaptiveDrawer } from '$lib/compositions/layout/useAdaptiveDrawer.svelte'
   import { useContextDrawer } from '$lib/compositions/layout/useContextDrawer.svelte'
   import { useGlobalDialog } from '$lib/compositions/layout/useGlobalDialog.svelte'
@@ -19,7 +24,7 @@
   import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
   import { useSystemMessages } from '$lib/compositions/useSystemMessages.svelte'
   import { useToast } from '$lib/compositions/useToastNotification'
-  import { getConfig } from '$lib/services/pipelineManager'
+  import { closedIntervalAction } from '$lib/functions/common/promise'
   import type { Snippet } from '$lib/types/svelte'
   import type { LayoutData } from './$types'
 
@@ -28,6 +33,7 @@
   const { children, data }: { children: Snippet; data: LayoutData } = $props()
 
   useRefreshPipelineList()
+  useRefreshClusterHealth()
   usePipelineAction()
 
   const rightDrawer = useAdaptiveDrawer('right')
@@ -37,11 +43,16 @@
   const clusterHealth = useClusterHealth()
   const now = useInterval(() => new Date(), 3600000, 3600000 - (Date.now() % 3600000))
 
-  // Check for backend version changes every 30 seconds
-  useInterval(
-    async () => {
+  // Check for backend version changes every 10 seconds, starting 10 seconds
+  // after layout load (first tick is delayed by `periodMs`).
+  // Calls `fetchConfigs()` to both get the latest config and update the cache,
+  // otherwise `invalidateAll()` would re-render the root layout from a stale cache
+  // and trigger the version mismatch in a loop.
+  let dismissTimeout: ReturnType<typeof setTimeout> | undefined
+  $effect.pre(() =>
+    closedIntervalAction(async () => {
       try {
-        const config = await getConfig()
+        const { config } = await fetchConfigs()
         const currentVersion = data.feldera?.version
         const currentRevision = data.feldera?.revision
         if (
@@ -55,7 +66,9 @@
           // Show a notification that the backend was updated
           const msgId = `backend_version_changed`
 
-          const dismissTimeout = setTimeout(() => systemMessages.dismiss(msgId), 30000) // Auto-dismiss after 30 seconds
+          // Auto-dismiss after 30 seconds; clear any prior pending timer.
+          clearTimeout(dismissTimeout)
+          dismissTimeout = setTimeout(() => systemMessages.dismiss(msgId), 30000)
           systemMessages.upsert(msgId, {
             id: msgId,
             text: `Feldera was updated from version ${currentVersion} to ${config.version}.`,
@@ -67,8 +80,7 @@
         // Silently ignore errors when checking for version changes
         console.error('Failed to check backend version:', e)
       }
-    },
-    10000 // Check every 10 seconds
+    }, 10000)
   )
 
   const displayedMessages = $derived(
@@ -102,14 +114,18 @@
   const api = usePipelineManager()
   const { toastMain, dismissMain } = useToast()
   $effect(() => {
-    if (api.isNetworkHealthy) {
-      dismissMain()
-    } else {
+    if (!api.isNetworkHealthy) {
       toastMain(
         'Unable to reach this Feldera instance.\nEither the cluster is unresponsive, or there is an issue with the network connection.'
       )
+    } else if (!api.isAuthHealthy) {
+      toastMain(AuthErrorToast)
+    } else {
+      dismissMain()
     }
   })
+
+  let isFelderaReachable = $derived(api.isNetworkHealthy && api.isAuthHealthy)
 </script>
 
 <SvelteKitTopLoader
@@ -120,10 +136,9 @@
   ignoreAfterNavigate={() => false}
 ></SvelteKitTopLoader>
 <div
-  class="flex h-full flex-col {api.isNetworkHealthy
+  class="flex h-full flex-col {isFelderaReachable
     ? ''
     : 'disabled pointer-events-auto select-text [&_.monaco-editor-background]:pointer-events-none [&_[role="button"]]:pointer-events-none [&_[role="separator"]]:pointer-events-none [&_a]:pointer-events-none [&_button]:pointer-events-none'}"
-  style={api.isNetworkHealthy ? '' : ''}
 >
   {#if healthMessage && !page.url.pathname.startsWith('/health')}
     <LineBanner variant="error">
@@ -169,6 +184,7 @@
         dismiss={message.dismissable !== 'never'
           ? () => systemMessages.dismiss(message.id)
           : undefined}
+        testid={`box-system-message-${message.id}`}
       >
         {#snippet start()}
           <span>{@html message.text}</span>

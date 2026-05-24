@@ -9,6 +9,8 @@ use std::sync::Weak;
 pub mod delta_table;
 mod postgres;
 
+#[cfg(feature = "with-postgres-cdc")]
+use crate::integrated::postgres::PostgresCdcInputEndpoint;
 use crate::integrated::postgres::PostgresInputEndpoint;
 pub use crate::integrated::postgres::PostgresOutputEndpoint;
 
@@ -35,6 +37,7 @@ where
 
 /// Create an instance of an integrated output endpoint given its config
 /// and output relation schema.
+#[allow(unused, clippy::too_many_arguments)]
 pub fn create_integrated_output_endpoint(
     endpoint_id: EndpointId,
     endpoint_name: &str,
@@ -42,6 +45,8 @@ pub fn create_integrated_output_endpoint(
     key_schema: &Option<Relation>,
     schema: &Relation,
     controller: Weak<ControllerInner>,
+    continue_previous_state: bool,
+    is_index: bool,
 ) -> Result<Box<dyn IntegratedOutputEndpoint>, ControllerError> {
     let ep: Box<dyn IntegratedOutputEndpoint> = match &connector_config.transport {
         #[cfg(feature = "with-deltalake")]
@@ -52,6 +57,8 @@ pub fn create_integrated_output_endpoint(
             key_schema,
             schema,
             controller,
+            continue_previous_state,
+            is_index,
         )?),
         TransportConfig::PostgresOutput(config) => Box::new(PostgresOutputEndpoint::new(
             endpoint_id,
@@ -60,6 +67,7 @@ pub fn create_integrated_output_endpoint(
             key_schema,
             schema,
             controller,
+            is_index,
         )?),
         transport => {
             return Err(ControllerError::unknown_output_transport(
@@ -99,6 +107,12 @@ pub fn create_integrated_input_endpoint(
         TransportConfig::PostgresInput(config) => {
             Box::new(PostgresInputEndpoint::new(endpoint_name, config, consumer))
         }
+        #[cfg(feature = "with-postgres-cdc")]
+        TransportConfig::PostgresCdcInput(config) => Box::new(PostgresCdcInputEndpoint::new(
+            endpoint_name,
+            config,
+            consumer,
+        )),
         transport => {
             return Err(ControllerError::unknown_input_transport(
                 endpoint_name,

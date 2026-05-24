@@ -61,8 +61,9 @@ groups related actions into multi-action dropdowns when multiple options are ava
   import { getDeploymentStatusLabel, isPipelineShutdown } from '$lib/functions/pipelines/status'
   import { resolve } from '$lib/functions/svelte'
   import type { PipelineAction } from '$lib/services/pipelineManager'
+  import type { Snippet } from '$lib/types/svelte'
 
-  const {
+  let {
     pipeline,
     onDeletePipeline,
     editConfigDisabled,
@@ -72,7 +73,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
     saveFile,
     class: _class = ''
   }: {
-    pipeline: WritablePipeline
+    pipeline: WritablePipeline<true>
     onDeletePipeline?: (pipelineName: string) => void
     editConfigDisabled: boolean
     deleted?: boolean
@@ -342,7 +343,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         ? {
             onPausedReady: async (pipelineName: string) => {
               const cbs = pipelineActionCallbacks.getAll(pipelineName, 'start_paused')
-              await Promise.allSettled(cbs.map((x) => x(pipelineName)))
+              await Promise.allSettled(cbs.map((cb) => cb(pipelineName)))
             }
           }
         : undefined
@@ -367,7 +368,17 @@ groups related actions into multi-action dropdowns when multiple options are ava
   }
 
   // Static button configurations for each action
-  const buttonConfigs = {
+  const buttonConfigs: Record<
+    string,
+    {
+      label: string
+      description: string
+      onclick: () => void
+      disabled: () => boolean
+      disabledText?: string
+      standaloneButton: Snippet
+    }
+  > = {
     _start: {
       label: 'Start',
       description: 'Start the pipeline normally',
@@ -441,7 +452,8 @@ groups related actions into multi-action dropdowns when multiple options are ava
           toastError('Waiting for pipeline to standby')
         )
       },
-      disabled: () => false,
+      disabled: () => unsavedChanges,
+      disabledText: 'Save First',
       standaloneButton: _standby
     },
     _activate: {
@@ -519,7 +531,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
           toastError('Waiting for pipeline to stop')
         )
       },
-      'The pipeline will stop processing inputs and make a checkpoint of its state.'
+      'The pipeline will stop processing inputs and create a checkpoint of its state.'
     )(pipeline.current.name)}
   ></DeleteDialog>
 {/snippet}
@@ -580,7 +592,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
               <span class="">{button.label}</span>
 
               {#if button.disabled}
-                <span class="text-sm">Enterprise Only</span>
+                <span class="text-sm">{button.disabledText}</span>
               {/if}
             </div>
             <div class="text-base text-surface-700-300">

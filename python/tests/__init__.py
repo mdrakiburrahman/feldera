@@ -7,7 +7,17 @@ from feldera.testutils import (
     FELDERA_REQUESTS_VERIFY,
     TEST_CLIENT,
     enterprise_only,
+    skip_on_arm64,
     unique_pipeline_name,
+)
+from tests.utils import (
+    KAFKA_BOOTSTRAP,
+    MINIO_BUCKET,
+    MINIO_ENDPOINT,
+    MINIO_REGION,
+    env_truthy,
+    required_env,
+    runs_in_ci,
 )
 
 LOGLEVEL = os.environ.get("LOGLEVEL", "INFO").upper()
@@ -17,7 +27,15 @@ __all__ = [
     "TEST_CLIENT",
     "unique_pipeline_name",
     "enterprise_only",
+    "skip_on_arm64",
     "API_KEY",
     "BASE_URL",
     "FELDERA_REQUESTS_VERIFY",
+    "KAFKA_BOOTSTRAP",
+    "MINIO_BUCKET",
+    "MINIO_ENDPOINT",
+    "MINIO_REGION",
+    "env_truthy",
+    "required_env",
+    "runs_in_ci",
 ]

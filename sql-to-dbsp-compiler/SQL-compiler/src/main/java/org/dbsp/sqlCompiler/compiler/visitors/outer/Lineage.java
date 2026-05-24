@@ -2,6 +2,7 @@ package org.dbsp.sqlCompiler.compiler.visitors.outer;
 
 import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateZeroOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPAtomicSumOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPChainAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPConstantOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPDeindexOperator;
@@ -20,6 +21,7 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPNoopOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNowOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPRankOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPRowNumberOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceTableOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamAggregateOperator;
@@ -412,6 +414,11 @@ public class Lineage extends CircuitVisitor {
     }
 
     @Override
+    public void postorder(DBSPRowNumberOperator node) {
+        this.eraseValue(node);
+    }
+
+    @Override
     public void postorder(DBSPStreamAggregateOperator node) {
         this.eraseValue(node);
     }
@@ -548,6 +555,11 @@ public class Lineage extends CircuitVisitor {
 
     @Override
     public void postorder(DBSPSumOperator node) {
+        this.intersect(node);
+    }
+
+    @Override
+    public void postorder(DBSPAtomicSumOperator node) {
         this.intersect(node);
     }
 

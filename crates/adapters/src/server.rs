@@ -1,10 +1,13 @@
 use crate::adhoc::set_snapshot;
 use crate::controller::{CompletionToken, ConsistentSnapshot, ControllerBuilder};
-use crate::format::{get_input_format, get_output_format};
+use crate::format::csv::CsvOutputFormat;
+use crate::format::get_input_format;
+use crate::format::json::JsonOutputFormat;
 use crate::server::metrics::{
     JsonFormatter, LabelStack, MetricsFormatter, MetricsWriter, PrometheusFormatter,
 };
 use crate::static_compile::catalog::OUTPUT_MAPPING;
+use crate::transport::http::HttpOutputFormat;
 use crate::util::{LongOperationWarning, RateLimitCheckResult, TokenBucketRateLimiter};
 use crate::{Catalog, dyn_event};
 use crate::{
@@ -63,6 +66,7 @@ use feldera_types::constants::STATUS_FILE;
 use feldera_types::coordination::{
     AdHocScan, CoordinationActivate, CoordinationStatus, Labels, RestartArgs, Step, StepRequest,
 };
+use feldera_types::format::json::JsonEncoderConfig;
 use feldera_types::pipeline_diff::PipelineDiff;
 use feldera_types::query_params::{
     ActivateParams, MetricsFormat, MetricsParameters, SamplyProfileGetParams, SamplyProfileParams,
@@ -73,6 +77,7 @@ use feldera_types::runtime_status::{
 };
 use feldera_types::suspend::{SuspendError, SuspendableResponse};
 use feldera_types::time_series::TimeSeries;
+use feldera_types::transport::http::HttpOutputConfig;
 use feldera_types::{
     checkpoint::CheckpointMetadata, config::TransportConfig, transport::http::HttpInputConfig,
 };
@@ -1230,9 +1235,8 @@ where
         .service(input_endpoint_status)
         .service(output_endpoint_status)
         .service(output_endpoint_command)
-        .service(reset_output_endpoint)
-        .service(reset_status)
         .service(rebalance)
+        .service(start_compaction)
         .service(coordination_activate_handler)
         .service(coordination_status)
         .service(coordination_step_request)
@@ -1247,6 +1251,7 @@ where
         .service(coordination_adhoc_scan)
         .service(coordination_labels_incomplete)
         .service(coordination_restart)
+        .service(clock_advance)
 }
 
 /// Implements `/start`, `/pause`, `/activate`:
@@ -1557,9 +1562,23 @@ async fn query(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct StatsParams {
+    /// When `true`, include the most recent error messages for each endpoint
+    /// in the response (up to `MAX_CONNECTOR_ERRORS` per list). Default is
+    /// `false` so that callers polling `/stats` keep getting a lightweight
+    /// response. This selector is intended for the support-bundle collector.
+    #[serde(default)]
+    include_connector_errors: bool,
+}
+
 #[get("/stats")]
-async fn stats(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
-    Ok(HttpResponse::Ok().json(state.controller()?.api_status()))
+async fn stats(
+    state: WebData<ServerState>,
+    params: Query<StatsParams>,
+) -> Result<HttpResponse, PipelineError> {
+    let include_connector_errors = params.into_inner().include_connector_errors;
+    Ok(HttpResponse::Ok().json(state.controller()?.api_status(include_connector_errors)))
 }
 
 /// This endpoint returns a subset of stats that don't need updating and so is more performant than /stats
@@ -2026,6 +2045,46 @@ async fn commit_transaction(state: WebData<ServerState>) -> Result<impl Responde
     Ok(HttpResponse::Ok().json("Transaction commit initiated"))
 }
 
+/// Advance the externally-driven `NOW()` clock and return its new value.
+///
+/// Requires `dev_tweaks.now_http_driven = true`.
+#[post("/clock/advance")]
+async fn clock_advance(
+    state: WebData<ServerState>,
+    body: web::Json<feldera_types::transport::clock::ClockAdvanceRequest>,
+) -> Result<impl Responder, PipelineError> {
+    use feldera_types::transport::clock::ClockAdvanceResponse;
+    let controller = state.controller()?;
+    let reader =
+        controller
+            .get_input_endpoint("now")
+            .ok_or_else(|| PipelineError::InvalidParam {
+                error: "this pipeline's program does not reference `NOW()`; \
+                        the clock connector is not active and cannot be advanced"
+                    .to_string(),
+            })?;
+    let clock_reader = reader
+        .as_any()
+        .downcast::<crate::transport::clock::ClockReader>()
+        .map_err(|_| PipelineError::InvalidParam {
+            error: "the `now` input endpoint is not the built-in clock connector".to_string(),
+        })?;
+
+    let now_ms =
+        clock_reader
+            .advance(body.delta_ms)
+            .await
+            .map_err(|e| PipelineError::InvalidParam {
+                error: e.to_string(),
+            })?;
+
+    let now = chrono::DateTime::<Utc>::from_timestamp_millis(now_ms)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|| format!("{now_ms} ms since epoch"));
+
+    Ok(HttpResponse::Ok().json(ClockAdvanceResponse { now_ms, now }))
+}
+
 #[derive(Debug, Deserialize)]
 struct IngressArgs {
     #[serde(default = "HttpInputTransport::default_format")]
@@ -2055,28 +2114,14 @@ async fn get_or_create_http_input_endpoint(
         name: endpoint_name.clone(),
     };
 
-    let endpoint = HttpInputEndpoint::new(config.clone());
+    let guard = controller.register_api_connection()?;
+    let endpoint = HttpInputEndpoint::new(config.clone()).with_api_connection_guard(guard);
     // Create endpoint config.
-    let config = InputEndpointConfig {
-        stream: Cow::from(table_name),
-        connector_config: ConnectorConfig {
-            transport: TransportConfig::HttpInput(config),
-            format: Some(format),
-            preprocessor: None,
-            index: None,
-            output_buffer_config: Default::default(),
-            max_batch_size: None,
-            max_worker_batch_size: None,
-            max_queued_records: HttpInputTransport::default_max_buffered_records(),
-            paused: false,
-            labels: vec![],
-            start_after: None,
-        },
-    };
-
-    if controller.register_api_connection().is_err() {
-        return Err(PipelineError::ApiConnectionLimit);
-    }
+    let config = InputEndpointConfig::new(
+        table_name,
+        ConnectorConfig::new(TransportConfig::HttpInput(config), Some(format))
+            .with_max_queued_records(HttpInputTransport::default_max_buffered_records()),
+    );
 
     controller
         .add_input_endpoint(
@@ -2086,7 +2131,6 @@ async fn get_or_create_http_input_endpoint(
             None,
         )
         .inspect_err(|e| {
-            controller.unregister_api_connection();
             debug!("Failed to create API endpoint: '{e}'");
         })?;
 
@@ -2182,23 +2226,28 @@ pub fn parser_config_from_http_request(
 /// HTTP request using the `InputFormat::config_from_http_request` method.
 pub fn encoder_config_from_http_request(
     endpoint_name: &str,
-    format_name: &str,
+    format: HttpOutputFormat,
     request: &HttpRequest,
 ) -> Result<FormatConfig, ControllerError> {
-    let format = get_output_format(format_name)
-        .ok_or_else(|| ControllerError::unknown_output_format(endpoint_name, format_name))?;
+    let format = match format {
+        HttpOutputFormat::Csv => {
+            Box::new(CsvOutputFormat) as Box<dyn feldera_adapterlib::format::OutputFormat>
+        }
+        HttpOutputFormat::Json => Box::new(JsonOutputFormat),
+    };
 
     let config = format.config_from_http_request(endpoint_name, request)?;
 
     Ok(FormatConfig {
-        name: Cow::from(format_name.to_string()),
+        name: format.name(),
         config: serde_json::to_value(config)
             .map_err(|e| ControllerError::encoder_config_parse_error(endpoint_name, &e, ""))?,
     })
 }
 
 /// URL-encoded arguments to the `/egress` endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct EgressArgs {
     /// Apply backpressure on the pipeline when the HTTP client cannot receive
     /// data fast enough.
@@ -2209,13 +2258,15 @@ struct EgressArgs {
     ///
     /// When the flag is set to true, the connector waits for the client to receive
     /// each chunk and blocks the pipeline if the client cannot keep up.
-    #[serde(default)]
-    backpressure: bool,
+    backpressure: Option<bool>,
 
-    /// Data format used to encode the output of the query, e.g., 'csv',
-    /// 'json' etc.
-    #[serde(default = "HttpOutputTransport::default_format")]
-    format: String,
+    /// Data format used to encode the output of the query.
+    format: Option<HttpOutputFormat>,
+
+    /// When `true`, deliver a full snapshot of the materialized view before
+    /// streaming incremental updates. The view must be materialized.
+    #[serde(default)]
+    send_snapshot: bool,
 }
 
 #[post("/egress/{table_name}")]
@@ -2224,57 +2275,101 @@ async fn output_endpoint(
     path: web::Path<String>,
     req: HttpRequest,
     args: Query<EgressArgs>,
+    body: web::Bytes,
 ) -> Result<HttpResponse, PipelineError> {
     debug!("/egress request:{req:?}");
 
     let table_name = path.into_inner();
 
-    // Generate endpoint name depending on the query and output mode.
-    let endpoint_name = format!("{table_name}.api-{}", Uuid::new_v4());
+    let connector_config = if !body.is_empty() {
+        let mut json = serde_json::from_slice::<serde_json::Value>(&body).map_err(|e| {
+            PipelineError::InvalidParam {
+                error: e.to_string(),
+            }
+        })?;
 
-    // debug!("Endpoint name: '{endpoint_name}'");
+        if args.format.is_some() || args.backpressure.is_some() {
+            return Err(PipelineError::InvalidParam {
+                error: String::from(
+                    "Can't mix configuration between JSON body and query parameters",
+                ),
+            });
+        }
+
+        if let Some(object) = json.as_object_mut()
+            && !object.contains_key("transport")
+        {
+            object.insert(
+                String::from("transport"),
+                serde_json::to_value(TransportConfig::HttpOutput(HttpOutputConfig::default()))
+                    .unwrap(),
+            );
+        }
+        serde_json::from_value(json).map_err(|e| PipelineError::InvalidParam {
+            error: e.to_string(),
+        })?
+    } else {
+        let format =
+            encoder_config_from_http_request(&table_name, args.format.unwrap_or_default(), &req)?;
+        let mut connector_config = ConnectorConfig::new(
+            TransportConfig::HttpOutput(HttpOutputConfig {
+                backpressure: args.backpressure.unwrap_or_default(),
+            }),
+            Some(format),
+        )
+        .with_max_queued_records(HttpOutputTransport::default_max_buffered_records());
+        connector_config.send_snapshot = args.send_snapshot;
+        connector_config
+    };
+    let config = OutputEndpointConfig::new(table_name, connector_config);
+
+    let http_output_config = match &config.connector_config.transport {
+        TransportConfig::HttpOutput(config) => config.clone(),
+        _ => {
+            return Err(PipelineError::InvalidParam {
+                error: "Transport configuration must be `http_output`".to_string(),
+            });
+        }
+    };
+    let format = match &config.connector_config.format {
+        Some(format) if format.name == "csv" => HttpOutputFormat::Csv,
+        Some(format) if format.name == "json" => {
+            let json_format: JsonEncoderConfig = serde_json::from_value(format.config.clone())
+                .map_err(|e| PipelineError::InvalidParam {
+                    error: format!("Invalid JSON format configuration: {e}"),
+                })?;
+            if !json_format.array {
+                return Err(PipelineError::InvalidParam {
+                    error: String::from(r#"JSON format configuration must set `"array": true`"#),
+                });
+            }
+            HttpOutputFormat::Json
+        }
+        _ => {
+            return Err(PipelineError::InvalidParam {
+                error: "Format must be configured as `csv` or `json`".to_string(),
+            });
+        }
+    };
 
     // Create HTTP endpoint.
-    let endpoint = HttpOutputEndpoint::new(&endpoint_name, &args.format, args.backpressure);
-
-    // Create endpoint config.
-    let config = OutputEndpointConfig {
-        stream: Cow::from(table_name),
-        connector_config: ConnectorConfig {
-            transport: HttpOutputTransport::config(),
-            format: Some(encoder_config_from_http_request(
-                &endpoint_name,
-                &args.format,
-                &req,
-            )?),
-            preprocessor: None,
-            index: None,
-            output_buffer_config: Default::default(),
-            max_batch_size: None,
-            max_worker_batch_size: None,
-            max_queued_records: HttpOutputTransport::default_max_buffered_records(),
-            paused: false,
-            labels: vec![],
-            start_after: None,
-        },
-    };
+    let endpoint_name = format!("{}.api-{}", &config.stream, Uuid::new_v4());
+    let endpoint = HttpOutputEndpoint::new(&endpoint_name, format, http_output_config.backpressure);
+    // Pre-connect the streaming receiver before `add_output_endpoint` so the
+    // initial snapshot (when `send_snapshot` is enabled) is captured rather
+    // than racing the streaming body that drains it.
+    let response_receiver = endpoint.connect_stream();
 
     // Connect endpoint.
     let controller = state.controller()?;
-    if controller.register_api_connection().is_err() {
-        return Err(PipelineError::ApiConnectionLimit);
-    }
+    let _guard = controller.register_api_connection()?;
 
-    let endpoint_id = controller
-        .add_output_endpoint(
-            &endpoint_name,
-            &config,
-            Box::new(endpoint.clone()) as Box<dyn OutputEndpoint>,
-            None,
-        )
-        .inspect_err(|_| {
-            controller.unregister_api_connection();
-        })?;
+    let endpoint_id = controller.add_output_endpoint(
+        &endpoint_name,
+        &config,
+        Box::new(endpoint.clone()) as Box<dyn OutputEndpoint>,
+        None,
+    )?;
 
     // We need to pass a callback to `request` to disconnect the endpoint when the
     // request completes.  Use a downgraded reference to `state`, so
@@ -2283,19 +2378,21 @@ async fn output_endpoint(
 
     // Call endpoint to create a response with a streaming body, which will be
     // evaluated after we return the response object to actix.
-    Ok(endpoint.request(Box::new(move || {
-        // Delete endpoint on completion/error.
-        // We don't control the lifetime of the response object after
-        // returning it to actix, so the only way to run cleanup code
-        // when the HTTP request terminates is to piggyback on the
-        // destructor.
-        if let Some(state) = weak_state.upgrade()
-            && let Ok(controller) = state.controller()
-        {
-            controller.disconnect_output(&endpoint_id);
-            controller.unregister_api_connection();
-        }
-    })))
+    Ok(endpoint.request(
+        Some(response_receiver),
+        Box::new(move || {
+            // Delete endpoint on completion/error.
+            // We don't control the lifetime of the response object after
+            // returning it to actix, so the only way to run cleanup code
+            // when the HTTP request terminates is to piggyback on the
+            // destructor.
+            if let Some(state) = weak_state.upgrade()
+                && let Ok(controller) = state.controller()
+            {
+                controller.disconnect_output(&endpoint_id);
+            }
+        }),
+    ))
 }
 
 /// This service journals the paused state, but it does not wait for the journal
@@ -2337,20 +2434,6 @@ async fn output_endpoint_command(
             .controller()?
             .output_endpoint_command(&path, command.into_inner())?,
     ))
-}
-
-#[post("/output_endpoints/{endpoint_name}/reset")]
-async fn reset_output_endpoint(path: web::Path<String>) -> Result<HttpResponse, PipelineError> {
-    Err(PipelineError::from(ControllerError::not_supported(
-        &format!("output endpoint '{}' does not support reset", path.as_str()),
-    )))
-}
-
-#[get("/reset_status")]
-async fn reset_status() -> Result<HttpResponse, PipelineError> {
-    Err(PipelineError::from(ControllerError::not_supported(
-        "reset status is not yet available on this pipeline",
-    )))
 }
 
 /// This service journals the paused state, but it does not wait for the journal
@@ -2398,6 +2481,12 @@ async fn completion_status(
 async fn rebalance(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
     state.controller()?.rebalance().await?;
 
+    Ok(HttpResponse::Ok().into())
+}
+
+#[post("/start_compaction")]
+async fn start_compaction(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
+    state.controller()?.start_compaction().await?;
     Ok(HttpResponse::Ok().into())
 }
 
@@ -2748,33 +2837,27 @@ impl StoredStatus {
     }
 }
 
+/// Helpers shared between the HTTP-only and Kafka-using server tests. Lives
+/// outside `mod test_with_kafka` so it stays available when `with-kafka` is
+/// off.
 #[cfg(test)]
-#[cfg(feature = "with-kafka")]
-mod test_with_kafka {
+mod test_http_helpers {
     use super::{ServerArgs, ServerState, bootstrap, build_app, parse_config};
     use crate::{
-        controller::{ControllerBuilder, MAX_API_CONNECTIONS},
-        ensure_default_crypto_provider,
+        controller::ControllerBuilder,
         server::{InitializationState, PipelinePhase},
-        test::{
-            TestStruct, async_wait, generate_test_batches,
-            http::{TestHttpReceiver, TestHttpSender},
-            kafka::{BufferConsumer, KafkaResources, TestProducer},
-            test_circuit,
-        },
+        test::{TestStruct, async_wait, test_circuit},
     };
     use actix_test::TestServer;
-    use actix_web::{App, http::StatusCode, middleware::Logger, web::Data as WebData};
-    use feldera_types::runtime_status::RuntimeDesiredStatus;
+    use actix_web::{App, http::StatusCode, middleware::Logger, web::Bytes, web::Data as WebData};
+    use awc::error::PayloadError;
+    use csv::ReaderBuilder as CsvReaderBuilder;
     use feldera_types::{
-        completion_token::{CompletionStatus, CompletionStatusResponse, CompletionTokenResponse},
-        runtime_status::BootstrapPolicy,
+        completion_token::{CompletionStatus, CompletionStatusResponse},
+        runtime_status::{BootstrapPolicy, RuntimeDesiredStatus},
     };
-    use proptest::{
-        strategy::{Strategy, ValueTree},
-        test_runner::TestRunner,
-    };
-    use serde_json::{self, Value as JsonValue, json};
+    use futures::{Stream, StreamExt};
+    use serde_json::Value as JsonValue;
     use std::{
         io::Write,
         thread,
@@ -2784,7 +2867,7 @@ mod test_with_kafka {
     use tempfile::NamedTempFile;
     use uuid::Uuid;
 
-    async fn print_stats(server: &TestServer) {
+    pub(super) async fn print_stats(server: &TestServer) {
         let stats = serde_json::to_string_pretty(
             &server
                 .get("/stats")
@@ -2799,6 +2882,392 @@ mod test_with_kafka {
 
         println!("{stats}")
     }
+
+    pub(super) async fn start_test_server(config_str: &str, deployment_id: Uuid) -> TestServer {
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file.write_all(config_str.as_bytes()).unwrap();
+
+        println!("Creating HTTP server");
+
+        let state = WebData::new(ServerState::new(
+            PipelinePhase::Initializing(InitializationState::Starting),
+            String::default(),
+            RuntimeDesiredStatus::Paused,
+            BootstrapPolicy::Allow,
+            deployment_id,
+            None,
+        ));
+        let state_clone = state.clone();
+
+        let args = ServerArgs {
+            config_file: config_file.path().display().to_string(),
+            metadata_file: None,
+            bind_address: "127.0.0.1".to_string(),
+            default_port: None,
+            storage_location: None,
+            enable_https: false,
+            https_tls_cert_path: None,
+            https_tls_key_path: None,
+            initial: RuntimeDesiredStatus::Paused,
+            bootstrap_policy: BootstrapPolicy::Allow,
+            deployment_id,
+            host_id: None,
+        };
+
+        let config = parse_config(&args.config_file).unwrap();
+        let builder = ControllerBuilder::new(&config).unwrap();
+        thread::spawn(move || {
+            bootstrap(
+                builder,
+                Box::new(|workers| {
+                    Ok(test_circuit::<TestStruct>(
+                        workers,
+                        &TestStruct::schema(),
+                        &[None],
+                    ))
+                }),
+                state_clone,
+            )
+        });
+
+        let server =
+            actix_test::start(move || build_app(App::new().wrap(Logger::default()), state.clone()));
+
+        let start = Instant::now();
+        while server.get("/stats").send().await.unwrap().status() == StatusCode::SERVICE_UNAVAILABLE
+        {
+            assert!(start.elapsed() < Duration::from_millis(20_000));
+            sleep(Duration::from_millis(200));
+        }
+
+        server
+    }
+
+    pub(super) fn flatten_and_sort_batches(data: &[Vec<TestStruct>]) -> Vec<TestStruct> {
+        let mut records = data
+            .iter()
+            .flat_map(|batch| batch.iter().cloned())
+            .collect::<Vec<_>>();
+        records.sort();
+        records
+    }
+
+    fn decode_chunk_records(chunk: &crate::transport::http::Chunk) -> Vec<TestStruct> {
+        let Some(csv) = &chunk.text_data else {
+            return Vec::new();
+        };
+
+        let mut reader = CsvReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(csv.as_bytes());
+
+        reader
+            .deserialize::<(TestStruct, i32)>()
+            .map(Result::unwrap)
+            .map(|(record, weight)| {
+                assert_eq!(weight, 1);
+                record
+            })
+            .collect()
+    }
+
+    pub(super) async fn collect_output_chunks<S>(
+        response: &mut S,
+        num_records: usize,
+    ) -> (Vec<crate::transport::http::Chunk>, Vec<TestStruct>)
+    where
+        S: Stream<Item = Result<Bytes, PayloadError>> + Unpin,
+    {
+        let mut chunks = Vec::new();
+        let mut records = Vec::with_capacity(num_records);
+        let mut data = Vec::new();
+
+        while records.len() < num_records {
+            let bytes = response.next().await.unwrap().unwrap();
+            data.extend_from_slice(&bytes);
+
+            if data.last() != Some(&b'\n') {
+                continue;
+            }
+
+            for chunk in serde_json::Deserializer::from_slice(&data)
+                .into_iter::<crate::transport::http::Chunk>()
+            {
+                let chunk = chunk.unwrap();
+                let chunk_records = decode_chunk_records(&chunk);
+                if chunk_records.is_empty() {
+                    continue;
+                }
+                records.extend(chunk_records);
+                chunks.push(chunk);
+            }
+
+            data.clear();
+        }
+
+        (chunks, records)
+    }
+
+    pub(super) async fn wait_for_completion(server: &TestServer, token: &str) {
+        async_wait(
+            || async {
+                let resp = server
+                    .get(format!("/completion_status?token={token}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .body()
+                    .await
+                    .unwrap();
+                let CompletionStatusResponse { status, .. } =
+                    serde_json::from_slice(&resp).unwrap();
+                status == CompletionStatus::Complete
+            },
+            20_000,
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Server tests that exercise HTTP egress/ingress only — no Kafka required.
+#[cfg(test)]
+mod test_http {
+    use super::test_http_helpers::{
+        collect_output_chunks, flatten_and_sort_batches, print_stats, start_test_server,
+        wait_for_completion,
+    };
+    use crate::{
+        ensure_default_crypto_provider,
+        test::{TestStruct, http::TestHttpSender},
+    };
+    use feldera_types::completion_token::CompletionTokenResponse;
+    use std::time::Duration;
+    use tokio::time::timeout;
+    use uuid::Uuid;
+
+    /// Verifies the `send_snapshot` HTTP egress mode:
+    /// 1. Pushes initial data, connects with `send_snapshot=true`, and
+    ///    verifies the snapshot chunks carry `snapshot: true`.
+    /// 2. Pushes more data and verifies incremental delta chunks arrive
+    ///    with `snapshot: false`.
+    /// 3. Opens a second connection and verifies it receives a full
+    ///    snapshot of all data (initial + follow).
+    #[actix_web::test]
+    async fn test_http_egress_send_snapshot() {
+        ensure_default_crypto_provider();
+
+        let initial_data = vec![
+            vec![TestStruct::for_id(1), TestStruct::for_id(2)],
+            vec![TestStruct::for_id(3)],
+        ];
+        let follow_data = vec![vec![TestStruct::for_id(10), TestStruct::for_id(11)]];
+
+        let server = start_test_server(
+            r#"
+name: test
+inputs:
+outputs:
+"#,
+            Uuid::new_v4(),
+        )
+        .await;
+
+        let resp = server.get("/start").send().await.unwrap();
+        assert!(resp.status().is_success());
+
+        let CompletionTokenResponse { token } =
+            TestHttpSender::send_stream_deserialize_resp::<CompletionTokenResponse>(
+                server.post("/ingress/test_input1"),
+                &initial_data,
+            )
+            .await;
+        wait_for_completion(&server, &token).await;
+
+        let mut response = server
+            .post("/egress/test_output1?format=csv&backpressure=true&send_snapshot=true")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let (snapshot_chunks, mut snapshot_records) = match timeout(
+            Duration::from_secs(10),
+            collect_output_chunks(&mut response, initial_data.iter().map(Vec::len).sum()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                print_stats(&server).await;
+                panic!("timed out waiting for snapshot output: {error:?}");
+            }
+        };
+        snapshot_records.sort();
+        assert_eq!(snapshot_records, flatten_and_sort_batches(&initial_data));
+        assert!(!snapshot_chunks.is_empty());
+        assert!(snapshot_chunks.iter().all(|chunk| chunk.snapshot));
+
+        let CompletionTokenResponse { token } = TestHttpSender::send_stream_deserialize_resp::<
+            CompletionTokenResponse,
+        >(
+            server.post("/ingress/test_input1"), &follow_data
+        )
+        .await;
+        wait_for_completion(&server, &token).await;
+
+        let (delta_chunks, mut delta_records) = timeout(
+            Duration::from_secs(10),
+            collect_output_chunks(&mut response, follow_data.iter().map(Vec::len).sum()),
+        )
+        .await
+        .expect("timed out waiting for follow output");
+        delta_records.sort();
+        assert_eq!(delta_records, flatten_and_sort_batches(&follow_data));
+        assert!(!delta_chunks.is_empty());
+        assert!(delta_chunks.iter().all(|chunk| !chunk.snapshot));
+
+        // Open a second connection: it should receive a snapshot of all data
+        // (initial + follow) since the view is materialized.
+        let all_data_len: usize = initial_data.iter().map(Vec::len).sum::<usize>()
+            + follow_data.iter().map(Vec::len).sum::<usize>();
+
+        let mut response2 = server
+            .post("/egress/test_output1?format=csv&backpressure=true&send_snapshot=true")
+            .send()
+            .await
+            .unwrap();
+        assert!(response2.status().is_success());
+
+        let (snapshot2_chunks, mut snapshot2_records) = timeout(
+            Duration::from_secs(10),
+            collect_output_chunks(&mut response2, all_data_len),
+        )
+        .await
+        .expect("timed out waiting for second connection snapshot");
+        snapshot2_records.sort();
+
+        let mut all_expected = flatten_and_sort_batches(&initial_data);
+        all_expected.extend(flatten_and_sort_batches(&follow_data));
+        all_expected.sort();
+
+        assert_eq!(snapshot2_records, all_expected);
+        assert!(!snapshot2_chunks.is_empty());
+        assert!(snapshot2_chunks.iter().all(|chunk| chunk.snapshot));
+    }
+
+    /// Connecting to `/egress?send_snapshot=true` while the pipeline is
+    /// Paused must still deliver the cached materialized-view snapshot.
+    ///
+    /// Without the fix, the snapshot stalls indefinitely: registration calls
+    /// `request_snapshot_delivery`, which short-circuits when the pipeline is
+    /// not `Running`, so no step fires and `push_output` never runs the
+    /// `is_snapshot_pending` path. The HTTP client receives only the 3-second
+    /// keepalive empties and times out.
+    #[actix_web::test]
+    async fn test_http_egress_send_snapshot_while_paused() {
+        ensure_default_crypto_provider();
+
+        let initial_data = vec![
+            vec![TestStruct::for_id(1), TestStruct::for_id(2)],
+            vec![TestStruct::for_id(3)],
+        ];
+
+        let server = start_test_server(
+            r#"
+name: test
+inputs:
+outputs:
+"#,
+            Uuid::new_v4(),
+        )
+        .await;
+
+        // Start, push data, wait for it to land in the materialized view so
+        // `trace_snapshots` is populated before we pause.
+        let resp = server.get("/start").send().await.unwrap();
+        assert!(resp.status().is_success());
+
+        let CompletionTokenResponse { token } =
+            TestHttpSender::send_stream_deserialize_resp::<CompletionTokenResponse>(
+                server.post("/ingress/test_input1"),
+                &initial_data,
+            )
+            .await;
+        wait_for_completion(&server, &token).await;
+
+        // Pause; subsequent egress request must still see the snapshot.
+        let resp = server.get("/pause").send().await.unwrap();
+        assert!(resp.status().is_success());
+        // The /pause API returns immediately after setting the desired state;
+        // give the circuit thread a moment to actually stop stepping so we
+        // exercise the truly-paused path (not a race with the last in-flight
+        // step).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut response = server
+            .post("/egress/test_output1?format=csv&backpressure=true&send_snapshot=true")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let (snapshot_chunks, mut snapshot_records) = match timeout(
+            Duration::from_secs(10),
+            collect_output_chunks(&mut response, initial_data.iter().map(Vec::len).sum()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                print_stats(&server).await;
+                panic!(
+                    "timed out waiting for snapshot output while paused: {error:?} \
+                     (expected the snapshot to be delivered without resuming)"
+                );
+            }
+        };
+        snapshot_records.sort();
+        assert_eq!(snapshot_records, flatten_and_sort_batches(&initial_data));
+        assert!(
+            !snapshot_chunks.is_empty(),
+            "expected at least one chunk with payload"
+        );
+        assert!(
+            snapshot_chunks.iter().all(|chunk| chunk.snapshot),
+            "expected all data chunks to be marked snapshot=true while paused, got: {:?}",
+            snapshot_chunks
+                .iter()
+                .map(|c| c.snapshot)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "with-kafka")]
+mod test_with_kafka {
+    use super::test_http_helpers::{print_stats, start_test_server};
+    use crate::{
+        controller::MAX_API_CONNECTIONS,
+        ensure_default_crypto_provider,
+        test::{
+            TestStruct, async_wait, generate_test_batches,
+            http::{TestHttpReceiver, TestHttpSender},
+            kafka::{BufferConsumer, KafkaResources, TestProducer},
+        },
+    };
+    use feldera_types::{
+        adapter_stats::{ExternalControllerStatus, TransactionStatus},
+        completion_token::{CompletionStatus, CompletionStatusResponse, CompletionTokenResponse},
+    };
+    use proptest::{
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+    use serde_json::{Value as JsonValue, json};
+    use std::{thread::sleep, time::Duration};
+    use uuid::Uuid;
 
     #[actix_web::test]
     async fn test_server() {
@@ -2850,62 +3319,7 @@ outputs:
         format:
             name: csv
 "#;
-
-        let mut config_file = NamedTempFile::new().unwrap();
-        config_file.write_all(config_str.as_bytes()).unwrap();
-
-        println!("Creating HTTP server");
-
-        let state = WebData::new(ServerState::new(
-            PipelinePhase::Initializing(InitializationState::Starting),
-            String::new(),
-            RuntimeDesiredStatus::Paused,
-            BootstrapPolicy::Allow,
-            Uuid::new_v4(),
-            None,
-        ));
-        let state_clone = state.clone();
-
-        let args = ServerArgs {
-            config_file: config_file.path().display().to_string(),
-            metadata_file: None,
-            bind_address: "127.0.0.1".to_string(),
-            default_port: None,
-            storage_location: None,
-            enable_https: false,
-            https_tls_cert_path: None,
-            https_tls_key_path: None,
-            initial: RuntimeDesiredStatus::Paused,
-            bootstrap_policy: BootstrapPolicy::Allow,
-            deployment_id: uuid::Uuid::nil(),
-            host_id: None,
-        };
-
-        let config = parse_config(&args.config_file).unwrap();
-        let builder = ControllerBuilder::new(&config).unwrap();
-        thread::spawn(move || {
-            bootstrap(
-                builder,
-                Box::new(|workers| {
-                    Ok(test_circuit::<TestStruct>(
-                        workers,
-                        &TestStruct::schema(),
-                        &[None],
-                    ))
-                }),
-                state_clone,
-            )
-        });
-
-        let server =
-            actix_test::start(move || build_app(App::new().wrap(Logger::default()), state.clone()));
-
-        let start = Instant::now();
-        while server.get("/stats").send().await.unwrap().status() == StatusCode::SERVICE_UNAVAILABLE
-        {
-            assert!(start.elapsed() < Duration::from_millis(20_000));
-            sleep(Duration::from_millis(200));
-        }
+        let server = start_test_server(config_str, Uuid::new_v4()).await;
 
         // Write data to Kafka.
         println!("Send test data");
@@ -3143,62 +3557,7 @@ name: test
 inputs:
 outputs:
 "#;
-
-        let mut config_file = NamedTempFile::new().unwrap();
-        config_file.write_all(config_str.as_bytes()).unwrap();
-
-        println!("Creating HTTP server");
-
-        let state = WebData::new(ServerState::new(
-            PipelinePhase::Initializing(InitializationState::Starting),
-            String::default(),
-            RuntimeDesiredStatus::Paused,
-            BootstrapPolicy::Allow,
-            Uuid::default(),
-            None,
-        ));
-        let state_clone = state.clone();
-
-        let args = ServerArgs {
-            config_file: config_file.path().display().to_string(),
-            metadata_file: None,
-            bind_address: "127.0.0.1".to_string(),
-            default_port: None,
-            storage_location: None,
-            enable_https: false,
-            https_tls_cert_path: None,
-            https_tls_key_path: None,
-            initial: RuntimeDesiredStatus::Paused,
-            bootstrap_policy: BootstrapPolicy::Allow,
-            deployment_id: Uuid::default(),
-            host_id: None,
-        };
-
-        let config = parse_config(&args.config_file).unwrap();
-        let builder = ControllerBuilder::new(&config).unwrap();
-        thread::spawn(move || {
-            bootstrap(
-                builder,
-                Box::new(|workers| {
-                    Ok(test_circuit::<TestStruct>(
-                        workers,
-                        &TestStruct::schema(),
-                        &[None],
-                    ))
-                }),
-                state_clone,
-            )
-        });
-
-        let server =
-            actix_test::start(move || build_app(App::new().wrap(Logger::default()), state.clone()));
-
-        let start = Instant::now();
-        while server.get("/stats").send().await.unwrap().status() == StatusCode::SERVICE_UNAVAILABLE
-        {
-            assert!(start.elapsed() < Duration::from_millis(20_000));
-            sleep(Duration::from_millis(200));
-        }
+        let server = start_test_server(config_str, Uuid::default()).await;
 
         // Start pipeline.
         println!("/start");
@@ -3226,5 +3585,122 @@ outputs:
         assert!(resp.status().is_success());
 
         TestHttpReceiver::wait_for_output_unordered(&mut egress_resp, &data).await;
+    }
+
+    /// Regression test for issue #6231.
+    /// In a pipeline without output connectors, the number of completed records,
+    /// completed steps, and the `pipeline_complete` flag are updated before the current transaction
+    /// completes.
+    #[actix_web::test]
+    async fn test_transaction_completion_without_output_connectors() {
+        ensure_default_crypto_provider();
+
+        let data = vec![vec![
+            TestStruct::for_id(1),
+            TestStruct::for_id(2),
+            TestStruct::for_id(3),
+        ]];
+        let input_records = data.iter().map(Vec::len).sum::<usize>() as u64;
+
+        // Keep the controller free of configured output connectors.  This
+        // exercises the no-output path in completion accounting instead of
+        // waiting for any egress connector to report progress.
+        let config_str = r#"
+name: test
+inputs:
+outputs:
+"#;
+        let server = start_test_server(config_str, Uuid::default()).await;
+
+        println!("/start");
+        let resp = server.get("/start").send().await.unwrap();
+        assert!(resp.status().is_success());
+
+        println!("/start_transaction");
+        let resp = server.post("/start_transaction").send().await.unwrap();
+        assert!(resp.status().is_success());
+
+        // Push input through HTTP ingress while the transaction is open.  The
+        // endpoint returns a completion token for exactly the records that this
+        // request placed into the pipeline.
+        let req = server.post("/ingress/test_input1");
+        let CompletionTokenResponse { token } =
+            TestHttpSender::send_stream_deserialize_resp::<CompletionTokenResponse>(req, &data)
+                .await;
+        println!("completion token: {token}");
+
+        // Give the pipeline time to process the input inside the transaction.
+        // Before commit, records must not be reported as completed.
+        sleep(Duration::from_millis(5000));
+        let stats = server
+            .get("/stats")
+            .send()
+            .await
+            .unwrap()
+            .json::<ExternalControllerStatus>()
+            .await
+            .unwrap();
+        assert!(!stats.global_metrics.pipeline_complete);
+        assert_eq!(stats.global_metrics.total_completed_records, 0);
+
+        let CompletionStatusResponse { status, .. } = server
+            .get(format!("/completion_status?token={token}"))
+            .send()
+            .await
+            .unwrap()
+            .json::<CompletionStatusResponse>()
+            .await
+            .unwrap();
+        assert_eq!(status, CompletionStatus::InProgress);
+
+        println!("/commit_transaction");
+        let resp = server.post("/commit_transaction").send().await.unwrap();
+        assert!(resp.status().is_success());
+
+        // Wait for the transaction to commit.
+        async_wait(
+            || async {
+                let stats = server
+                    .get("/stats")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<ExternalControllerStatus>()
+                    .await
+                    .unwrap();
+                stats.global_metrics.transaction_status == TransactionStatus::NoTransaction
+            },
+            20_000,
+        )
+        .await
+        .unwrap();
+
+        async_wait(
+            || async {
+                let CompletionStatusResponse { status, .. } = server
+                    .get(format!("/completion_status?token={token}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<CompletionStatusResponse>()
+                    .await
+                    .unwrap();
+                status == CompletionStatus::Complete
+            },
+            20_000,
+        )
+        .await
+        .unwrap();
+
+        let stats = server
+            .get("/stats")
+            .send()
+            .await
+            .unwrap()
+            .json::<ExternalControllerStatus>()
+            .await
+            .unwrap();
+        assert!(stats.global_metrics.pipeline_complete);
+        assert_eq!(stats.global_metrics.total_completed_records, input_records,);
     }
 }

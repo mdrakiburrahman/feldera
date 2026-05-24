@@ -1,5 +1,7 @@
 use crate::storage::file::format::BatchMetadata;
-use crate::storage::filter_stats::FilterStats;
+use crate::storage::file::{
+    FilterKind, FilterStats, TouchedWindowCount, TouchedWindowCounter, collect_roaring_metadata,
+};
 use crate::{
     DBData, DBWeight, NumEntries, Runtime,
     algebra::{AddAssignByRef, AddByRef, NegByRef},
@@ -10,7 +12,7 @@ use crate::{
     storage::{
         buffer_cache::CacheStats,
         file::{
-            Factories as FileFactories,
+            Factories as FileFactories, FilterPlan,
             reader::{BulkRows, Cursor as FileCursor, Error as ReaderError, Reader},
             writer::Writer2,
         },
@@ -19,8 +21,9 @@ use crate::{
         Batch, BatchFactories, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor,
         FileValBatch, VecIndexedWSetFactories, WeightedItem,
         cursor::{CursorFactory, CursorFactoryWrapper, Pending, Position, PushCursor},
+        filter::BatchFilters,
         merge_batches_by_reference,
-        ord::{batch_filter::BatchFilters, file::UnwrapStorage, merge_batcher::MergeBatcher},
+        ord::{file::UnwrapStorage, merge_batcher::MergeBatcher},
     },
 };
 use crate::{DynZWeight, ZWeight};
@@ -284,7 +287,7 @@ where
             Runtime::buffer_cache,
             &*Runtime::storage_backend().unwrap_storage(),
             Runtime::file_writer_parameters(),
-            self.key_count(),
+            FilterPlan::<K>::decide_filter(None, self.key_count()),
         )
         .unwrap_storage();
 
@@ -302,6 +305,7 @@ where
         let stats = BatchMetadata {
             negative_weight_count: (self.len() as u64)
                 .saturating_sub(self.metadata().negative_weight_count),
+            touched_window_count: self.metadata().touched_window_count,
         };
         let (file, filters) = writer.into_reader(stats).unwrap_storage();
         Self::from_parts(self.factories.clone(), Arc::new(file), filters)
@@ -396,6 +400,10 @@ where
 
     fn membership_filter_stats(&self) -> FilterStats {
         self.filters.stats().membership_filter
+    }
+
+    fn membership_filter_kind(&self) -> FilterKind {
+        self.filters.membership_filter_kind()
     }
 
     fn range_filter_stats(&self) -> FilterStats {
@@ -500,8 +508,16 @@ where
         Ok(Self::from_parts(factories.clone(), file, filters))
     }
 
+    fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)> {
+        self.filters.key_bounds()
+    }
+
     fn negative_weight_count(&self) -> Option<u64> {
         Some(self.metadata().negative_weight_count)
+    }
+
+    fn touched_window_count(&self) -> TouchedWindowCount {
+        self.metadata().touched_window_count
     }
 }
 
@@ -875,6 +891,8 @@ where
     num_tuples: usize,
     #[size_of(skip)]
     stats: BatchMetadata,
+    #[size_of(skip)]
+    touched_window_counter: Option<TouchedWindowCounter>,
 }
 
 impl<K, V, R> FileIndexedWSetBuilder<K, V, R>
@@ -900,10 +918,11 @@ where
     R: WeightTrait + ?Sized,
 {
     #[inline]
-    fn with_capacity(
+    fn with_capacity_in_location(
         factories: &FileIndexedWSetFactories<K, V, R>,
         key_capacity: usize,
         _value_capacity: usize,
+        _location: Option<BatchLocation>,
     ) -> Self {
         Self {
             factories: factories.clone(),
@@ -913,22 +932,69 @@ where
                 Runtime::buffer_cache,
                 &*Runtime::storage_backend().unwrap_storage(),
                 Runtime::file_writer_parameters(),
-                key_capacity,
+                FilterPlan::<K>::decide_filter(None, key_capacity),
             )
             .unwrap_storage(),
             weight: factories.weight_factory().default_box(),
             num_tuples: 0,
             stats: BatchMetadata::default(),
+            touched_window_counter: collect_roaring_metadata().then(TouchedWindowCounter::default),
         }
     }
 
-    fn done(self) -> FileIndexedWSet<K, V, R> {
+    fn for_merge<'a, B, I>(
+        factories: &FileIndexedWSetFactories<K, V, R>,
+        batches: I,
+        _location: Option<BatchLocation>,
+    ) -> Self
+    where
+        B: Batch<Key = K, Val = V, Time = (), R = R>,
+        I: IntoIterator<Item = &'a B> + Clone,
+    {
+        let key_capacity = batches.clone().into_iter().map(|b| b.key_count()).sum();
+        let key_filter = if collect_roaring_metadata() {
+            let filter_plan = FilterPlan::from_batches(batches.clone());
+            filter_plan.map_or_else(
+                || FilterPlan::<K>::decide_filter(None, key_capacity),
+                |filter_plan| FilterPlan::decide_filter(Some(&filter_plan), key_capacity),
+            )
+        } else {
+            FilterPlan::<K>::decide_filter(None, key_capacity)
+        };
+        Self {
+            factories: factories.clone(),
+            writer: Writer2::new(
+                &factories.factories0,
+                &factories.factories1,
+                Runtime::buffer_cache,
+                &*Runtime::storage_backend().unwrap_storage(),
+                Runtime::file_writer_parameters(),
+                key_filter,
+            )
+            .unwrap_storage(),
+            weight: factories.weight_factory().default_box(),
+            num_tuples: 0,
+            stats: BatchMetadata::default(),
+            touched_window_counter: collect_roaring_metadata().then(TouchedWindowCounter::default),
+        }
+    }
+
+    fn done(mut self) -> FileIndexedWSet<K, V, R> {
+        self.stats.touched_window_count = self
+            .touched_window_counter
+            .map(TouchedWindowCounter::finish)
+            .unwrap_or_default();
         let (file, filters) = self.writer.into_reader(self.stats).unwrap_storage();
         let file = Arc::new(file);
         FileIndexedWSet::from_parts(self.factories, file, filters)
     }
 
     fn push_key(&mut self, key: &K) {
+        if let Some(counter) = self.touched_window_counter.as_mut()
+            && !counter.push_key(key)
+        {
+            self.touched_window_counter = None;
+        }
         self.writer.write0((key, &())).unwrap_storage();
     }
 

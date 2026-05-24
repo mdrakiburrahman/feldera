@@ -307,6 +307,11 @@ public class RewriteInternedFields extends CircuitCloneVisitor {
     }
 
     @Override
+    public void postorder(DBSPRowNumberOperator operator) {
+        this.uninternValue(operator);
+    }
+
+    @Override
     public void postorder(DBSPLagOperator operator) {
         // Unfortunately we have to unintern everything in the value,
         // since the comparator will touch all the input value fields
@@ -493,12 +498,10 @@ public class RewriteInternedFields extends CircuitCloneVisitor {
         throw new InternalCompilerError("Unexpected type " + left);
     }
 
-    @Override
-    public void postorder(DBSPSumOperator operator) {
+    boolean processSum(DBSPSimpleOperator operator) {
         List<OutputPort> inputs = Linq.map(operator.inputs, this::mapped);
         if (!operator.inputsDiffer(inputs, false)) {
-            super.postorder(operator);
-            return;
+            return false;
         }
 
         DBSPType commonType = inputs.get(0).getOutputRowType();
@@ -527,8 +530,23 @@ public class RewriteInternedFields extends CircuitCloneVisitor {
             inputs.set(i, map.outputPort());
             this.addOperator(map);
         }
-        DBSPSumOperator result = new DBSPSumOperator(operator.getRelNode(), inputs);
+        DBSPSimpleOperator result = operator.withInputs(inputs, false).to(DBSPSimpleOperator.class);
         this.map(operator, result);
+        return true;
+    }
+
+    @Override
+    public void postorder(DBSPSumOperator operator) {
+        if (!this.processSum(operator)) {
+            super.postorder(operator);
+        }
+    }
+
+    @Override
+    public void postorder(DBSPAtomicSumOperator operator) {
+        if (!this.processSum(operator)) {
+            this.postorder(operator);
+        }
     }
 
     OutputPort uninternKey(OutputPort source, DBSPTypeIndexedZSet sourceType, DBSPTypeTuple commonKeyType) {

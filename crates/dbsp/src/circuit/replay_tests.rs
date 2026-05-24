@@ -1,9 +1,10 @@
 use feldera_types::config::StorageConfig;
 
 use crate::{
-    CmpFunc, DBData, OrdZSet, OutputHandle, RootCircuit, Runtime, Stream, ZSetHandle, ZWeight,
+    CmpFunc, DBData, IndexedZSetHandle, OrdIndexedZSet, OrdZSet, OutputHandle, RootCircuit,
+    Runtime, Stream, ZSetHandle, ZWeight,
     circuit::dbsp_handle::CircuitStorageConfig,
-    default_hash,
+    default_hash, indexed_zset,
     operator::{
         Max, Min,
         time_series::{RelOffset, RelRange},
@@ -11,7 +12,7 @@ use crate::{
     typed_batch::SpineSnapshot,
     utils::{Tup2, Tup3, Tup4, test::init_test_logger},
 };
-use std::{cmp::Ordering, fmt::Debug, marker::PhantomData, sync::Arc};
+use std::{cmp::Ordering, fmt::Debug, marker::PhantomData, path::PathBuf, sync::Arc};
 
 use super::{CircuitConfig, dbsp_handle::Mode};
 
@@ -148,6 +149,23 @@ type CircuitFn<I1, I2, O1, O2> = Arc<
 ///```
 ///
 /// The common part of the two circuits must return identical results.
+
+fn circuit_config(path: &PathBuf) -> CircuitConfig {
+    CircuitConfig::with_workers(NUM_WORKERS)
+        .with_splitter_chunk_size_records(2)
+        .with_mode(Mode::Persistent)
+        .with_storage(Some(
+            CircuitStorageConfig::for_config(
+                StorageConfig {
+                    path: path.to_string_lossy().into_owned(),
+                    cache: Default::default(),
+                },
+                Default::default(),
+            )
+            .unwrap(),
+        ))
+}
+
 fn test_replay<I1, I2, I3, O1, O2, O3>(
     circuit_constructor1: CircuitFn<I1, I2, O1, O2>,
     circuit_constructor2: CircuitFn<I2, I3, O2, O3>,
@@ -168,19 +186,8 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
 
     init_test_logger();
 
-    let mut circuit_config = CircuitConfig::with_workers(NUM_WORKERS)
-        .with_splitter_chunk_size_records(2)
-        .with_mode(Mode::Persistent);
     let path = tempfile::tempdir().unwrap().keep();
     println!("Running replay_test in {}", path.display());
-
-    let config = StorageConfig {
-        path: path.to_string_lossy().into_owned(),
-        cache: Default::default(),
-    };
-    let options = Default::default();
-
-    circuit_config.storage = Some(CircuitStorageConfig::for_config(config, options).unwrap());
 
     // Create both reference circuits, feed I1 and I2 to circuit1; feed I2 and I3 to circuit2.
     let mut reference_output1 = Vec::new();
@@ -189,9 +196,10 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
     let mut reference_output3 = Vec::new();
 
     {
+        println!("Running first circuit to get reference output");
         let circuit_constructor1_clone = circuit_constructor1.clone();
         let (mut circuit, (input_handles1, input_handles2, output_handles1, output_handles2)) =
-            Runtime::init_circuit(&circuit_config, move |circuit| {
+            Runtime::init_circuit(circuit_config(&path), move |circuit| {
                 Ok(circuit_constructor1_clone(circuit))
             })
             .unwrap();
@@ -216,9 +224,10 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
 
         circuit.kill().unwrap();
 
+        println!("Running second circuit to get reference output");
         let circuit_constructor2_clone = circuit_constructor2.clone();
         let (mut circuit, (input_handles2, input_handles3, output_handles2, output_handles3)) =
-            Runtime::init_circuit(&circuit_config, move |circuit| {
+            Runtime::init_circuit(circuit_config(&path), move |circuit| {
                 Ok(circuit_constructor2_clone(circuit))
             })
             .unwrap();
@@ -252,11 +261,13 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
     let mut actual_output3 = Vec::new();
 
     let checkpoint = {
+        println!("Running first circuit to create checkpoint");
+
         // Create the first circuit.
         let circuit_constructor1_clone = circuit_constructor1.clone();
 
         let (mut circuit, (input_handles1, input_handles2, output_handles1, output_handles2)) =
-            Runtime::init_circuit(&circuit_config, move |circuit| {
+            Runtime::init_circuit(circuit_config(&path), move |circuit| {
                 Ok(circuit_constructor1_clone(circuit))
             })
             .unwrap();
@@ -284,13 +295,13 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
         println!("Restarting circuit from checkpoint {}", checkpoint.uuid);
 
         // Restart the second circuit from the checkpoint.
-        let mut circuit_config = circuit_config.clone();
+        let mut circuit_config = circuit_config(&path);
         circuit_config.storage.as_mut().unwrap().init_checkpoint = Some(checkpoint.uuid);
 
         let circuit_constructor2_clone = circuit_constructor2.clone();
 
         let (mut circuit, (input_handles2, input_handles3, output_handles2, output_handles3)) =
-            Runtime::init_circuit(&circuit_config, move |circuit| {
+            Runtime::init_circuit(circuit_config, move |circuit| {
                 Ok(circuit_constructor2_clone(circuit))
             })
             .unwrap();
@@ -310,6 +321,8 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
             actual_output2.push(O2::read_outputs(&output_handles2));
             actual_output3.push(O3::read_outputs(&output_handles3));
         }
+
+        println!("Additional transactions completed");
 
         circuit.kill().unwrap();
     }
@@ -578,17 +591,25 @@ fn test_linear_circuit_materialized_inputs_with_backfill() {
 //
 // Pipeline 1:
 //
+//        |----------------------|
+//        |                      v
+//        |              |----->join--->
+//        |              |
 // ---> input1 ---> join --> output1
 //                   ^
 // ---> input2 ------|
 //
 // Pipeline 2 (adds another join):
 //
+//        |----------------------|
+//        |                      v
+//        |              |----->join--->
+//        |              |
 // ---> input1 ---> join --> output1
-//                   ^
-// ---> input2 ------|
-//                   v
-// ---> input3 ---> join --> output2
+//                   ^    |
+// ---> input2 ------|    |------------>join-->output2
+//                   v    |
+// ---> input3 ---> join --
 //
 fn join_circuit1(
     balancing: bool,
@@ -605,9 +626,8 @@ fn join_circuit1(
     let (input_stream2, input_handle2) = circuit.add_input_zset::<u64>();
     input_stream2.set_persistent_id(Some("input2"));
 
-    // These integrals will be used for replay input streams.
-    input_stream1.integrate_trace();
-    input_stream2.integrate_trace();
+    // Note: we don't need to manually create integrals of the input streams, as they can be replayed from the
+    // integrals maintained internally by the join operator.
 
     let input_stream1_indexed = input_stream1
         .map_index(|x| (*x, *x))
@@ -616,14 +636,28 @@ fn join_circuit1(
         .map_index(|x| (*x, *x))
         .set_persistent_id(Some("input_stream2_indexed"));
 
-    let output_handle1 = if balancing {
-        input_stream1_indexed
+    let (_j1_indexed, output_handle1) = if balancing {
+        let j1 = input_stream1_indexed
             .join_balanced_inner(&input_stream2_indexed, |key, _v1, _v2| *key)
-            .accumulate_output_persistent(Some("output1"))
+            .set_persistent_id(Some("j1"));
+
+        let j1_indexed = j1
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j1-indexed"));
+        j1_indexed.join_balanced_inner(&input_stream1_indexed, |key, _v1, _v2| *key);
+
+        (j1_indexed, j1.accumulate_output_persistent(Some("output1")))
     } else {
-        input_stream1_indexed
+        let j1 = input_stream1_indexed
             .join(&input_stream2_indexed, |key, _v1, _v2| *key)
-            .accumulate_output_persistent(Some("output1"))
+            .set_persistent_id(Some("j1"));
+
+        let j1_indexed = j1
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j1-indexed"));
+        j1_indexed.join(&input_stream1_indexed, |key, _v1, _v2| *key);
+
+        (j1_indexed, j1.accumulate_output_persistent(Some("output1")))
     };
 
     ((), (input_handle1, input_handle2), (), output_handle1)
@@ -647,10 +681,10 @@ fn join_circuit2(
     let (input_stream3, input_handle3) = circuit.add_input_zset::<u64>();
     input_stream3.set_persistent_id(Some("input3"));
 
-    // These integrals will be used for replay input streams.
-    input_stream1.integrate_trace();
-    input_stream2.integrate_trace();
-    input_stream3.integrate_trace();
+    // // These integrals will be used for replay input streams.
+    // input_stream1.integrate_trace();
+    // input_stream2.integrate_trace();
+    // input_stream3.integrate_trace();
 
     let input_stream1_indexed = input_stream1
         .map_index(|x| (*x, *x))
@@ -662,24 +696,60 @@ fn join_circuit2(
         .map_index(|x| (*x, *x))
         .set_persistent_id(Some("input_stream3_indexed"));
 
-    let output_handle1 = if balancing {
-        input_stream1_indexed
+    let (j1_indexed, output_handle1) = if balancing {
+        let j1 = input_stream1_indexed
             .join_balanced_inner(&input_stream2_indexed, |key, _v1, _v2| *key)
-            .accumulate_output_persistent(Some("output1"))
+            .set_persistent_id(Some("j1"));
+
+        let j1_indexed = j1
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j1-indexed"));
+
+        j1_indexed.join_balanced_inner(&input_stream1_indexed, |key, _v1, _v2| *key);
+
+        (j1_indexed, j1.accumulate_output_persistent(Some("output1")))
     } else {
-        input_stream1_indexed
+        let j1 = input_stream1_indexed
             .join(&input_stream2_indexed, |key, _v1, _v2| *key)
-            .accumulate_output_persistent(Some("output1"))
+            .set_persistent_id(Some("j1"));
+
+        let j1_indexed = j1
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j1-indexed"));
+
+        j1_indexed.join(&input_stream1_indexed, |key, _v1, _v2| *key);
+
+        (j1_indexed, j1.accumulate_output_persistent(Some("output1")))
     };
 
     let output_handle2 = if balancing {
-        input_stream2_indexed
+        let j2 = input_stream2_indexed
             .join_balanced_inner(&input_stream3_indexed, |key, _v1, _v2| *key)
-            .accumulate_output_persistent(Some("output2"))
+            .set_persistent_id(Some("j2"));
+
+        let j2_indexed = j2
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j2-indexed"));
+
+        let j3 = j2_indexed
+            .join_balanced_inner(&j1_indexed, |key, _v1, _v2| *key)
+            .set_persistent_id(Some("j3"));
+
+        j3.accumulate_output_persistent(Some("output2"))
     } else {
-        input_stream2_indexed
+        let j2 = input_stream2_indexed
             .join(&input_stream3_indexed, |key, _v1, _v2| *key)
-            .accumulate_output_persistent(Some("output2"))
+            .set_persistent_id(Some("j2"));
+
+        let j2_indexed = j2
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j2-indexed"));
+
+        let j3 = j2_indexed
+            .join(&j1_indexed, |key, _v1, _v2| *key)
+            .set_persistent_id(Some("j3"));
+
+        j3.accumulate_output_persistent(Some("output2"))
     };
 
     (
@@ -1578,4 +1648,253 @@ fn test_rolling_circuit() {
         sequence(20, 40),
         std::iter::repeat_n((), 20).collect(),
     );
+}
+
+// Regression test:
+//
+// Pipeline 1:
+// ---> input_map
+//
+// Pipeline 2:
+// ---> input_map ---> aggregate --> output
+//
+// The second pipeline should replay the input from the input_map operator.
+// A bug prevented this from happening, because the integral built by the
+// aggregate operator was used to replay instead.
+
+#[test]
+fn regression1() {
+    init_test_logger();
+
+    let path = tempfile::tempdir().unwrap().keep();
+
+    let (mut circuit1, input_handle1) =
+        Runtime::init_circuit(circuit_config(&path), move |circuit| {
+            let (input_stream, input_handle) = circuit
+                .add_input_map_persistent::<u64, u64, u64, _>(Some("input_map"), |v, u| *v = *u);
+            input_stream.set_persistent_id(Some("input_map"));
+            Ok(input_handle)
+        })
+        .unwrap();
+
+    input_handle1.push(0, crate::operator::Update::Insert(0));
+
+    circuit1.transaction().unwrap();
+
+    // Checkpoint.
+    let checkpoint = circuit1.checkpoint().run().unwrap();
+    circuit1.kill().unwrap();
+
+    // Restart the second circuit from the checkpoint.
+    let mut circuit_config = circuit_config(&path);
+    circuit_config.storage.as_mut().unwrap().init_checkpoint = Some(checkpoint.uuid);
+
+    let (mut circuit2, (_input_handle2, output_handle2)) =
+        Runtime::init_circuit(circuit_config, move |circuit| {
+            let (input_stream, input_handle) = circuit
+                .add_input_map_persistent::<u64, u64, u64, _>(Some("input_map"), |v, u| *v = *u);
+            input_stream.set_persistent_id(Some("input_map"));
+
+            let aggregate = input_stream
+                .aggregate_persistent(Some("aggregate1"), Max)
+                .set_persistent_id(Some("aggregate1"));
+
+            let output_handle = aggregate
+                .accumulate_trace()
+                .apply(|trace| trace.ro_snapshot().consolidate())
+                .output_persistent(Some("output"));
+            Ok((input_handle, output_handle))
+        })
+        .unwrap();
+
+    while circuit2.bootstrap_in_progress() {
+        circuit2.transaction().unwrap();
+    }
+    println!("Replay finished");
+
+    let actual_output = &output_handle2.concat().consolidate();
+
+    // The bug causes the output to be empty.
+    assert_eq!(actual_output, &indexed_zset!(0 => {0 => 1}));
+}
+
+/// Unit test for the replay behavior of Z1Trace and AccumulateZ1Trace operators.
+/// Operators must correctly replay their contents during bootstrap as one atomic transaction.
+
+#[derive(Clone, Copy, Debug)]
+enum ReplayTraceKind {
+    IntegrateTrace,
+    AccumulateTrace,
+}
+
+type IndexedReplayBatch = Vec<Tup2<u64, Tup2<u64, ZWeight>>>;
+
+fn add_replay_trace(
+    stream: &Stream<RootCircuit, OrdIndexedZSet<u64, u64>>,
+    trace_kind: ReplayTraceKind,
+) {
+    match trace_kind {
+        ReplayTraceKind::IntegrateTrace => {
+            stream.integrate_trace();
+        }
+        ReplayTraceKind::AccumulateTrace => {
+            stream.accumulate_trace();
+        }
+    }
+}
+
+fn transactional_bootstrap_circuit1(
+    circuit: &mut RootCircuit,
+    trace_kind: ReplayTraceKind,
+) -> IndexedZSetHandle<u64, u64> {
+    let (input_stream, input_handle) = circuit.add_input_indexed_zset::<u64, u64>();
+    input_stream.set_persistent_id(Some("input"));
+    add_replay_trace(&input_stream, trace_kind);
+    input_handle
+}
+
+fn transactional_bootstrap_circuit2(
+    circuit: &mut RootCircuit,
+    trace_kind: ReplayTraceKind,
+) -> (
+    IndexedZSetHandle<u64, u64>,
+    OutputHandle<SpineSnapshot<OrdIndexedZSet<u64, u64>>>,
+) {
+    let (input_stream, input_handle) = circuit.add_input_indexed_zset::<u64, u64>();
+    input_stream.set_persistent_id(Some("input"));
+    add_replay_trace(&input_stream, trace_kind);
+
+    let output_handle = input_stream.accumulate_output_persistent(Some("output"));
+
+    (input_handle, output_handle)
+}
+
+fn replay_batch_to_indexed_zset(batches: &[IndexedReplayBatch]) -> OrdIndexedZSet<u64, u64> {
+    OrdIndexedZSet::from_tuples(
+        (),
+        batches
+            .iter()
+            .flatten()
+            .map(|Tup2(key, Tup2(value, weight))| Tup2(Tup2(*key, *value), *weight))
+            .collect(),
+    )
+}
+
+fn run_transactional_bootstrap_test(
+    trace_kind: ReplayTraceKind,
+    batches: Vec<IndexedReplayBatch>,
+    expect_multistep_replay: bool,
+) {
+    init_test_logger();
+
+    let path = tempfile::tempdir().unwrap().keep();
+    let expected = replay_batch_to_indexed_zset(&batches);
+
+    let checkpoint = {
+        let (mut circuit, input_handle) =
+            Runtime::init_circuit(circuit_config(&path), move |circuit| {
+                Ok(transactional_bootstrap_circuit1(circuit, trace_kind))
+            })
+            .unwrap();
+
+        for mut batch in batches.clone() {
+            input_handle.append(&mut batch);
+            circuit.transaction().unwrap();
+        }
+
+        let checkpoint = circuit.checkpoint().run().unwrap();
+        circuit.kill().unwrap();
+        checkpoint
+    };
+
+    let mut circuit_config = circuit_config(&path);
+    circuit_config.storage.as_mut().unwrap().init_checkpoint = Some(checkpoint.uuid);
+
+    let (mut circuit, (_input_handle, output_handle)) =
+        Runtime::init_circuit(circuit_config, move |circuit| {
+            Ok(transactional_bootstrap_circuit2(circuit, trace_kind))
+        })
+        .unwrap();
+
+    assert_eq!(output_handle.num_nonempty_mailboxes(), 0);
+
+    if circuit.bootstrap_in_progress() {
+        circuit.start_transaction().unwrap();
+        circuit.start_commit_transaction().unwrap();
+
+        let mut incomplete_commit_steps = 0;
+        loop {
+            let commit_complete = circuit.step().unwrap();
+            if commit_complete {
+                break;
+            }
+
+            incomplete_commit_steps += 1;
+        }
+
+        if expect_multistep_replay {
+            assert!(
+                incomplete_commit_steps > 0,
+                "{trace_kind:?} replay finished in a single commit step despite the splitter chunk size"
+            );
+        }
+    }
+
+    assert!(!circuit.bootstrap_in_progress());
+    assert_eq!(output_handle.concat().consolidate(), expected);
+
+    circuit.kill().unwrap();
+}
+
+fn transactional_bootstrap_cases() -> Vec<(Vec<IndexedReplayBatch>, bool)> {
+    vec![
+        (vec![], false),
+        (vec![vec![Tup2(1, Tup2(10, 1))]], false),
+        (
+            vec![vec![Tup2(1, Tup2(10, 1)), Tup2(1, Tup2(11, 1))]],
+            false,
+        ),
+        (
+            vec![
+                vec![
+                    Tup2(1, Tup2(10, 1)),
+                    Tup2(1, Tup2(11, 1)),
+                    Tup2(2, Tup2(20, 1)),
+                ],
+                vec![
+                    Tup2(1, Tup2(11, -1)),
+                    Tup2(1, Tup2(12, 1)),
+                    Tup2(4, Tup2(40, 2)),
+                    Tup2(5, Tup2(50, 2)),
+                    Tup2(6, Tup2(50, 2)),
+                    Tup2(7, Tup2(50, 2)),
+                    Tup2(8, Tup2(50, 2)),
+                    Tup2(9, Tup2(50, 2)),
+                ],
+            ],
+            true,
+        ),
+    ]
+}
+
+#[test]
+fn test_integrate_trace_bootstrap_is_transactional() {
+    for (batches, expect_multistep_replay) in transactional_bootstrap_cases() {
+        run_transactional_bootstrap_test(
+            ReplayTraceKind::IntegrateTrace,
+            batches,
+            expect_multistep_replay,
+        );
+    }
+}
+
+#[test]
+fn test_accumulate_trace_bootstrap_is_transactional() {
+    for (batches, expect_multistep_replay) in transactional_bootstrap_cases() {
+        run_transactional_bootstrap_test(
+            ReplayTraceKind::AccumulateTrace,
+            batches,
+            expect_multistep_replay,
+        );
+    }
 }

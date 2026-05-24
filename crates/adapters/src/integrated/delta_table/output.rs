@@ -22,6 +22,8 @@ use deltalake::logstore::ObjectStoreRef;
 use deltalake::operations::create::CreateBuilder;
 use deltalake::operations::write::writer::{DeltaWriter, WriterConfig};
 use deltalake::protocol::{DeltaOperation, SaveMode};
+use feldera_adapterlib::catalog::SerCursorFlattened;
+use feldera_adapterlib::transport::OutputBatchType;
 use feldera_types::serde_with_context::serde_config::{
     BinaryFormat, DecimalFormat, UuidFormat, VariantFormat,
 };
@@ -71,6 +73,7 @@ struct DeltaTableWriterInner {
     /// progress is visible to the metrics snapshot without any extra
     /// synchronisation.
     records_written: Arc<AtomicU64>,
+    is_index: bool,
 }
 
 pub struct DeltaTableWriter {
@@ -86,6 +89,7 @@ pub struct DeltaTableWriter {
 const CHUNK_SIZE: usize = 100_000;
 
 impl DeltaTableWriter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         endpoint_id: EndpointId,
         endpoint_name: &str,
@@ -93,6 +97,8 @@ impl DeltaTableWriter {
         key_schema: &Option<Relation>,
         value_schema: &Relation,
         controller: Weak<ControllerInner>,
+        continue_previous_state: bool,
+        is_index: bool,
     ) -> Result<Self, ControllerError> {
         config.validate().map_err(|e| {
             ControllerError::invalid_transport_configuration(endpoint_name, &e.to_string())
@@ -100,7 +106,7 @@ impl DeltaTableWriter {
 
         let threads = config.threads.unwrap_or(1);
 
-        if threads > 1 && key_schema.is_none() {
+        if threads > 1 && !is_index {
             return Err(ControllerError::invalid_transport_configuration(
                 endpoint_name,
                 "Parallel writes (threads > 1) require the view to have a unique key to \
@@ -151,6 +157,7 @@ impl DeltaTableWriter {
             value_schema: value_schema.clone(),
             controller,
             records_written: Arc::new(AtomicU64::new(0)),
+            is_index,
         });
 
         // Register the progress counter with the controller's metrics.
@@ -165,7 +172,7 @@ impl DeltaTableWriter {
         // Panic safety: block_on() panics if called from a tokio async context.
         // new() is called from sync controller code (connect_output), so this is fine.
         let task = TOKIO
-            .block_on(WriterTask::create(inner.clone()))
+            .block_on(WriterTask::create(inner.clone(), continue_previous_state))
             .map_err(|e| {
                 ControllerError::output_transport_error(
                     endpoint_name,
@@ -262,7 +269,10 @@ impl WriterTask {
         }
     }
 
-    async fn create(inner: Arc<DeltaTableWriterInner>) -> AnyResult<Self> {
+    async fn create(
+        inner: Arc<DeltaTableWriterInner>,
+        continue_previous_state: bool,
+    ) -> AnyResult<Self> {
         let mut storage_options = inner.config.object_store_config.clone();
 
         // FIXME: S3 does not support the atomic rename operation required by delta. This is not a problem
@@ -273,17 +283,39 @@ impl WriterTask {
         // and hope for the best.  Without this config option, writes to S3-based delta tables will fail.
         storage_options.insert("AWS_S3_ALLOW_UNSAFE_RENAME".to_string(), "true".to_string());
 
+        // On restart (resuming from a checkpoint), open the existing table
+        // without truncating or error-checking.  This prevents data loss when
+        // the pipeline auto-restarts with `truncate` mode, and avoids spurious
+        // errors with `error_if_exists` mode.
         let save_mode = match inner.config.mode {
             // I expected `SaveMode::Append` to be the correct setting, but
             // that always returns an error.
             DeltaTableWriteMode::Append => SaveMode::Ignore,
-            DeltaTableWriteMode::Truncate => SaveMode::Overwrite,
-            DeltaTableWriteMode::ErrorIfExists => SaveMode::ErrorIfExists,
+            DeltaTableWriteMode::Truncate => {
+                if continue_previous_state {
+                    SaveMode::Ignore
+                } else {
+                    SaveMode::Overwrite
+                }
+            }
+            DeltaTableWriteMode::ErrorIfExists => {
+                if continue_previous_state {
+                    SaveMode::Ignore
+                } else {
+                    SaveMode::ErrorIfExists
+                }
+            }
         };
 
         info!(
-            "delta_table {}: opening or creating delta table '{}' in '{save_mode:?}' mode",
-            &inner.endpoint_name, &inner.config.uri
+            "delta_table {}: {} delta table '{}' in '{save_mode:?}' mode",
+            &inner.endpoint_name,
+            if continue_previous_state {
+                "reopening"
+            } else {
+                "opening or creating"
+            },
+            &inner.config.uri,
         );
 
         let delta_table = {
@@ -588,7 +620,9 @@ async fn stream_encode_and_write(
     let mut num_records = 0;
     let index_name = inner.key_schema.as_ref().map(|s| &s.name);
 
-    if let Some(index_name) = index_name {
+    if let Some(index_name) = index_name
+        && inner.is_index
+    {
         let mut cursor = cursor_builder.build();
 
         while cursor.key_valid() {
@@ -640,7 +674,12 @@ async fn stream_encode_and_write(
         }
     } else {
         let cursor = cursor_builder.build();
-        let mut cursor = CursorWithPolarity::new(Box::new(cursor));
+
+        let mut cursor = if inner.key_schema.is_some() {
+            CursorWithPolarity::new(Box::new(SerCursorFlattened::new(Box::new(cursor))))
+        } else {
+            CursorWithPolarity::new(Box::new(cursor))
+        };
 
         while cursor.key_valid() {
             if !cursor.val_valid() {
@@ -702,7 +741,7 @@ impl OutputConsumer for DeltaTableWriter {
         usize::MAX
     }
 
-    fn batch_start(&mut self, _step: Step) {
+    fn batch_start(&mut self, _step: Step, _batch_type: OutputBatchType) {
         self.pending_actions.clear();
         self.num_rows = 0;
         self.inner.records_written.store(0, Ordering::Relaxed);
@@ -894,7 +933,7 @@ impl OutputEndpoint for DeltaTableWriter {
         todo!()
     }
 
-    fn batch_start(&mut self, _step: Step) -> AnyResult<()> {
+    fn batch_start(&mut self, _step: Step, _batch_type: OutputBatchType) -> AnyResult<()> {
         unreachable!()
     }
 
@@ -949,6 +988,7 @@ mod parallel {
     use crate::static_compile::seroutput::SerBatchImpl;
     use crate::test::data::{DeltaTestKey, DeltaTestStruct, TestStruct};
     use crate::test::list_files_recursive;
+    use feldera_adapterlib::transport::OutputBatchType;
 
     use super::DeltaTableWriter;
 
@@ -1043,6 +1083,7 @@ mod parallel {
             )],
             materialized: false,
             properties: BTreeMap::new(),
+            primary_key: None,
         }
     }
 
@@ -1053,13 +1094,29 @@ mod parallel {
     }
 
     fn make_endpoint(threads: usize, table_uri: &str, indexed: bool) -> DeltaTableWriter {
+        make_endpoint_ex(
+            threads,
+            table_uri,
+            indexed,
+            DeltaTableWriteMode::Truncate,
+            false,
+        )
+    }
+
+    fn make_endpoint_ex(
+        threads: usize,
+        table_uri: &str,
+        indexed: bool,
+        mode: DeltaTableWriteMode,
+        continue_previous_state: bool,
+    ) -> DeltaTableWriter {
         let key_schema = if indexed { Some(key_relation()) } else { None };
         DeltaTableWriter::new(
             EndpointId::default(),
             "test_endpoint",
             &DeltaTableWriterConfig {
                 uri: table_uri.to_string(),
-                mode: DeltaTableWriteMode::Truncate,
+                mode,
                 max_retries: Some(0),
                 threads: Some(threads),
                 object_store_config: Default::default(),
@@ -1068,6 +1125,8 @@ mod parallel {
             &key_schema,
             &value_relation(),
             Weak::new(),
+            continue_previous_state,
+            indexed,
         )
         .expect("failed to create endpoint")
     }
@@ -1114,7 +1173,7 @@ mod parallel {
     }
 
     fn encode_batch(endpoint: &mut DeltaTableWriter, batch: &Arc<dyn SerBatch>) {
-        endpoint.consumer().batch_start(0);
+        endpoint.consumer().batch_start(0, OutputBatchType::Delta);
         endpoint
             .encode(batch.clone().arc_as_batch_reader())
             .unwrap();
@@ -1132,11 +1191,28 @@ mod parallel {
         records
     }
 
+    /// Read only the files referenced by the current delta table snapshot,
+    /// ignoring orphaned parquet files left behind by `SaveMode::Overwrite`.
+    fn read_delta_output(table_uri: &str) -> Vec<OutputRecord> {
+        use dbsp::circuit::tokio::TOKIO;
+        use deltalake::open_table;
+
+        let url = url::Url::from_file_path(table_uri).unwrap();
+        let table = TOKIO.block_on(async move { open_table(url).await.unwrap() });
+        let base = Path::new(table_uri);
+        let mut records = Vec::new();
+        for uri in table.get_file_uris().unwrap() {
+            let mut batch: Vec<OutputRecord> = load_parquet_file(&base.join(&*uri));
+            records.append(&mut batch);
+        }
+        records
+    }
+
     fn make_record(i: usize) -> DeltaTestStruct {
         DeltaTestStruct {
             bigint: i as i64,
             binary: ByteArray::from_vec(vec![i as u8, (i >> 8) as u8]),
-            boolean: i % 2 == 0,
+            boolean: i.is_multiple_of(2),
             date: Date::from_days(i as i32 % 100_000),
             decimal_10_3: SqlDecimal::<10, 3>::new((i as i128 % 1_000_000) * 1000, 3).unwrap(),
             double: F64::new((i as f64).trunc()),
@@ -1144,7 +1220,7 @@ mod parallel {
             int: i as i32,
             smallint: (i % 32000) as i16,
             string: format!("record_{i}"),
-            unused: if i % 3 == 0 {
+            unused: if i.is_multiple_of(3) {
                 None
             } else {
                 Some(format!("unused_{i}"))
@@ -1154,7 +1230,7 @@ mod parallel {
             string_array: vec![format!("arr_{i}")],
             struct1: TestStruct {
                 id: i as u32,
-                b: i % 2 == 0,
+                b: i.is_multiple_of(2),
                 i: Some(i as i64),
                 s: format!("s_{i}"),
             },
@@ -1349,6 +1425,8 @@ mod parallel {
             &key_schema,
             &value_relation(),
             Weak::new(),
+            false,
+            false,
         );
         assert!(
             result.is_err(),
@@ -1453,7 +1531,7 @@ mod parallel {
         // Make directory read-only to trigger write failure.
         std::fs::set_permissions(table_dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        endpoint.consumer().batch_start(0);
+        endpoint.consumer().batch_start(0, OutputBatchType::Delta);
         let result = endpoint.encode(batch.arc_as_batch_reader());
 
         // Restore permissions before asserting (so TempDir cleanup succeeds).
@@ -1487,13 +1565,15 @@ mod parallel {
             &key_schema,
             &value_relation(),
             Weak::new(),
+            false,
+            true,
         )
         .expect("failed to create endpoint");
 
         // Make directory read-only to trigger write failure.
         std::fs::set_permissions(table_dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        endpoint.consumer().batch_start(0);
+        endpoint.consumer().batch_start(0, OutputBatchType::Delta);
         let result = endpoint.encode(batch.arc_as_batch_reader());
 
         // Restore permissions.
@@ -1534,7 +1614,7 @@ mod parallel {
         let mut endpoint = make_endpoint(1, &table_uri, true);
 
         assert_eq!(records_written(&endpoint), 0);
-        endpoint.consumer().batch_start(0);
+        endpoint.consumer().batch_start(0, OutputBatchType::Delta);
         endpoint
             .encode(batch.clone().arc_as_batch_reader())
             .unwrap();
@@ -1552,7 +1632,7 @@ mod parallel {
         let batch = build_insert_batch(&records);
         let mut endpoint = make_endpoint(4, &table_uri, true);
 
-        endpoint.consumer().batch_start(0);
+        endpoint.consumer().batch_start(0, OutputBatchType::Delta);
         endpoint
             .encode(batch.clone().arc_as_batch_reader())
             .unwrap();
@@ -1569,7 +1649,7 @@ mod parallel {
         let batch = build_insert_batch(&[]);
         let mut endpoint = make_endpoint(1, &table_uri, true);
 
-        endpoint.consumer().batch_start(0);
+        endpoint.consumer().batch_start(0, OutputBatchType::Delta);
         endpoint
             .encode(batch.clone().arc_as_batch_reader())
             .unwrap();
@@ -1588,7 +1668,7 @@ mod parallel {
         // Batch 1: 50 records.
         let records1 = make_records(50);
         let batch1 = build_insert_batch(&records1);
-        endpoint.consumer().batch_start(0);
+        endpoint.consumer().batch_start(0, OutputBatchType::Delta);
         endpoint
             .encode(batch1.clone().arc_as_batch_reader())
             .unwrap();
@@ -1599,7 +1679,7 @@ mod parallel {
         // Batch 2: 30 records (ids 50..80).
         let records2: Vec<_> = (50..80).map(make_record).collect();
         let batch2 = build_insert_batch(&records2);
-        endpoint.consumer().batch_start(1);
+        endpoint.consumer().batch_start(1, OutputBatchType::Delta);
         endpoint
             .encode(batch2.clone().arc_as_batch_reader())
             .unwrap();
@@ -1617,14 +1697,14 @@ mod parallel {
         let batch = build_insert_batch(&records);
         let mut endpoint = make_endpoint(1, &table_uri, true);
 
-        endpoint.consumer().batch_start(0);
+        endpoint.consumer().batch_start(0, OutputBatchType::Delta);
         endpoint
             .encode(batch.clone().arc_as_batch_reader())
             .unwrap();
         assert_eq!(records_written(&endpoint), 50);
 
         // batch_start without batch_end resets the counter.
-        endpoint.consumer().batch_start(1);
+        endpoint.consumer().batch_start(1, OutputBatchType::Delta);
         assert_eq!(records_written(&endpoint), 0);
     }
 
@@ -1640,7 +1720,7 @@ mod parallel {
         // Make directory read-only to trigger write failure.
         std::fs::set_permissions(table_dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        endpoint.consumer().batch_start(0);
+        endpoint.consumer().batch_start(0, OutputBatchType::Delta);
         let result = endpoint.encode(batch.arc_as_batch_reader());
 
         // Restore permissions before asserting.
@@ -1674,13 +1754,15 @@ mod parallel {
             &key_schema,
             &value_relation(),
             Weak::new(),
+            false,
+            true,
         )
         .expect("failed to create endpoint");
 
         // Make directory read-only to trigger write failure with retries.
         std::fs::set_permissions(table_dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        endpoint.consumer().batch_start(0);
+        endpoint.consumer().batch_start(0, OutputBatchType::Delta);
         let result = endpoint.encode(batch.arc_as_batch_reader());
 
         // Restore permissions.
@@ -1702,7 +1784,7 @@ mod parallel {
         let batch = build_insert_batch(&records);
         let mut endpoint = make_endpoint(1, &table_uri, true);
 
-        endpoint.consumer().batch_start(0);
+        endpoint.consumer().batch_start(0, OutputBatchType::Delta);
         endpoint
             .encode(batch.clone().arc_as_batch_reader())
             .unwrap();
@@ -1713,5 +1795,102 @@ mod parallel {
         assert_eq!(records_written(&endpoint), 0);
         let output = read_output(&table_uri);
         assert_eq!(output.len(), num);
+    }
+
+    /// Simulate a pipeline restart: drop the first endpoint, create a new one
+    /// on the same table with `continue_previous_state=true`. Data written before the
+    /// restart must survive.
+    #[test]
+    fn test_truncate_preserves_data_across_restart() {
+        let table_dir = TempDir::new().unwrap();
+        let table_uri = table_dir.path().display().to_string();
+
+        // First start: write 50 records.
+        let records = make_records(50);
+        let batch = build_insert_batch(&records);
+        {
+            let mut endpoint =
+                make_endpoint_ex(1, &table_uri, true, DeltaTableWriteMode::Truncate, false);
+            encode_batch(&mut endpoint, &batch);
+        }
+
+        assert_eq!(read_delta_output(&table_uri).len(), 50);
+
+        // Restart: create a new endpoint with continue_previous_state=true.
+        let more_records: Vec<DeltaTestStruct> = (50..80).map(make_record).collect();
+        let batch2 = build_insert_batch(&more_records);
+        {
+            let mut endpoint =
+                make_endpoint_ex(1, &table_uri, true, DeltaTableWriteMode::Truncate, true);
+            encode_batch(&mut endpoint, &batch2);
+        }
+
+        // All 80 records (50 original + 30 new) must be present in the
+        // delta log.  read_delta_output reads through the log, so orphaned
+        // parquet files left by SaveMode::Overwrite are not counted.
+        let output = read_delta_output(&table_uri);
+        assert_eq!(output.len(), 80);
+    }
+
+    /// First-start truncation still clears pre-existing data.
+    #[test]
+    fn test_truncate_clears_data_on_first_start() {
+        let table_dir = TempDir::new().unwrap();
+        let table_uri = table_dir.path().display().to_string();
+
+        // Seed the table via a first endpoint (simulates pre-existing data).
+        let records = make_records(50);
+        let batch = build_insert_batch(&records);
+        {
+            let mut endpoint =
+                make_endpoint_ex(1, &table_uri, true, DeltaTableWriteMode::Truncate, false);
+            encode_batch(&mut endpoint, &batch);
+        }
+        assert_eq!(read_output(&table_uri).len(), 50);
+
+        // New pipeline start (continue_previous_state=false) with truncate: old data is wiped.
+        let new_records: Vec<DeltaTestStruct> = (100..110).map(make_record).collect();
+        let batch2 = build_insert_batch(&new_records);
+        {
+            let mut endpoint =
+                make_endpoint_ex(1, &table_uri, true, DeltaTableWriteMode::Truncate, false);
+            encode_batch(&mut endpoint, &batch2);
+        }
+
+        // Only the 10 new records should be present in the delta table snapshot.
+        // (Orphaned parquet files from the truncated table may still exist on
+        // disk, so we read through the delta log rather than scanning all files.)
+        let output = read_delta_output(&table_uri);
+        assert_eq!(output.len(), 10);
+    }
+
+    /// `error_if_exists` mode must not fail on restart.
+    #[test]
+    fn test_error_if_exists_succeeds_on_restart() {
+        let table_dir = TempDir::new().unwrap();
+        let table_uri = table_dir.path().display().to_string();
+
+        // First start: create table.
+        {
+            let mut endpoint = make_endpoint_ex(
+                1,
+                &table_uri,
+                true,
+                DeltaTableWriteMode::ErrorIfExists,
+                false,
+            );
+            let batch = build_insert_batch(&make_records(10));
+            encode_batch(&mut endpoint, &batch);
+        }
+
+        // Restart: should open the existing table without error.
+        let endpoint = make_endpoint_ex(
+            1,
+            &table_uri,
+            true,
+            DeltaTableWriteMode::ErrorIfExists,
+            true,
+        );
+        drop(endpoint);
     }
 }

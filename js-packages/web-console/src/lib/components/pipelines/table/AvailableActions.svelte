@@ -75,7 +75,9 @@
       .map((p) => p.name)
       .sort()
   const actions = $derived.by(() => {
-    if (selected.length === 0) return []
+    if (selected.length === 0) {
+      return []
+    }
     const supportedByAny = new Set(selected.flatMap(statusActions))
     return availableActions
       .filter((action) => supportedByAny.has(action))
@@ -223,8 +225,8 @@
           : 'You are about to stop ' + pipelines.length.toFixed() + ' pipelines:',
       () => postPipelinesAction('stop'),
       pipelines.length === 1
-        ? 'The pipeline will stop processing inputs and make a checkpoint of its state.'
-        : 'These pipelines will stop processing inputs and make checkpoints of their states.',
+        ? 'The pipeline will stop processing inputs and create a checkpoint of its state.'
+        : 'These pipelines will stop processing inputs and create checkpoints of their states.',
       pipelines.join('\n')
     )()}
   ></DeleteDialog>

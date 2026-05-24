@@ -4,10 +4,19 @@ import time
 from collections import deque
 from datetime import datetime
 from threading import Event
-from typing import Any, Callable, Dict, Generator, List, Mapping, Optional
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Mapping,
+    Optional,
+)
 from uuid import UUID
 
 import pandas
+import pyarrow as pa
 
 from feldera._callback_runner import CallbackRunner
 from feldera._helpers import chunk_dataframe, ensure_dataframe_has_columns
@@ -670,6 +679,33 @@ metrics"""
 
         self.client.resume_pipeline(self.name, wait=wait, timeout_s=timeout_s)
 
+    def advance_clock(self, delta_ms: Optional[int] = None) -> Dict[str, int | str]:
+        """
+        Advance the externally-driven `NOW()` clock and return its new value.
+
+        Requires `dev_tweaks.now_http_driven = True` on this pipeline.
+        Forward-only: `delta_ms` must be non-negative.
+
+        :param delta_ms: Milliseconds to add to `NOW()`.  ``0`` reads the
+            current value without moving the clock; ``None`` (the default)
+            advances by one ``clock_resolution`` (one configured tick).
+            Any non-zero value rounds up to the next ``clock_resolution``
+            boundary, so a sub-resolution delta still moves the clock by
+            one full tick.
+
+        The returned ``now_ms`` is the value the worker will emit on its
+        next pipeline step; queries against materialized views may
+        observe the previous ``NOW()`` until that step completes.  Poll
+        the view if you need read-after-write semantics.
+
+        :return: A dict ``{"now_ms": <int>, "now": <RFC 3339 str>}``.
+
+        :raises FelderaAPIError: If the clock is not in http-driven mode,
+            the body is malformed, or the pipeline is not running.
+        """
+
+        return self.client.advance_clock(self.name, delta_ms)
+
     def start_transaction(self) -> int:
         """
         Start a new transaction.
@@ -938,8 +974,13 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         Executes an ad-hoc SQL query on this pipeline and returns a generator
         that yields the rows of the result as Python dictionaries. For
         ``INSERT`` and ``DELETE`` queries, consider using :meth:`.execute`
-        instead. All floating-point numbers are deserialized as Decimal objects
+        instead. All floating-point numbers are deserialized as ``Decimal``
         to avoid precision loss.
+
+        For new code, prefer :meth:`.query_arrow`: Arrow IPC keeps full
+        SQL type fidelity, lets ``MAP`` keys be non-string values, and
+        returns every column even when two share a name. See
+        https://github.com/feldera/feldera/issues/4219.
 
         Note:
             You can only ``SELECT`` from materialized tables and views.
@@ -958,7 +999,9 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         :raises FelderaAPIError: If the query is invalid.
         """
 
-        return self.client.query_as_json(self.name, query)
+        # Delegate to the non-deprecated internal helper so calls through
+        # `query()` don't surface a DeprecationWarning to user code.
+        return self.client._query_json_stream(self.name, query)
 
     def query_parquet(self, query: str, path: str):
         """
@@ -979,6 +1022,47 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         """
 
         self.client.query_as_parquet(self.name, query, path)
+
+    def query_arrow(self, query: str) -> Generator[pa.RecordBatch, None, None]:
+        """
+        Executes an ad-hoc SQL query on this pipeline and returns a generator
+        that yields the result as PyArrow RecordBatches.
+
+        Note:
+            You can only ``SELECT`` from materialized tables and views.
+
+        :param query: The SQL query to be executed.
+
+        :raises FelderaAPIError: If the pipeline is not in a RUNNING or PAUSED
+            state.
+        :raises FelderaAPIError: If querying a non materialized table or view.
+        :raises FelderaAPIError: If the query is invalid.
+
+        :return: A generator that yields ``pyarrow.RecordBatch`` objects.
+        """
+        return self.client.query_as_arrow(self.name, query)
+
+    def query_arrow_dicts(self, query: str) -> Generator[Mapping[str, Any], None, None]:
+        """
+        Executes an ad-hoc SQL query on this pipeline and returns a generator
+        that yields the result as a sequence of Dictionaries.
+
+        Note:
+            You can only ``SELECT`` from materialized tables and views.
+
+        :param query: The SQL query to be executed.
+
+        :raises FelderaAPIError: If the pipeline is not in a RUNNING or PAUSED
+            state.
+        :raises FelderaAPIError: If querying a non materialized table or view.
+        :raises FelderaAPIError: If the query is invalid.
+
+        :return: A generator that yields ``pyarrow.Mapping`` objects.
+        """
+        batches = self.query_arrow(query)
+        for batch in batches:
+            for row in batch.to_pylist():
+                yield row
 
     def query_tabular(self, query: str) -> Generator[str, None, None]:
         """
@@ -1566,6 +1650,13 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
 
         self.client.rebalance_pipeline(self.name)
 
+    def start_compaction(self):
+        """
+        Initiate immediate compaction of the pipeline's state.
+        """
+
+        self.client.start_compaction_pipeline(self.name)
+
     def generate_completion_token(self, table_name: str, connector_name: str) -> str:
         """
         Returns a completion token that can be passed to :meth:`.Pipeline.completion_token_status` to
@@ -1603,3 +1694,26 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
             CheckpointMetadata.from_dict(chk)
             for chk in self.client.get_checkpoints(self.name)
         ]
+
+    def events(self, *, selector: str = "status") -> List[dict]:
+        """
+        Retrieves all pipeline events (status fields only).
+
+        :param selector: (Optional) Limit the returned fields. Valid values: "all", "status" (default).
+
+        :returns: List of pipeline events.
+        """
+
+        return self.client.get_pipeline_events(self.name, selector=selector)
+
+    def event(self, event_id: str, *, selector: str = "status") -> dict:
+        """
+        Retrieves a specific pipeline event.
+
+        :param event_id: Identifier (UUID) of the event to retrieve, or `latest` for the latest event.
+        :param selector: (Optional) Limit the returned fields. Valid values: "all", "status" (default).
+
+        :returns: Event (fields limited based on selector).
+        """
+
+        return self.client.get_pipeline_event(self.name, event_id, selector=selector)

@@ -7,9 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // Replace worker-timers with thin wrappers over the global timer API so that
 // `vi.useFakeTimers()` can deterministically drive time in the test.
 vi.mock('worker-timers', () => ({
-  setTimeout: (fn: () => void, ms: number) =>
-    globalThis.setTimeout(fn, ms) as unknown as number,
-  clearTimeout: (id: number) => globalThis.clearTimeout(id as unknown as ReturnType<typeof setTimeout>)
+  setTimeout: (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms) as unknown as number,
+  clearTimeout: (id: number) =>
+    globalThis.clearTimeout(id as unknown as ReturnType<typeof setTimeout>)
 }))
 
 import { closedIntervalAction } from './promise'
@@ -111,7 +111,9 @@ describe('closedIntervalAction', () => {
     let calls = 0
     const action = vi.fn(async () => {
       calls++
-      if (calls === 1) await firstDone
+      if (calls === 1) {
+        await firstDone
+      }
     })
 
     const cancel = closedIntervalAction(action, 1000)
@@ -136,7 +138,9 @@ describe('closedIntervalAction', () => {
     let calls = 0
     const action = vi.fn(async () => {
       calls++
-      if (calls === 1) throw new Error('boom')
+      if (calls === 1) {
+        throw new Error('boom')
+      }
     })
 
     const cancel = closedIntervalAction(action, 1000)

@@ -6,19 +6,23 @@
     | 'Changes Stream'
     | 'Profile Visualizer'
     | 'Samply'
+    | 'Health'
     | 'Logs'
 </script>
 
+<!-- svelte-ignore state_referenced_locally -->
 <script lang="ts">
+  import { Switch } from '@skeletonlabs/skeleton-svelte'
   import { useLocalStorage } from '$lib/compositions/localStore.svelte'
+  import { useLayoutSettings } from '$lib/compositions/layout/useLayoutSettings.svelte'
   import PanelAdHocQuery from '$lib/components/pipelines/editor/TabAdHocQuery.svelte'
   import PanelChangeStream from '$lib/components/pipelines/editor/TabChangeStream.svelte'
   import * as TabPerformance from '$lib/components/pipelines/editor/TabPerformance.svelte'
   import PanelPipelineErrors from '$lib/components/pipelines/editor/TabPipelineErrors.svelte'
   import * as TabProfileVisualizer from '$lib/components/pipelines/editor/TabProfileVisualizer.svelte'
   import * as TabSamplyProfile from '$lib/components/pipelines/editor/TabSamplyProfile.svelte'
+  import PanelHealth from '$lib/components/pipelines/editor/TabHealth.svelte'
   import PanelLogs from '$lib/components/pipelines/editor/TabLogs.svelte'
-  import { tuple } from '$lib/functions/common/tuple'
   import type { ExtendedPipeline } from '$lib/services/pipelineManager'
   import type { PipelineMetrics } from '$lib/functions/pipelineMetrics'
   import { count } from '$lib/functions/common/array'
@@ -48,32 +52,77 @@
   } = $props()
 
   const pipelineName = $derived(pipeline.current.name)
+  const layoutSettings = useLayoutSettings()
 
   let tabs = $derived(
     [
-      tuple('Errors' as const, TabControlPipelineErrors, PanelPipelineErrors, false),
-      tuple(TabPerformance.id, TabControlPerformance, TabPerformance.default, false),
-      tuple('Ad-Hoc Queries' as const, TabControlAdhoc, PanelAdHocQuery, false),
-      tuple('Changes Stream' as const, TabControlChangeStream, PanelChangeStream, true),
-      tuple(
-        TabProfileVisualizer.id,
-        TabProfileVisualizer.Label,
-        TabProfileVisualizer.default,
-        true
-      ),
-      tuple('Samply' as const, TabSamplyProfile.Label, TabSamplyProfile.default, false),
-      tuple('Logs' as const, TabLogs, PanelLogs, true)
-    ].filter((tab) => !hiddenTabs.includes(tab[0]))
+      {
+        id: 'Errors' as const,
+        label: TabControlPipelineErrors,
+        panel: PanelPipelineErrors,
+        keepAlive: false,
+        tabBarEnd: TabBarEndCompiler
+      },
+      {
+        id: TabPerformance.id,
+        label: TabControlPerformance,
+        panel: TabPerformance.default,
+        keepAlive: false,
+        tabBarEnd: TabBarEndPipelineInfo
+      },
+      {
+        id: 'Ad-Hoc Queries' as const,
+        label: TabControlAdhoc,
+        panel: PanelAdHocQuery,
+        keepAlive: false,
+        tabBarEnd: TabBarEndPipelineInfo
+      },
+      {
+        id: 'Changes Stream' as const,
+        label: TabControlChangeStream,
+        panel: PanelChangeStream,
+        keepAlive: true,
+        tabBarEnd: TabBarEndPipelineInfo
+      },
+      {
+        id: TabProfileVisualizer.id,
+        label: TabProfileVisualizer.Label,
+        panel: TabProfileVisualizer.default,
+        keepAlive: true,
+        tabBarEnd: TabBarEndPipelineInfo
+      },
+      {
+        id: 'Samply' as const,
+        label: TabSamplyProfile.Label,
+        panel: TabSamplyProfile.default,
+        keepAlive: false,
+        tabBarEnd: TabBarEndPipelineInfo
+      },
+      {
+        id: 'Health' as const,
+        label: TabHealth,
+        panel: PanelHealth,
+        keepAlive: false,
+        tabBarEnd: TabBarEndPipelineInfo
+      },
+      {
+        id: 'Logs' as const,
+        label: TabLogs,
+        panel: PanelLogs,
+        keepAlive: true,
+        tabBarEnd: TabBarEndPipelineInfo
+      }
+    ].filter((tab) => !hiddenTabs.includes(tab.id))
   )
   const currentTabStorage = $derived(
     useLocalStorage<MonitoringTabs>('pipelines/' + pipelineName + '/currentMonitoringTab', 'Errors')
   )
   $effect.pre(() => {
     // Initialize from storage, or reset to first available tab if current is hidden
-    if (!tabs.some((t) => t[0] === currentTab)) {
-      currentTab = tabs.some((t) => t[0] === currentTabStorage.value)
+    if (!tabs.some((t) => t.id === currentTab)) {
+      currentTab = tabs.some((t) => t.id === currentTabStorage.value)
         ? currentTabStorage.value
-        : tabs[0][0]
+        : tabs[0].id
     }
   })
   $effect(() => {
@@ -99,6 +148,21 @@
   )
 
   const connectorsWithErrorsCount = $derived(numConnectorsWithProblems(metrics.current))
+
+  // Updating individual properties in an $effect avoids unnecessary reactive updates within tab components
+  let tabProps = $state({ metrics, pipeline, errors, deleted })
+  $effect(() => {
+    tabProps.metrics = metrics
+  })
+  $effect(() => {
+    tabProps.pipeline = pipeline
+  })
+  $effect(() => {
+    tabProps.errors = errors
+  })
+  $effect(() => {
+    tabProps.deleted = deleted
+  })
 </script>
 
 {#snippet TabControlPerformance()}
@@ -133,28 +197,56 @@
 
 {#snippet TabControlChangeStream()}
   <span class="inline sm:hidden"> Changes </span>
-  <span class="hidden sm:inline"> Changes Stream </span>
+  <span class="hidden sm:inline"> Change Stream </span>
+{/snippet}
+
+{#snippet TabHealth()}
+  <span>Health</span>
 {/snippet}
 
 {#snippet TabLogs()}
   <span>Logs</span>
 {/snippet}
 
-<TabsPanel {tabs} bind:currentTab={currentTab!} tabProps={{ metrics, pipeline, errors, deleted }}>
-  {#snippet tabBarEnd()}
-    {#if currentTab !== 'Errors'}
-      <div class="ml-auto flex">
-        <ClipboardCopyButton
-          value={pipeline.current.id}
-          class="h-8 w-auto! gap-2 preset-tonal-surface px-4"
-        >
-          <span class="text-base font-normal text-surface-950-50"> Pipeline ID </span>
-        </ClipboardCopyButton>
-        <Tooltip placement="top">
-          {pipeline.current.id}
-        </Tooltip>
-        <DownloadSupportBundle {pipelineName} />
-      </div>
-    {/if}
-  {/snippet}
-</TabsPanel>
+{#snippet TabBarEndPipelineInfo()}
+  <div class="ml-auto flex">
+    <ClipboardCopyButton
+      value={pipeline.current.id}
+      class="h-8 w-auto! gap-2 preset-tonal-surface px-4"
+    >
+      <span class="text-base font-normal text-surface-950-50"> Pipeline ID </span>
+    </ClipboardCopyButton>
+    <Tooltip placement="top">
+      {pipeline.current.id}
+    </Tooltip>
+    <DownloadSupportBundle {pipelineName} />
+  </div>
+{/snippet}
+
+{#snippet TabBarEndCompiler()}
+  <div class="ml-auto flex flex-nowrap items-center gap-6 py-1">
+    <label
+      class="flex cursor-pointer items-center gap-2"
+      class:disabled={layoutSettings.verbatimErrors.value}
+    >
+      Hide warnings
+      <input class="checkbox" type="checkbox" bind:checked={layoutSettings.hideWarnings.value} />
+    </label>
+    <label class="flex cursor-pointer items-center gap-2 rounded">
+      Verbatim errors
+      <Switch
+        name="verbatimErrors"
+        checked={layoutSettings.verbatimErrors.value}
+        onCheckedChange={(e) => (layoutSettings.verbatimErrors.value = e.checked)}
+      >
+        <Switch.Control>
+          <Switch.Thumb />
+        </Switch.Control>
+        <Switch.Label />
+        <Switch.HiddenInput />
+      </Switch>
+    </label>
+  </div>
+{/snippet}
+
+<TabsPanel {tabs} bind:currentTab={currentTab!} {tabProps} />

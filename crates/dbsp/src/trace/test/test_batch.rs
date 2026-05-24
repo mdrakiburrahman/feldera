@@ -3,7 +3,8 @@
 //! So far, only methods/traits used in tests have been implemented.
 #![allow(clippy::type_complexity)]
 
-use crate::storage::filter_stats::FilterStats;
+use crate::storage::file::FilterStats;
+use crate::trace::BatchLocation;
 use crate::{
     DBData, DBWeight, NumEntries, Timestamp,
     dynamic::{
@@ -21,6 +22,7 @@ use rand_chacha::ChaChaRng;
 use rkyv::{Archive, Archived, Deserialize, Fallible, Serialize, ser::Serializer};
 use size_of::SizeOf;
 use std::any::TypeId;
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::{self, Debug},
@@ -872,10 +874,11 @@ where
     R: WeightTrait + ?Sized,
     T: Timestamp,
 {
-    fn with_capacity(
+    fn with_capacity_in_location(
         factories: &TestBatchFactories<K, V, T, R>,
         _key_capacity: usize,
         _value_capacity: usize,
+        _location: Option<BatchLocation>,
     ) -> Self {
         Self {
             result: TestBatch::new(factories),
@@ -1287,8 +1290,18 @@ where
     type Batcher = TestBatchBatcher<K, V, T, R>;
     type Builder = TestBatchBuilder<K, V, T, R>;
 
+    fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)> {
+        let min = self.data.keys().next()?.0.as_ref();
+        let max = self.data.keys().next_back()?.0.as_ref();
+        Some((min, max))
+    }
+
     fn negative_weight_count(&self) -> Option<u64> {
         None
+    }
+
+    fn touched_window_count(&self) -> crate::storage::file::TouchedWindowCount {
+        crate::storage::file::TouchedWindowCount::default()
     }
 }
 
@@ -1324,12 +1337,14 @@ where
         }
     }
 
-    fn insert(&mut self, batch: Self::Batch) {
-        self.data = Self::merge(self, &batch, &self.key_filter, &self.value_filter).data;
-    }
-
-    fn insert_arc(&mut self, batch: std::sync::Arc<Self::Batch>) {
-        self.data = Self::merge(self, batch.as_ref(), &self.key_filter, &self.value_filter).data;
+    async fn insert(&mut self, batch: impl Into<Arc<Self::Batch>>) {
+        self.data = Self::merge(
+            self,
+            batch.into().as_ref(),
+            &self.key_filter,
+            &self.value_filter,
+        )
+        .data;
     }
 
     fn clear_dirty_flag(&mut self) {}
@@ -1380,6 +1395,8 @@ where
     ) -> Result<(), crate::Error> {
         todo!()
     }
+
+    fn initiate_compaction(&self) {}
 }
 
 /// Test random sampling methods.

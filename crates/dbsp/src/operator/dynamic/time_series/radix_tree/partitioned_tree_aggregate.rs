@@ -9,7 +9,7 @@ use crate::{
         Scope,
         metadata::{BatchSizeStats, INPUT_BATCHES_STATS, OUTPUT_BATCHES_STATS, OperatorMeta},
         operator_traits::Operator,
-        splitter_output_chunk_size,
+        splitter_output_chunk_size, splitter_output_first_chunk_size,
     },
     dynamic::{ClonableTrait, Data, DataTrait, DynDataTyped, DynPair, Erase},
     operator::{
@@ -253,7 +253,7 @@ where
         V: DataTrait + ?Sized,
         O: PartitionedRadixTreeBatch<TS, Acc, Key = Z::Key>,
     {
-        let stream = self.dyn_shard(&factories.input_factories);
+        //let stream = self.dyn_shard(&factories.input_factories);
 
         self.circuit()
             .region("partitioned_tree_aggregate", move || {
@@ -294,8 +294,8 @@ where
                         StreamingTernaryWrapper::new(PartitionedRadixTreeAggregate::new(
                             factories, aggregator,
                         )),
-                        &stream.dyn_accumulate(&factories.input_factories),
-                        &stream.dyn_accumulate_integrate_trace(&factories.stored_factories),
+                        &self.dyn_shard_accumulate(&factories.input_factories),
+                        &self.dyn_shard_accumulate_integrate_trace(&factories.stored_factories),
                         &feedback.delayed_trace,
                     )
                     .mark_sharded();
@@ -424,7 +424,9 @@ where
 
             self.input_batch_stats.borrow_mut().add_batch(delta.len());
 
-            let key_capacity = min(delta.key_count(), chunk_size + 2);
+            // Limit the initial capacity of the builder in case the chunk size
+            // is bigger than memory (e.g. `usize::MAX`).
+            let key_capacity = min(delta.key_count(), splitter_output_first_chunk_size() + 2);
             let value_capacity = 2 * key_capacity;
             let mut builder =
                 O::Builder::with_capacity(&self.factories.output_factories, key_capacity, value_capacity);
@@ -549,6 +551,8 @@ where
                         let result = builder.done();
                         self.output_batch_stats.borrow_mut().add_batch(result.len());
                         yield (result, false, delta_cursor.position());
+                        let key_capacity = min(delta.key_count(), chunk_size + 2);
+                        let value_capacity = 2 * key_capacity;
                         builder =
                             O::Builder::with_capacity(&self.factories.output_factories, key_capacity, value_capacity);
                         any_values = false;

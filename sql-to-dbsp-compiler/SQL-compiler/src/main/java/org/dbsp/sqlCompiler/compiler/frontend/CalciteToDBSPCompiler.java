@@ -42,6 +42,7 @@ import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.core.Uncollect;
 import org.apache.calcite.rel.core.Window;
+import org.apache.calcite.rel.hint.RelHint;
 import org.apache.calcite.rel.logical.LogicalAggregate;
 import org.apache.calcite.rel.logical.LogicalAsofJoin;
 import org.apache.calcite.rel.logical.LogicalCorrelate;
@@ -74,6 +75,8 @@ import org.apache.calcite.sql.SqlUserDefinedTypeNameSpec;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.util.ImmutableBitSet;
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
+import org.dbsp.sqlCompiler.circuit.annotation.Annotations;
+import org.dbsp.sqlCompiler.circuit.annotation.JoinStrategy;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAsofJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateZeroOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPConstantOperator;
@@ -600,7 +603,8 @@ public class CalciteToDBSPCompiler extends RelVisitor
                     "TIMESTAMP used for TUMBLE function is nullable; this can cause runtime crashes.\n" +
                             "We recommend filtering out null values before applying the TUMBLE function");
         }
-        args[0] = row.deref().field(timestampIndex).unwrapIfNullable("TUMBLE timestamp should never be NULL");
+        args[0] = row.deref().field(timestampIndex)
+                .unwrapIfNullable(node, "TUMBLE timestamp should never be NULL");
         args[1] = interval;
         if (start != null)
             args[2] = start;
@@ -922,7 +926,8 @@ public class CalciteToDBSPCompiler extends RelVisitor
             DBSPExpression flattenField = kv.field(1).deref().field(i).applyCloneIfNeeded();
             // Here we correct from the type produced by the Folder (typeFromAggregate) to the
             // actual expected type aggType (which is the tuple of aggTypes).
-            DBSPExpression cast = flattenField.cast(node, aggTypes[i], DBSPCastExpression.CastType.SqlUnsafe);
+            CalciteObject aggNode = CalciteObject.create(aggregate, aggregate.getAggCallList().get(i));
+            DBSPExpression cast = flattenField.cast(aggNode, aggTypes[i], DBSPCastExpression.CastType.SqlUnsafe);
             flattenFields[aggregate.getGroupCount() + i] = cast;
         }
 
@@ -1518,11 +1523,29 @@ public class CalciteToDBSPCompiler extends RelVisitor
                 TypeCompiler.makeZSet(resultType), operator.outputPort());
     }
 
+    JoinStrategy fromJoinHint(RelHint hint) {
+        JoinStrategy.Strategy strat = JoinStrategy.Strategy.valueOf(Utilities.titleCase(hint.hintName));
+        Utilities.enforce(hint.listOptions.size() == 2);
+        int input = Integer.parseInt(hint.listOptions.get(0));
+        String table = hint.listOptions.get(1);
+        return new JoinStrategy(new SourcePositionRange(hint.pos), strat, input, table);
+    }
+
     private void visitJoin(LogicalJoin join) {
         final CalciteObject conditionNode = CalciteObject.create(join, join.getCondition());
         final IntermediateRel node = CalciteObject.create(join, conditionNode.getPositionRange());
         // The result is the sum of all these operators.
         final List<OutputPort> sumInputs = new ArrayList<>();
+
+        final Annotations strategies = new Annotations();
+        for (var hint: join.getHints()) {
+            // We only consider hints with an empty inherit path.
+            // We assume the other hints were inserted by the optimizer during rewrites
+            if (SqlToRelCompiler.isJoinHint(hint) && hint.inheritPath.isEmpty()) {
+                var strategy = this.fromJoinHint(hint);
+                strategies.add(strategy);
+            }
+        }
 
         JoinRelType joinType = join.getJoinType();
         if (joinType == JoinRelType.ANTI || joinType == JoinRelType.SEMI)
@@ -1678,6 +1701,7 @@ public class CalciteToDBSPCompiler extends RelVisitor
             joinResult = new DBSPStreamJoinOperator(node, TypeCompiler.makeZSet(lr.getType()),
                     makeTuple, left.isMultiset || right.isMultiset,
                     leftNonNullIndex.outputPort(), rightNonNullIndex.outputPort(), false);
+            joinResult.addAnnotations(strategies, DBSPSimpleOperator.class);
             inner = joinResult;
 
             if (joinType == JoinRelType.LEFT && leftPulled == left && !hasFilter) {
@@ -1722,6 +1746,7 @@ public class CalciteToDBSPCompiler extends RelVisitor
                         node, TypeCompiler.makeZSet(makeLeftTuple.getResultType()),
                         makeLeftTuple, left.isMultiset || right.isMultiset,
                         leftDiff.outputPort(), rightDiff.outputPort(), false);
+                lj.addAnnotations(strategies, DBSPSimpleOperator.class);
                 this.addOperator(lj);
                 final DBSPIntegrateOperator integrate = new DBSPIntegrateOperator(node, lj.outputPort());
                 // Additional casts may be needed to fix key field types on the left side
@@ -2329,9 +2354,13 @@ public class CalciteToDBSPCompiler extends RelVisitor
         DBSPTypeTuple resultType;
         if (this.modifyTableTranslation != null) {
             resultType = this.modifyTableTranslation.getResultType();
-            if (sourceType.size() != resultType.size())
-                throw new InternalCompilerError("Expected a tuple with " + resultType.size() +
-                        " values but got " + values, node);
+            if (sourceType.size() != resultType.size()) {
+                this.compiler.reportError(this.modifyTableTranslation.getPosition(),
+                        "Schema error",
+                        "VALUES has " + sourceType.size() + " columns but " + resultType.size() + " are expected");
+                // Ignore value
+                return;
+            }
         } else {
             resultType = sourceType;
         }
@@ -2644,6 +2673,7 @@ public class CalciteToDBSPCompiler extends RelVisitor
             }
         }
 
+        List<Integer> previousPartitionKeys = null;
         for (WindowAggregates ga: toProcess) {
             if (ga.is(RankAggregate.class)) {
                 // Check if we can compile it into a TopK aggregate:
@@ -2667,10 +2697,11 @@ public class CalciteToDBSPCompiler extends RelVisitor
 
             if (lastOperator != input)
                 this.addOperator(lastOperator);
-            lastOperator = ga.implement(input, lastOperator, index == toProcess.size() - 1);
+            lastOperator = ga.implement(input, lastOperator, previousPartitionKeys, index == toProcess.size() - 1);
             shuffle.add(inputRowType.size() + elementIndex);
             elementIndex++;
             index++;
+            previousPartitionKeys = ga.partitionKeys;
         }
 
         shuffle.addAll(later);
@@ -2678,7 +2709,8 @@ public class CalciteToDBSPCompiler extends RelVisitor
         if (topKAggregate != null) {
             if (lastOperator != input)
                 this.addOperator(lastOperator);
-            lastOperator = topKAggregate.aggregate.implementAsTopK(topKAggregate.limit, lastOperator,  true);
+            lastOperator = topKAggregate.aggregate.implementAsTopK(
+                    topKAggregate.limit, lastOperator,  previousPartitionKeys, true);
         }
 
         // Permute the results to put the TopK results in their right place
@@ -3076,6 +3108,7 @@ public class CalciteToDBSPCompiler extends RelVisitor
         return o;
     }
 
+    @Nullable
     DBSPNode compileModifyTable(TableModifyStatement modify) {
         // The type of the data must be extracted from the modified table
         boolean isInsert = modify.insert;
@@ -3086,6 +3119,10 @@ public class CalciteToDBSPCompiler extends RelVisitor
         } else {
             SqlRemove remove = (SqlRemove) modify.parsedStatement.statement();
             targetColumnList = remove.getTargetColumnList();
+        }
+        if (!this.options.ioOptions.testing) {
+            this.compiler.reportWarning(modify.getPosition(), "Statement ignored",
+                    modify.getSqlOperationName() + " has no effect in a pipeline definition");
         }
         CreateTableStatement def = this.tableContents.getTableDefinition(modify.tableName);
         this.modifyTableTranslation = new ModifyTableTranslation(
@@ -3123,9 +3160,11 @@ public class CalciteToDBSPCompiler extends RelVisitor
             throw new UnimplementedException("statement of this form not supported",
                     modify.getCalciteObject());
         }
+        this.modifyTableTranslation = null;
+        if (result == null)
+            return result;
         if (!isInsert)
             result = result.negate();
-        this.modifyTableTranslation = null;
         this.tableContents.addToTable(modify.tableName, result, this.compiler);
         return result;
     }

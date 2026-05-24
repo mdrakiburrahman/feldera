@@ -23,7 +23,7 @@
 //! current thread.  To instead run the circuit in a collection of worker
 //! threads, use [`Runtime::init_circuit`].
 use crate::{
-    Error as DbspError, Position, Runtime,
+    Error as DbspError, Position, Runtime, RuntimeError,
     circuit::{
         cache::{CircuitCache, CircuitStoreMarker},
         fingerprinter::Fingerprinter,
@@ -58,6 +58,8 @@ use dyn_clone::{DynClone, clone_box};
 use feldera_ir::{LirCircuit, LirNodeId};
 use feldera_samply::Span;
 use feldera_storage::{FileCommitter, StoragePath};
+use itertools::Itertools;
+use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned};
 use std::{
     any::{Any, TypeId, type_name_of_val},
@@ -68,13 +70,15 @@ use std::{
     future::Future,
     io::ErrorKind,
     marker::PhantomData,
-    mem::transmute,
+    mem::{take, transmute},
     ops::Deref,
     panic::Location,
     pin::Pin,
     rc::Rc,
     sync::Arc,
+    task::{Context, Poll},
     thread::panicking,
+    time::{Duration, Instant},
 };
 use tokio::{runtime::Runtime as TokioRuntime, task::LocalSet};
 use tracing::debug;
@@ -1015,7 +1019,9 @@ pub trait Node: Any {
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Position>, SchedulerError>> + 'a>>;
 
-    fn import(&mut self) {}
+    fn import<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(async {})
+    }
 
     /// Notify the operator that the circuit is starting a transaction.
     fn start_transaction(&mut self);
@@ -1092,6 +1098,9 @@ pub trait Node: Any {
     /// that the operator that may have previously picked up its state
     /// from a checkpoint must be backfilled from clean state.
     fn clear_state(&mut self) -> Result<(), DbspError>;
+
+    /// Call [`Operator::start_compaction`](super::operator_traits::Operator::start_compaction) on the operator this node encapsulates.
+    fn start_compaction(&mut self);
 
     /// Place operator in the replay mode.
     ///
@@ -1216,7 +1225,7 @@ impl Serialize for GlobalNodeId {
     where
         S: Serializer,
     {
-        let s = self.node_identifier();
+        let s = self.node_identifier().to_string();
         serializer.serialize_str(&s)
     }
 }
@@ -1271,16 +1280,14 @@ impl GlobalNodeId {
     }
 
     /// Generate unique name to use as a node label in a visual graph.
-    pub fn node_identifier(&self) -> String {
-        let mut node_ident = "n".to_string();
-
-        for i in 0..self.path().len() {
-            node_ident.push_str(&self.path()[i].to_string());
-            if i < self.path().len() - 1 {
-                node_ident.push('_');
+    pub fn node_identifier(&self) -> impl Display {
+        struct NodeIdentifier<'a>(&'a GlobalNodeId);
+        impl<'a> Display for NodeIdentifier<'a> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "n{}", self.0.path().iter().format("_"))
             }
         }
-        node_ident
+        NodeIdentifier(self)
     }
 
     /// Returns local node id of `self` or `None` if `self` is the root node.
@@ -1489,10 +1496,20 @@ pub(crate) fn register_replay_stream<C, B>(
     // We currently only support using operators in the top-level circuit
     // as replay sources.
     if TypeId::of::<()>() == TypeId::of::<C::Time>() {
-        circuit.cache_insert(
-            ReplaySource::new(stream.stream_id()),
-            Box::new(replay_stream.clone()),
-        );
+        // If a replay source already exists, don't overwrite it. This normally shouldn't
+        // happen as we should not have more than one integral for each stream. One situation
+        // where this does happen today is for input streams that have an integral without
+        // an accumulator as part of input_upsert, and another integral with an accumulator
+        // created by a downstream join or aggregate. In this case, we want to use the former
+        // for replay, as the latter may have been added in the new version of the program
+        // and may be empty, while the former can have state (conversely, if the input integral
+        // is empty, the downstream integral is guaranteed to be empty too).
+        if !circuit.cache_contains(&ReplaySource::new(stream.stream_id())) {
+            circuit.cache_insert(
+                ReplaySource::new(stream.stream_id()),
+                Box::new(replay_stream.clone()),
+            );
+        }
     }
 }
 
@@ -1675,6 +1692,11 @@ pub trait CircuitBase: 'static {
     /// Returns vector of local node ids in the circuit.
     fn node_ids(&self) -> Vec<NodeId>;
 
+    fn lookup_local_node_by_persistent_id(
+        &self,
+        persistent_id: &str,
+    ) -> Result<GlobalNodeId, DbspError>;
+
     fn import_nodes(&self) -> Vec<NodeId>;
 
     fn clear(&mut self);
@@ -1794,18 +1816,14 @@ pub trait CircuitBase: 'static {
 
     fn check_fixedpoint(&self, scope: Scope) -> bool;
 
-    fn notify_start_transaction(&self) {
-        let _ = self.map_local_nodes_mut(&mut |node| {
-            node.start_transaction();
-            Ok(())
-        });
-    }
-
     /// Return the metadata exchange object associated with the circuit.
     fn metadata_exchange(&self) -> &MetadataExchange;
 
     /// Return the balancer object associated with the circuit.
     fn balancer(&self) -> &Balancer;
+
+    /// Set the auto-rebalancing flag for the circuit.
+    fn set_auto_rebalance(&self, enable: bool) -> Result<(), DbspError>;
 
     /// Set the balancer hint for the operator with the given global node id.
     ///
@@ -1813,16 +1831,25 @@ pub trait CircuitBase: 'static {
     ///
     /// Returns an error if the operator with the given global node id is not found
     /// or if the hint contradicts the current balancer policy.
-    fn set_balancer_hint(
+    fn set_balancer_hint_by_global_id(
         &self,
         global_node_id: &GlobalNodeId,
         hint: BalancerHint,
     ) -> Result<(), DbspError>;
 
+    fn set_balancer_hint(&self, persistent_id: &str, hint: BalancerHint) -> Result<(), DbspError>;
+
     /// Get the current balancer policy for all streams managed by the balancer.
-    fn get_current_balancer_policy(&self) -> BTreeMap<NodeId, PartitioningPolicy>;
+    fn get_current_balancer_policies(&self) -> BTreeMap<NodeId, PartitioningPolicy>;
+
+    fn get_current_balancer_policy(
+        &self,
+        persistent_id: &str,
+    ) -> Result<PartitioningPolicy, DbspError>;
 
     fn rebalance(&self);
+
+    fn start_compaction(&self);
 }
 
 /// The circuit interface.  All DBSP computation takes place within a circuit.
@@ -1956,7 +1983,7 @@ pub trait Circuit: CircuitBase + Clone + WithClock {
     ) -> impl Future<Output = Result<Option<Position>, SchedulerError>>;
 
     /// Evaluate import node to pull inputs from the parent circuit.
-    fn eval_import_node(&self, id: NodeId);
+    fn eval_import_node(&self, id: NodeId) -> impl Future<Output = ()>;
 
     fn flush_node(&self, id: NodeId);
 
@@ -2843,6 +2870,25 @@ where
             node.borrow().fixedpoint(scope)
         })
     }
+
+    fn lookup_local_node_by_persistent_id(
+        &self,
+        persistent_id: &str,
+    ) -> Result<GlobalNodeId, DbspError> {
+        self.nodes
+            .borrow()
+            .iter()
+            .find_map(|node| {
+                if node.borrow().get_label(LABEL_PERSISTENT_OPERATOR_ID) == Some(persistent_id) {
+                    Some(node.borrow().global_id().clone())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                DbspError::Runtime(RuntimeError::UnknownPersistentId(persistent_id.to_string()))
+            })
+    }
 }
 
 /// A circuit.
@@ -3381,6 +3427,14 @@ where
             .collect()
     }
 
+    fn lookup_local_node_by_persistent_id(
+        &self,
+        persistent_id: &str,
+    ) -> Result<GlobalNodeId, DbspError> {
+        self.inner()
+            .lookup_local_node_by_persistent_id(persistent_id)
+    }
+
     fn import_nodes(&self) -> Vec<NodeId> {
         self.inner().import_nodes()
     }
@@ -3420,7 +3474,11 @@ where
         &self.inner().balancer
     }
 
-    fn set_balancer_hint(
+    fn set_auto_rebalance(&self, enable: bool) -> Result<(), DbspError> {
+        self.inner().balancer.set_auto_rebalance(enable)
+    }
+
+    fn set_balancer_hint_by_global_id(
         &self,
         global_node_id: &GlobalNodeId,
         hint: BalancerHint,
@@ -3436,12 +3494,38 @@ where
             .set_hint(global_node_id.local_node_id().unwrap(), hint)
     }
 
-    fn get_current_balancer_policy(&self) -> BTreeMap<NodeId, PartitioningPolicy> {
+    fn set_balancer_hint(&self, persistent_id: &str, hint: BalancerHint) -> Result<(), DbspError> {
+        let global_node_id = self.lookup_local_node_by_persistent_id(persistent_id)?;
+        self.set_balancer_hint_by_global_id(&global_node_id, hint)
+    }
+
+    fn get_current_balancer_policies(&self) -> BTreeMap<NodeId, PartitioningPolicy> {
         self.inner().balancer.get_policy()
+    }
+
+    fn get_current_balancer_policy(
+        &self,
+        persistent_id: &str,
+    ) -> Result<PartitioningPolicy, DbspError> {
+        let global_node_id = self.lookup_local_node_by_persistent_id(persistent_id)?;
+        let local_node_id = global_node_id.local_node_id().unwrap();
+        self.inner()
+            .balancer
+            .get_policy_for_stream(local_node_id)
+            .ok_or_else(|| {
+                DbspError::Balancer(BalancerError::NotRegisteredWithBalancer(local_node_id))
+            })
     }
 
     fn rebalance(&self) {
         self.inner().balancer.rebalance()
+    }
+
+    fn start_compaction(&self) {
+        let _ = self.map_local_nodes_mut(&mut |node| {
+            node.start_compaction();
+            Ok(())
+        });
     }
 }
 
@@ -3636,25 +3720,34 @@ where
             .with_tooltip(|| {
                 let nodes = circuit.nodes.borrow();
                 let node = nodes[id.0].borrow();
-                format!("{} {}", node.name(), node.global_id())
+                format!("{} {}", node.name(), node.global_id().node_identifier())
             });
-        let progress = circuit.nodes.borrow()[id.0].borrow_mut().eval().await?;
+        let (result, duration) = Timed::new(circuit.nodes.borrow()[id.0].borrow_mut().eval()).await;
+        let progress = result?;
         span.record();
 
         circuit.log_scheduler_event(&SchedulerEvent::eval_end(
             circuit.nodes.borrow()[id.0].borrow().as_ref(),
+            duration,
         ));
 
         Ok(progress)
     }
 
     // Justification: the scheduler must not call `eval()` on a node twice.
-    fn eval_import_node(&self, id: NodeId) {
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn eval_import_node(&self, id: NodeId) {
         let circuit = self.inner();
         debug_assert!(id.0 < circuit.nodes.borrow().len());
         debug_assert!(circuit.import_nodes().contains(&id));
 
-        circuit.nodes.borrow()[id.0].borrow_mut().import();
+        // `circuit.nodes.borrow()` is safe across the await point because the
+        // scheduler only borrows `circuit.nodes` during a step and never
+        // borrows it mutably.
+        //
+        // `circuit.nodes.borrow()[id.0].borrow_mut()` is safe across the await
+        // point because the scheduler never evaluates a node reentrantly.
+        circuit.nodes.borrow()[id.0].borrow_mut().import().await;
     }
 
     fn flush_node(&self, id: NodeId) {
@@ -4538,15 +4631,22 @@ where
         })
     }
 
-    fn import(&mut self) {
-        match StreamValue::take(self.parent_stream.val()) {
-            None => self
-                .operator
-                .import(StreamValue::peek(&self.parent_stream.get())),
-            Some(val) => self.operator.import_owned(val),
-        }
+    // It is safe to hold `self.parent_stream.get()` across the await point
+    // because the operator is not evaluated reentrantly.
+    #[allow(clippy::await_holding_refcell_ref)]
+    fn import<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(async {
+            match StreamValue::take(self.parent_stream.val()) {
+                None => {
+                    self.operator
+                        .import(StreamValue::peek(&self.parent_stream.get()))
+                        .await
+                }
+                Some(val) => self.operator.import_owned(val).await,
+            }
 
-        StreamValue::consume_token(self.parent_stream.val());
+            StreamValue::consume_token(self.parent_stream.val());
+        })
     }
 
     fn start_transaction(&mut self) {
@@ -4592,6 +4692,10 @@ where
 
     fn restore(&mut self, base: &StoragePath) -> Result<(), DbspError> {
         self.operator.restore(base, self.persistent_id().as_deref())
+    }
+
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -4739,6 +4843,10 @@ where
 
     fn restore(&mut self, base: &StoragePath) -> Result<(), DbspError> {
         self.operator.restore(base, self.persistent_id().as_deref())
+    }
+
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -4902,6 +5010,10 @@ where
         self.operator.restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -5054,6 +5166,10 @@ where
 
     fn restore(&mut self, base: &StoragePath) -> Result<(), DbspError> {
         self.operator.restore(base, self.persistent_id().as_deref())
+    }
+
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -5267,6 +5383,10 @@ where
         self.operator.restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -5452,6 +5572,10 @@ where
 
     fn restore(&mut self, base: &StoragePath) -> Result<(), DbspError> {
         self.operator.restore(base, self.persistent_id().as_deref())
+    }
+
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -5665,6 +5789,10 @@ where
         self.operator.restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -5848,6 +5976,10 @@ where
 
     fn restore(&mut self, base: &StoragePath) -> Result<(), DbspError> {
         self.operator.restore(base, self.persistent_id().as_deref())
+    }
+
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -6056,6 +6188,10 @@ where
         self.operator.restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -6247,6 +6383,10 @@ where
         self.operator.restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -6428,6 +6568,10 @@ where
             .restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.borrow_mut().start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.borrow_mut().clear_state()
     }
@@ -6549,11 +6693,11 @@ where
     }
 
     fn flush(&mut self) {
-        self.operator.borrow_mut().flush();
+        self.operator.borrow_mut().flush_input();
     }
 
     fn is_flush_complete(&self) -> bool {
-        self.operator.borrow().is_flush_complete()
+        self.operator.borrow().is_flush_input_complete()
     }
 
     // Don't call `clock_start`/`clock_end` on the operator.  `FeedbackOutputNode`
@@ -6592,6 +6736,8 @@ where
         // See comment in `commit`.
         Ok(())
     }
+
+    fn start_compaction(&mut self) {}
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
         Ok(())
@@ -6765,12 +6911,12 @@ where
     fn eval<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Position>, SchedulerError>> + 'a>> {
-        // We may want to make the executor responsible for evaluating import nodes
-        // if there is a need for customizing this behavior.
-        for node_id in self.circuit.import_nodes() {
-            self.circuit.eval_import_node(node_id)
-        }
         Box::pin(async {
+            // We may want to make the executor responsible for evaluating import nodes
+            // if there is a need for customizing this behavior.
+            for node_id in self.circuit.import_nodes() {
+                self.circuit.eval_import_node(node_id).await;
+            }
             self.executor.transaction(&self.circuit).await?;
             Ok(None)
         })
@@ -6819,6 +6965,10 @@ where
 
     fn restore(&mut self, _base: &StoragePath) -> Result<(), DbspError> {
         Ok(())
+    }
+
+    fn start_compaction(&mut self) {
+        self.circuit.start_compaction();
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -7046,6 +7196,19 @@ impl CircuitHandle {
 
         // debug!("CircuitHandle::restore: restoring from checkpoint {}", base);
 
+        // In persistent mode, refuse to silently treat a vanished state
+        // file as backfill. dependencies.json records every state file at
+        // commit time; if any are gone, the corruption is structural and
+        // operators need to see it. A missing backend in persistent mode is
+        // an invariant violation, surface it rather than skipping verify.
+        if Runtime::mode() == Mode::Persistent {
+            let backend = Runtime::storage_backend()?;
+            crate::circuit::checkpointer::Checkpointer::verify_checkpoint_intact(
+                backend.as_ref(),
+                base,
+            )?;
+        }
+
         // Initialize `need_backfill` to operators without a checkpoint.
         // Fail if there are any errors other than NotFound.
         // By the end of this, `need_backfill` will contain all new integrals and output
@@ -7125,11 +7288,10 @@ impl CircuitHandle {
                 .collect::<Vec<NodeId>>()
         );
 
+        let replay_nodes = replay_sources.keys().cloned().collect::<BTreeSet<_>>();
+
         assert!(
-            replay_sources
-                .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>()
+            replay_nodes
                 .intersection(&need_backfill)
                 .collect::<Vec<_>>()
                 .is_empty()
@@ -7138,13 +7300,13 @@ impl CircuitHandle {
         // Nodes that will be backfilled from upstream nodes, including need_backfill nodes
         // and their transitive ancestors.
         let nodes_to_backfill = participate_in_backfill
-            .difference(&replay_sources.keys().cloned().collect::<BTreeSet<_>>())
+            .difference(&replay_nodes)
             .cloned()
             .collect::<BTreeSet<_>>();
 
         if !participate_in_backfill.is_empty() {
             // Configure all `replay_nodes` to run in replay mode.
-            for node_id in replay_sources.keys() {
+            for node_id in replay_nodes.iter() {
                 self.circuit
                     .map_local_node_mut(*node_id, &mut |node| node.start_replay())?;
             }
@@ -7174,7 +7336,11 @@ impl CircuitHandle {
             //             } else {
             //                 None
             //             };
-            //             Some(crate::utils::DotNodeAttributes::new().with_color(color))
+            //             Some(
+            //                 crate::utils::DotNodeAttributes::new()
+            //                     .with_color(color)
+            //                     .with_label(&format!("{}: {}", node.global_id(), node.name())),
+            //             )
             //         },
             //         |edge| {
             //             let style = if edge.is_dependency() {
@@ -7453,10 +7619,15 @@ impl CircuitHandle {
             return true;
         };
 
-        replay_info.replay_sources.keys().all(|node_id| {
+        // Bootstrapping is finished when all replay sources have completed their replay and the
+        // transaction has been committed.
+
+        let all_complete = replay_info.replay_sources.keys().all(|node_id| {
             self.circuit
                 .map_local_node_mut(*node_id, &mut |node| node.is_replay_complete())
-        })
+        });
+
+        all_complete && self.is_commit_complete()
     }
 
     /// Finalize the replay phase of the circuit.
@@ -7548,24 +7719,94 @@ impl CircuitHandle {
         (&self.circuit as &dyn CircuitBase).to_lir()
     }
 
-    pub fn set_balancer_hint(
+    pub fn set_auto_rebalance(&self, enable: bool) -> Result<(), DbspError> {
+        self.circuit.set_auto_rebalance(enable)
+    }
+
+    pub fn set_balancer_hint_by_global_id(
         &self,
         global_node_id: &GlobalNodeId,
         hint: BalancerHint,
     ) -> Result<(), DbspError> {
-        self.circuit.set_balancer_hint(global_node_id, hint)
+        self.circuit
+            .set_balancer_hint_by_global_id(global_node_id, hint)
     }
 
-    pub fn get_current_balancer_policy(&self) -> BTreeMap<GlobalNodeId, PartitioningPolicy> {
+    pub fn set_balancer_hint(
+        &self,
+        persistent_id: &str,
+        hint: BalancerHint,
+    ) -> Result<(), DbspError> {
+        self.circuit.set_balancer_hint(persistent_id, hint)
+    }
+
+    pub fn get_current_balancer_policies(&self) -> BTreeMap<GlobalNodeId, PartitioningPolicy> {
         self.circuit
-            .get_current_balancer_policy()
+            .get_current_balancer_policies()
             .into_iter()
             .map(|(node_id, policy)| (GlobalNodeId::root().child(node_id), policy))
             .collect()
     }
 
+    pub fn get_current_balancer_policy(
+        &self,
+        persistent_id: &str,
+    ) -> Result<PartitioningPolicy, DbspError> {
+        self.circuit.get_current_balancer_policy(persistent_id)
+    }
+
     pub fn rebalance(&self) {
         self.circuit.rebalance()
+    }
+
+    pub fn start_compaction(&self) {
+        self.circuit.start_compaction()
+    }
+}
+
+pin_project! {
+    /// An async task that measures its runtime.
+    ///
+    /// This uses the same wrapper technique as [tokio_metrics::Instrumented] or
+    /// [tracing::Instrument]: by implementing [Future] manually, it wraps each
+    /// poll with elapsed time measurement.  When the future eventually
+    /// completes, it outputs the wrapped future's output value plus the total
+    /// elapsed time.
+    ///
+    /// [tokio_metrics::Instrumented]: https://docs.rs/tokio-metrics/latest/tokio_metrics/struct.Instrumented.html
+    /// [tracing::Instrument]: https://docs.rs/tracing/latest/tracing/trait.Instrument.html
+    #[derive(Debug)]
+    pub struct Timed<T> {
+        // The task being instrumented
+        #[pin]
+        task: T,
+
+        // Time spent running this task.
+        elapsed: Duration,
+    }
+}
+
+impl<T> Timed<T> {
+    fn new(task: T) -> Self {
+        Self {
+            task,
+            elapsed: Duration::ZERO,
+        }
+    }
+}
+
+impl<T> Future for Timed<T>
+where
+    T: Future,
+{
+    type Output = (T::Output, Duration);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let start = Instant::now();
+        let ret = this.task.poll(cx);
+        *this.elapsed += start.elapsed();
+        ret.map(|value| (value, take(&mut *this.elapsed)))
     }
 }
 

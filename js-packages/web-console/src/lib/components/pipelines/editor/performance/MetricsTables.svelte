@@ -1,12 +1,12 @@
 <script lang="ts">
   import { SegmentedControl } from '@skeletonlabs/skeleton-svelte'
-  import { format } from 'd3-format'
   import type { HTMLAttributes } from 'svelte/elements'
   import Popover from '$lib/components/common/Popover.svelte'
   import Tooltip from '$lib/components/common/Tooltip.svelte'
   import ClipboardCopyButton from '$lib/components/other/ClipboardCopyButton.svelte'
   import { count } from '$lib/functions/common/array'
   import { humanSize } from '$lib/functions/common/string'
+  import { formatQty } from '$lib/functions/format'
   import type {
     AggregatedInputEndpointMetrics,
     AggregatedMetrics,
@@ -16,8 +16,6 @@
   import type { InputEndpointMetrics, OutputEndpointMetrics } from '$lib/services/manager'
   import type { Snippet } from '$lib/types/svelte'
   import type { ConnectorErrorFilter } from './ConnectorErrors.svelte'
-
-  const formatQty = (v: number) => format(',.0f')(v)
 
   let {
     metrics,
@@ -150,7 +148,7 @@
   {:else if hasErrors}
     <span
       data-testid="btn-icon-input-errors"
-      class="fd fd-circle-alert text-[16px] text-error-500"
+      class="fd fd-circle-alert cursor-pointer text-[16px] text-error-500"
       {...gotoErrorsBtnProps}
     ></span>
     <Tooltip placement="top"
@@ -211,7 +209,9 @@
   {#if hasErrors}
     <span
       data-testid="btn-icon-output-errors"
-      class="fd {hasFatalError ? 'fd-circle-x' : 'fd-circle-alert'} text-[16px] text-error-500"
+      class="fd {hasFatalError
+        ? 'fd-circle-x'
+        : 'fd-circle-alert'} cursor-pointer text-[16px] text-error-500"
       {...onErrorClick
         ? {
             onclick: (e) => {
@@ -431,7 +431,7 @@
         )}
       </div>
     </th>
-    <th class="pb-0! text-center! font-normal" colspan="2">Transmitted</th>
+    <th class="pb-0! text-center! font-normal" colspan="3">Transmitted</th>
     <th class="pb-0! text-center! font-normal" colspan="2">Buffered</th>
     <th class="pb-0! text-center! font-normal" colspan="2">Queued</th>
     <th class="font-normal 2xl:text-nowrap" rowspan="2">Encode errors</th>
@@ -439,6 +439,7 @@
   </tr>
   <tr>
     <th class="pt-0! !text-end font-normal">records</th>
+    <th class="pt-0! !text-end font-normal">in batch</th>
     <th class="pt-0! !text-end font-normal">bytes</th>
     <th class="pt-0! !text-end font-normal">records</th>
     <th class="pt-0! !text-end font-normal">batches</th>
@@ -455,6 +456,11 @@
 )}
   <td class="text-end font-dm-mono text-nowrap"
     ><span class={ioActive ? 'text-success-600-400' : ''}>{formatQty(m.transmitted_records)}</span
+    ></td
+  >
+  <td class="text-end font-dm-mono text-nowrap"
+    ><span class={ioActive ? 'text-success-600-400' : ''}
+      >{m.batch_records_written != null ? formatQty(m.batch_records_written) : '—'}</span
     ></td
   >
   <td class="text-end font-dm-mono text-nowrap"
@@ -496,7 +502,9 @@
 {/snippet}
 
 {#snippet tableMultiConnectorCell(data: AggregatedInputEndpointMetrics, isExpanded: boolean)}
-  {@const runningCount = data.connectors.filter((c) => c.paused === false).length}
+  {@const runningCount = data.connectors.filter(
+    (c) => c.paused === false && c.metrics.end_of_input === false
+  ).length}
   {@const anyErrors = data.connectors.some(inputHasErrors)}
   {@const anyFatalError = data.connectors.some((c) => c.fatal_error != null)}
   {@const anyBarrier = data.connectors.some((c) => c.barrier === true)}

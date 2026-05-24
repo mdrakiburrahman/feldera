@@ -1,4 +1,5 @@
-use crate::storage::filter_stats::FilterStats;
+use crate::storage::file::{FilterStats, TouchedWindowCount};
+use crate::trace::BatchLocation;
 use crate::trace::ord::merge_batcher::MergeBatcher;
 use crate::{
     DBData, DBWeight, NumEntries, Timestamp,
@@ -158,6 +159,7 @@ where
     /// Where all the dataz is.
     pub layer: VecKeyBatchLayer<K, T, R, O>,
     factories: VecKeyBatchFactories<K, T, R>,
+    touched_window_count: TouchedWindowCount,
 }
 
 impl<K, T, R, O> SizeOf for VecKeyBatch<K, T, R, O>
@@ -243,6 +245,7 @@ where
         Self {
             layer: self.layer.clone(),
             factories: self.factories.clone(),
+            touched_window_count: self.touched_window_count,
         }
     }
 }
@@ -334,7 +337,6 @@ where
 
     fn sample_keys<RG>(&self, rng: &mut RG, sample_size: usize, sample: &mut DynVec<Self::Key>)
     where
-        Self::Time: PartialEq<()>,
         RG: Rng,
     {
         self.layer.sample_keys(rng, sample_size, sample);
@@ -355,8 +357,16 @@ where
         unimplemented!()
     }
 
+    fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)> {
+        Some((self.layer.keys.first()?, self.layer.keys.last()?))
+    }
+
     fn negative_weight_count(&self) -> Option<u64> {
         None
+    }
+
+    fn touched_window_count(&self) -> TouchedWindowCount {
+        self.touched_window_count
     }
 }
 
@@ -595,10 +605,11 @@ where
     R: WeightTrait + ?Sized,
     O: OrdOffset,
 {
-    fn with_capacity(
+    fn with_capacity_in_location(
         factories: &VecKeyBatchFactories<K, T, R>,
         key_capacity: usize,
         value_capacity: usize,
+        _location: Option<BatchLocation>,
     ) -> Self {
         let mut keys = factories.layer_factories.keys.default_box();
         keys.reserve_exact(key_capacity);
@@ -664,6 +675,7 @@ where
                 ),
             ),
             factories: self.factories,
+            touched_window_count: TouchedWindowCount::default(),
         }
     }
 

@@ -287,7 +287,8 @@ pub trait Operator: 'static {
     fn flush(&mut self) {}
 
     /// Invoked after `flush` after each `eval` call to check if all outputs
-    /// have been produced.
+    /// have been produced.  Because it is invoked only after calling `eval`,
+    /// every operator must produce at least one output.
     ///
     /// Once this method returns `true`, its downstream operators can be flushed.
     fn is_flush_complete(&self) -> bool {
@@ -304,6 +305,11 @@ pub trait Operator: 'static {
     fn flush_progress(&self) -> Option<Position> {
         None
     }
+
+    /// Start compaction of the operator's state.
+    ///
+    /// Only defined for operators that support compaction. No-op for all other operators.
+    fn start_compaction(&mut self) {}
 }
 
 /// A source operator that injects data from the outside world or from the
@@ -573,6 +579,22 @@ pub trait StrictUnaryOperator<I, O>: StrictOperator<O> {
     fn input_preference(&self) -> OwnershipPreference {
         OwnershipPreference::INDIFFERENT
     }
+
+    /// Flush the input half of the strict operator.
+    ///
+    /// The strict operator appears in the circuit twice: as a source
+    /// operator that outputs the delayed value at the start of the step,
+    /// and as a sink operator that consumes the new value.
+    ///
+    /// These operators are flushed separately. The `Operator::flush` and
+    /// `Operator::is_flush_complete` methods are invoked on the output half.
+    ///
+    /// The `flush_input` and `is_flush_input_complete` methods are invoked
+    /// on the input half.
+    fn flush_input(&mut self);
+
+    /// See [`StrictUnaryOperator::flush_input`] for more details.
+    fn is_flush_input_complete(&self) -> bool;
 }
 
 /// An import operator makes a stream from the parent circuit
@@ -591,10 +613,10 @@ pub trait ImportOperator<I, O>: Operator {
     ///
     /// Either `import` or [`Self::import_owned`] is invoked once per
     /// nested clock epoch, right after `clock_start(0)`.
-    fn import(&mut self, val: &I);
+    async fn import(&mut self, val: &I);
 
     /// Consumes a value from the parent stream by value.
-    fn import_owned(&mut self, val: I);
+    async fn import_owned(&mut self, val: I);
 
     /// Invoked once per nested clock cycle to write a value to
     /// the output stream.

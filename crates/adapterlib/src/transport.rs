@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use dyn_clone::DynClone;
 use feldera_types::adapter_stats::ConnectorHealth;
 use feldera_types::config::FtModel;
+use feldera_types::coordination::Completion;
 use feldera_types::program_schema::Relation;
 use rmpv::{Value as RmpValue, ext::Error as RmpDecodeError};
 use serde::Deserialize;
@@ -766,6 +767,35 @@ pub trait InputConsumer: Send + Sync + DynClone {
     /// so connectors that have no custom metrics need not override it.
     fn set_custom_metrics(&self, _metrics: Arc<dyn ConnectorMetrics>) {}
 
+    /// Returns a watch receiver that fires each time pipeline step processing
+    /// completes.  The value is the count of fully-processed steps
+    /// (`total_completed_steps`): a record ingested in step `n` is done when
+    /// the value exceeds `n`.
+    ///
+    /// Input adapters can use this to defer acknowledgment (e.g. a CDC
+    /// connector holding a replication slot) until their data has been
+    /// processed by the circuit and all output connectors.
+    ///
+    /// Returns `None` if the consumer does not support completion tracking.
+    fn completion_watcher(&self) -> Option<tokio::sync::watch::Receiver<Completion>>;
+
+    /// Returns a watch receiver that fires each time a durable checkpoint
+    /// completes.  The value is the count of checkpointed steps: a record
+    /// ingested in step `n` is durably stored when the value exceeds `n`.
+    ///
+    /// Input adapters that require at-least-once delivery stronger than step
+    /// completion (e.g. a CDC connector that must not advance its replication
+    /// slot past the last checkpoint) can wait on this rather than on
+    /// [`completion_watcher`][Self::completion_watcher].
+    ///
+    /// Returns `Some` only when fault tolerance is enabled for the pipeline
+    /// (which implies storage is configured and checkpoints are scheduled).
+    /// Returns `None` otherwise, in which case the connector should fall back
+    /// to [`completion_watcher`][Self::completion_watcher].
+    fn checkpoint_watcher(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+
     /// Endpoint failed.
     ///
     /// Reports that the endpoint failed and that it will not queue any more
@@ -963,6 +993,14 @@ pub trait CommandHandler: Send + Sync {
     fn command(&self, command: serde_json::Value) -> AnyResult<serde_json::Value>;
 }
 
+/// Distinguishes a full-materialized-view snapshot from an incremental delta
+/// when pushed to an output connector.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum OutputBatchType {
+    Delta,
+    Snapshot,
+}
+
 /// A configured output transport endpoint.
 ///
 /// Output endpoints come in two flavors:
@@ -1012,7 +1050,7 @@ pub trait OutputEndpoint: Send {
     ///
     /// 2. The output batch must not be made visible to downstream readers
     ///    before the next call to `batch_end`.
-    fn batch_start(&mut self, _step: Step) -> AnyResult<()> {
+    fn batch_start(&mut self, _step: Step, _batch_type: OutputBatchType) -> AnyResult<()> {
         Ok(())
     }
 

@@ -5,6 +5,7 @@ use super::CircuitConfig;
 use super::dbsp_handle::{Layout, Mode};
 use crate::SchedulerError;
 use crate::circuit::checkpointer::Checkpointer;
+use crate::circuit::dbsp_handle::StepSize;
 use crate::error::Error as DbspError;
 use crate::operator::communication::Exchange;
 use crate::storage::backend::StorageBackend;
@@ -23,6 +24,7 @@ use core_affinity::{CoreId, get_core_ids};
 use crossbeam::sync::{Parker, Unparker};
 use enum_map::{Enum, EnumMap, enum_map};
 use feldera_buffer_cache::ThreadType;
+use feldera_samply::LongSpanBuilder;
 use feldera_storage::fbuf::FBuf;
 use feldera_storage::fbuf::slab::{FBufSlabs, FBufSlabsStats, set_thread_slab_pool};
 use feldera_types::config::{DevTweaks, StorageCompression, StorageConfig, StorageOptions};
@@ -35,7 +37,8 @@ use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::convert::identity;
 use std::iter::repeat;
-use std::ops::Range;
+use std::net::TcpListener;
+use std::ops::{Index, Range};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize};
 use std::sync::{LazyLock, Mutex};
@@ -58,14 +61,14 @@ use std::{
 use tokio::runtime::Builder as TokioBuilder;
 use tokio::runtime::Runtime as TokioRuntime;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use typedmap::TypedDashMap;
 
-/// The number of tuples a stateful operator outputs per step during replay.
-pub const DEFAULT_REPLAY_STEP_SIZE: usize = 10000;
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum Error {
+    /// Specified persistent id is not found in the circuit.
+    UnknownPersistentId(String),
     /// One of the worker threads terminated unexpectedly.
     WorkerPanic {
         // Detailed panic information from all threads that
@@ -82,6 +85,7 @@ pub enum Error {
 impl DetailedError for Error {
     fn error_code(&self) -> Cow<'static, str> {
         match self {
+            Self::UnknownPersistentId(_) => Cow::from("UnknownPersistentId"),
             Self::WorkerPanic { .. } => Cow::from("WorkerPanic"),
             Self::Terminated => Cow::from("Terminated"),
             Self::IncompatibleStorage => Cow::from("IncompatibleStorage"),
@@ -93,6 +97,9 @@ impl DetailedError for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
         match self {
+            Self::UnknownPersistentId(persistent_id) => {
+                write!(f, "Unknown persistent node id: {persistent_id}")
+            }
             Self::WorkerPanic { panic_info } => {
                 writeln!(f, "One or more worker threads terminated unexpectedly")?;
 
@@ -259,6 +266,7 @@ struct RuntimeStorage {
 struct RuntimeInner {
     layout: Layout,
     mode: Mode,
+    step_size: StepSize,
     dev_tweaks: DevTweaks,
 
     /// User-configured process memory limit.
@@ -280,6 +288,7 @@ struct RuntimeInner {
     storage: Option<RuntimeStorage>,
     store: LocalStore,
     kill_signal: AtomicBool,
+    cancellation_token: CancellationToken,
     aux_threads: Mutex<Vec<(JoinHandle<()>, Unparker)>>,
     buffer_caches: Vec<EnumMap<ThreadType, Arc<BufferCache>>>,
 
@@ -290,13 +299,22 @@ struct RuntimeInner {
     pin_cpus_bg: Vec<CoreId>,
     fbuf_slab_allocators: Vec<EnumMap<ThreadType, Arc<FBufSlabs>>>,
     worker_sequence_numbers: Vec<AtomicUsize>,
-    // Panic info collected from failed worker threads.
+    /// Panic info collected from failed worker threads.
     panic_info: Vec<EnumMap<ThreadType, RwLock<Option<WorkerPanicInfo>>>>,
     panicked: AtomicBool,
-    replay_step_size: AtomicUsize,
 
     /// Tokio runtime that runs async merger tasks (see `AsyncMerger`).
     tokio_merger_runtime: Mutex<Option<TokioRuntime>>,
+
+    /// Optional socket for exchange to listen on.
+    ///
+    /// When exchange initializes, it takes this socket.
+    ///
+    /// Passing in a socket allows the client to let the kernel pick a port
+    /// number by binding to port 0.  Port numbers need to be known for all the
+    /// hosts before we start the circuit, so without this feature we couldn't
+    /// be sure that we'd have a set of available ports.
+    exchange_listener: Mutex<Option<TcpListener>>,
 }
 
 impl Drop for RuntimeInner {
@@ -471,6 +489,7 @@ impl RuntimeInner {
             pin_cpus_bg,
             layout: config.layout,
             mode: config.mode,
+            step_size: config.step_size,
             dev_tweaks: config.dev_tweaks,
             max_rss: config.max_rss_bytes,
             process_rss: AtomicU64::new(process_rss_bytes().unwrap_or_default()),
@@ -480,6 +499,7 @@ impl RuntimeInner {
             storage,
             store: TypedDashMap::new(),
             kill_signal: AtomicBool::new(false),
+            cancellation_token: CancellationToken::new(),
             aux_threads: Mutex::new(Vec::new()),
             buffer_caches,
             fbuf_slab_allocators,
@@ -488,8 +508,8 @@ impl RuntimeInner {
                 .map(|_| EnumMap::from_fn(|_| RwLock::new(None)))
                 .collect(),
             panicked: AtomicBool::new(false),
-            replay_step_size: AtomicUsize::new(DEFAULT_REPLAY_STEP_SIZE),
             tokio_merger_runtime: Mutex::new(None),
+            exchange_listener: Mutex::new(config.exchange_listener),
         })
     }
 
@@ -653,7 +673,10 @@ impl Runtime {
     where
         F: FnOnce(Parker) + Clone + Send + 'static,
     {
-        let config: CircuitConfig = config.into();
+        let mut config: CircuitConfig = config.into();
+        if config.step_size == StepSize::FullSteps {
+            config.dev_tweaks.splitter_chunk_size_records = Some(u64::MAX);
+        }
 
         let workers = config.layout.local_workers();
         let num_merger_threads = config.num_merger_threads();
@@ -700,6 +723,7 @@ impl Runtime {
         runtime.spawn_aux_thread("rss-monitor", Parker::new(), |parker| {
             let runtime = Runtime::runtime().unwrap();
 
+            let mut pressure_span = None;
             while !Runtime::kill_in_progress() {
                 let process_rss = process_rss_bytes().unwrap_or_default();
                 runtime
@@ -734,6 +758,13 @@ impl Runtime {
                         current_memory_pressure
                     }
                 };
+                if pressure_span.is_none() || new_memory_pressure != previous_pressure {
+                    pressure_span = Some(
+                        LongSpanBuilder::new("memory-pressure")
+                            .with_tooltip(new_memory_pressure.to_string())
+                            .build(),
+                    );
+                }
 
                 runtime
                     .inner()
@@ -752,6 +783,7 @@ impl Runtime {
                 }
                 parker.park_timeout(Duration::from_secs(1));
             }
+            drop(pressure_span);
         });
 
         let workers = workers
@@ -989,7 +1021,17 @@ impl Runtime {
         match current_thread_type() {
             Some(ThreadType::Foreground) => WORKER_INDEX.get(),
             Some(ThreadType::Background) => TOKIO_WORKER_INDEX.get(),
-            None => 0,
+            None => RUNTIME.with_borrow(|runtime| match runtime {
+                Some(runtime) => {
+                    // We are running in an auxiliary thread.  Treat it like the
+                    // first thread in the local runtime.
+                    runtime.layout().local_workers().start
+                }
+                None => {
+                    // We are not running in a runtime.
+                    0
+                }
+            }),
         }
     }
 
@@ -1019,30 +1061,11 @@ impl Runtime {
     }
 
     pub fn get_mode(&self) -> Mode {
-        self.inner().mode.clone()
+        self.inner().mode
     }
 
-    /// Configure the number of tuples a stateful operator outputs per step during replay.
-    ///
-    /// The default is `DEFAULT_REPLAY_STEP_SIZE`.
-    pub fn set_replay_step_size(&self, step_size: usize) {
-        self.inner()
-            .replay_step_size
-            .store(step_size, Ordering::Release);
-    }
-
-    /// Get currently configured replay step size.
-    ///
-    /// Returns `DEFAULT_REPLAY_STEP_SIZE` if the current thread doesn't have a runtime.
-    pub fn replay_step_size() -> usize {
-        RUNTIME
-            .with(|rt| Some(rt.borrow().as_ref()?.get_replay_step_size()))
-            .unwrap_or(DEFAULT_REPLAY_STEP_SIZE)
-    }
-
-    /// Get currently configured replay step size.
-    pub fn get_replay_step_size(&self) -> usize {
-        self.inner().replay_step_size.load(Ordering::Acquire)
+    pub fn get_step_size(&self) -> StepSize {
+        self.inner().step_size
     }
 
     /// Returns the worker index as a string.
@@ -1260,6 +1283,10 @@ impl Runtime {
         })
     }
 
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.inner().cancellation_token.clone()
+    }
+
     pub fn worker_panic_info(
         &self,
         worker: usize,
@@ -1300,6 +1327,14 @@ impl Runtime {
             .handle()
             .clone()
     }
+
+    /// Takes and returns the TCP listener socket configured via
+    /// [CircuitConfig], if any.
+    ///
+    /// [CircuitConfig]: crate::circuit::dbsp_handle::CircuitConfig
+    pub(crate) fn take_exchange_listener(&self) -> Option<TcpListener> {
+        self.inner().exchange_listener.lock().unwrap().take()
+    }
 }
 
 /// A synchronization primitive that allows multiple threads within a runtime to agree
@@ -1326,45 +1361,25 @@ impl Consensus {
 pub(crate) enum Broadcast<T> {
     SingleThreaded,
     MultiThreaded {
-        notify_sender: Arc<Notify>,
-        notify_receiver: Arc<Notify>,
         exchange: Arc<Exchange<T>>,
+        identifier: Arc<String>,
     },
 }
 
 impl<T> Broadcast<T>
 where
-    T: Clone + Send + serde::Serialize + for<'de> serde::Deserialize<'de> + 'static,
+    T: Clone + Debug + Send + serde::Serialize + for<'de> serde::Deserialize<'de> + 'static,
 {
     pub fn new() -> Self {
         match Runtime::runtime() {
             Some(runtime) if Runtime::num_workers() > 1 => {
-                let worker_index = Runtime::worker_index();
                 let exchange_id = runtime.sequence_next().try_into().unwrap();
-                let exchange = Exchange::with_runtime(
-                    &runtime,
-                    exchange_id,
-                    // TODO: handle serialization/deserialization errors better.
-                    Box::new(|data| rmp_serde::from_slice(&data).unwrap()),
-                );
-
-                let notify_sender = Arc::new(Notify::new());
-                let notify_sender_clone = notify_sender.clone();
-                let notify_receiver = Arc::new(Notify::new());
-                let notify_receiver_clone = notify_receiver.clone();
-
-                exchange.register_sender_callback(worker_index, move || {
-                    notify_sender_clone.notify_one()
-                });
-
-                exchange.register_receiver_callback(worker_index, move || {
-                    notify_receiver_clone.notify_one()
-                });
+                let exchange = Exchange::with_runtime(&runtime, exchange_id);
+                let identifier = Arc::new(format!("broadcast {exchange_id}"));
 
                 Self::MultiThreaded {
-                    notify_sender,
-                    notify_receiver,
                     exchange,
+                    identifier,
                 }
             }
             _ => Self::SingleThreaded,
@@ -1380,37 +1395,26 @@ where
         match self {
             Self::SingleThreaded => Ok(vec![local]),
             Self::MultiThreaded {
-                notify_sender,
-                notify_receiver,
                 exchange,
-            } => {
-                while !exchange.try_send_all_with_serializer(
-                    Runtime::worker_index(),
-                    repeat(local.clone()),
-                    |local| {
-                        let mut fbuf = FBuf::new();
-                        rmp_serde::encode::write(&mut fbuf, &local).unwrap();
-                        fbuf
-                    },
-                ) {
-                    if Runtime::kill_in_progress() {
-                        return Err(SchedulerError::Killed);
-                    }
-                    notify_sender.notified().await;
-                }
-                // Receive and collect the status of each peer.
-                let mut result = Vec::with_capacity(Runtime::num_workers());
-                while !exchange
-                    .try_receive_all(Runtime::worker_index(), |status| result.push(status))
-                {
-                    if Runtime::kill_in_progress() {
-                        return Err(SchedulerError::Killed);
-                    }
-                    // Sleep if other threads are still working.
-                    notify_receiver.notified().await;
-                }
-                Ok(result)
-            }
+                identifier,
+            } => Runtime::runtime()
+                .unwrap()
+                .cancellation_token()
+                .run_until_cancelled_owned(async {
+                    exchange
+                        .send_all_with_serializer(identifier, repeat(local.clone()), |local| {
+                            let mut fbuf = FBuf::new();
+                            rmp_serde::encode::write(&mut fbuf, &local).unwrap();
+                            fbuf
+                        })
+                        .await;
+
+                    exchange
+                        .receive_all(|data| rmp_serde::from_slice(&data).unwrap())
+                        .await
+                })
+                .await
+                .ok_or(SchedulerError::Killed),
         }
     }
 }
@@ -1460,6 +1464,7 @@ impl RuntimeHandle {
             .inner()
             .kill_signal
             .store(true, Ordering::SeqCst);
+        self.runtime.inner().cancellation_token.cancel();
         for (_worker, unparker) in self.workers.iter() {
             unparker.unpark();
         }
@@ -1598,11 +1603,7 @@ impl WorkerLocations {
     /// worker indexes.
     pub fn new() -> Self {
         if let Some(runtime) = Runtime::runtime() {
-            let layout = runtime.layout();
-            Self {
-                workers: 0..layout.n_workers(),
-                local_workers: layout.local_workers(),
-            }
+            Self::for_layout(runtime.layout())
         } else {
             Self {
                 workers: 0..1,
@@ -1611,13 +1612,29 @@ impl WorkerLocations {
         }
     }
 
+    /// Constructs a new iterator from `layout`.
+    pub fn for_layout(layout: &Layout) -> Self {
+        Self {
+            workers: 0..layout.n_workers(),
+            local_workers: layout.local_workers(),
+        }
+    }
+
     /// Returns the location of the worker with the given index.
     pub fn get(&self, worker: usize) -> WorkerLocation {
+        self[worker]
+    }
+}
+
+impl Index<usize> for WorkerLocations {
+    type Output = WorkerLocation;
+
+    fn index(&self, worker: usize) -> &Self::Output {
         debug_assert!(worker < self.workers.end);
         if self.local_workers.contains(&worker) {
-            WorkerLocation::Local
+            &WorkerLocation::Local
         } else {
-            WorkerLocation::Remote
+            &WorkerLocation::Remote
         }
     }
 }
@@ -1644,8 +1661,8 @@ mod tests {
     use crate::{
         Circuit, RootCircuit,
         circuit::{
-            CircuitConfig, Layout,
-            dbsp_handle::{CircuitStorageConfig, Mode},
+            CircuitConfig,
+            dbsp_handle::CircuitStorageConfig,
             metadata::{LOOSE_MEMORY_RECORDS_COUNT, MERGING_MEMORY_RECORDS_COUNT},
             schedule::{DynamicScheduler, Scheduler},
         },
@@ -1657,7 +1674,7 @@ mod tests {
     use feldera_buffer_cache::{CacheEntry, ThreadType};
     use feldera_storage::fbuf::{FBuf, slab::set_thread_slab_pool};
     use feldera_types::config::{
-        DevTweaks, StorageCacheConfig, StorageConfig, StorageOptions,
+        StorageCacheConfig, StorageConfig, StorageOptions,
         dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy},
     };
     use feldera_types::memory_pressure::MemoryPressure;
@@ -1766,23 +1783,16 @@ mod tests {
         // Case 1: storage specified, runtime should not clean up storage when exiting
         let path = tempfile::tempdir().unwrap().keep();
         let path_clone = path.clone();
-        let cconf = CircuitConfig {
-            layout: Layout::new_solo(4),
-            max_rss_bytes: None,
-            mode: Mode::Ephemeral,
-            pin_cpus: Vec::new(),
-            storage: Some(
-                CircuitStorageConfig::for_config(
-                    StorageConfig {
-                        path: path.to_string_lossy().into_owned(),
-                        cache: StorageCacheConfig::default(),
-                    },
-                    StorageOptions::default(),
-                )
-                .unwrap(),
-            ),
-            dev_tweaks: DevTweaks::default(),
-        };
+        let cconf = CircuitConfig::with_workers(4).with_storage(Some(
+            CircuitStorageConfig::for_config(
+                StorageConfig {
+                    path: path.to_string_lossy().into_owned(),
+                    cache: StorageCacheConfig::default(),
+                },
+                StorageOptions::default(),
+            )
+            .unwrap(),
+        ));
 
         let hruntime = Runtime::run(cconf, move |_parker| {
             let runtime = Runtime::runtime().unwrap();
@@ -1850,7 +1860,7 @@ mod tests {
         let runtime = Runtime(Arc::new(
             RuntimeInner::new(
                 CircuitConfig::with_workers(workers)
-                    .with_storage(storage)
+                    .with_storage(Some(storage))
                     .with_buffer_cache_strategy(BufferCacheStrategy::Lru),
             )
             .unwrap(),
@@ -1959,7 +1969,7 @@ mod tests {
         let runtime = Runtime(Arc::new(
             RuntimeInner::new(
                 CircuitConfig::with_workers(1)
-                    .with_storage(storage)
+                    .with_storage(Some(storage))
                     .with_buffer_cache_allocation_strategy(
                         BufferCacheAllocationStrategy::SharedPerWorkerPair,
                     ),
@@ -1993,7 +2003,7 @@ mod tests {
         let runtime = Runtime(Arc::new(
             RuntimeInner::new(
                 CircuitConfig::with_workers(2)
-                    .with_storage(storage)
+                    .with_storage(Some(storage))
                     .with_buffer_cache_allocation_strategy(BufferCacheAllocationStrategy::Global),
             )
             .unwrap(),
@@ -2020,7 +2030,7 @@ mod tests {
         )
         .unwrap();
         let runtime = Runtime(Arc::new(
-            RuntimeInner::new(CircuitConfig::with_workers(1).with_storage(storage)).unwrap(),
+            RuntimeInner::new(CircuitConfig::with_workers(1).with_storage(Some(storage))).unwrap(),
         ));
 
         let previous = set_thread_slab_pool(Some(

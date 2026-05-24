@@ -1,6 +1,5 @@
 package org.dbsp.sqlCompiler.compiler.sql.simple;
 
-import org.checkerframework.checker.nullness.qual.Nullable;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPFlatMapIndexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPMapIndexOperator;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
@@ -15,9 +14,11 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI32Literal;
 import org.dbsp.sqlCompiler.ir.type.DBSPTypeCode;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeInteger;
+import org.dbsp.util.NullPrintStream;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.PrintStream;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Random;
@@ -470,6 +471,8 @@ public class IncrementalRegression2Tests extends SqlIoTest {
 
     @Test
     public void issue5935() {
+        PrintStream savedErr = System.err;
+        System.setErr(NullPrintStream.INSTANCE);
         var ccs = this.getCCS("""
                 CREATE TABLE orders (
                     order_id              INT NOT NULL PRIMARY KEY,
@@ -497,6 +500,7 @@ public class IncrementalRegression2Tests extends SqlIoTest {
                 LEFT JOIN customers AS sc
                     ON o.shipping_customer_id = sc.customer_id
                 ORDER BY o.order_id;""");
+        System.setErr(savedErr);
         // Validated on Postgres
         ccs.stepWeightOne("""
                 INSERT INTO CUSTOMERS VALUES
@@ -683,5 +687,42 @@ public class IncrementalRegression2Tests extends SqlIoTest {
             lastOutput = output.deepCopy();
             ccs.step(new Change("T", delta), new Change("V", outputDelta));
         }
+    }
+
+
+    @Test
+    public void testSumCase() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(id INT, bid INT, ts TIMESTAMP, ts0 TIMESTAMP, s INT);
+                CREATE VIEW V AS
+                SELECT id, bid,
+                    SUM(
+                        CASE
+                            WHEN ts >= (ts0 - INTERVAL '180' DAY)
+                            AND NOT s IS NULL THEN 1
+                            ELSE 0
+                        END
+                    )
+                FROM T GROUP BY id, bid;
+                """);
+        ccs.stepWeightOne("", """
+                 id | bid | sum
+                ----------------""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(1, 1, 0, 0, 0);", """
+                 id | bid | sum
+                ----------------
+                 1  | 1   | 1""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(NULL, NULL, NULL, NULL, NULL);", """
+                 id | bid | sum
+                ----------------
+                    |     | 0""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(0, 0, NULL, NULL, NULL);", """
+                 id | bid | sum
+                ----------------
+                 0  | 0   | 0""");
+        ccs.step("REMOVE FROM T VALUES(0, 0, NULL, NULL, NULL);", """
+                 id | bid | sum | weight
+                -------------------------
+                 0  | 0   | 0 | -1""");
     }
 }

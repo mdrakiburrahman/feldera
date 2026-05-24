@@ -8,6 +8,7 @@ use feldera_rest_api::types::*;
 use feldera_rest_api::*;
 use feldera_types::config::{FtModel, RuntimeConfig, StorageOptions};
 use feldera_types::error::ErrorResponse;
+use feldera_types::transport::clock::ClockAdvanceRequest;
 use futures_util::StreamExt;
 use json_to_table::json_to_table;
 use log::{debug, error, info, trace, warn};
@@ -1910,6 +1911,55 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .unwrap();
             println!("Initiated rebalancing for pipeline {name}.");
         }
+        PipelineAction::ClockAdvance { name, delta_ms } => {
+            let response = client
+                .clock_advance()
+                .pipeline_name(name.clone())
+                .body(ClockAdvanceRequest { delta_ms })
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to advance clock",
+                    1,
+                ))
+                .unwrap();
+            let body = response.into_inner();
+            match format {
+                OutputFormat::Text => {
+                    println!("NOW() = {} ({} ms)", body.now, body.now_ms);
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&body)
+                            .expect("failed to serialize clock advance response")
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "Unsupported output format, falling back to text: {}",
+                        format
+                    );
+                    println!("NOW() = {} ({} ms)", body.now, body.now_ms);
+                    std::process::exit(1);
+                }
+            }
+        }
+        PipelineAction::StartCompaction { name } => {
+            client
+                .post_pipeline_start_compaction()
+                .pipeline_name(name.clone())
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to initiate compaction",
+                    1,
+                ))
+                .unwrap();
+            println!("Initiated compaction for pipeline {name}.");
+        }
         PipelineAction::Bench { args } => bench::bench(client, format, args).await,
         PipelineAction::DismissError { name } => {
             let response = client
@@ -1925,6 +1975,263 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .unwrap();
             println!("Pipeline deployment error dismissed successfully.");
             trace!("{:#?}", response);
+        }
+        PipelineAction::Events { name, selector } => {
+            let response = client
+                .list_pipeline_events()
+                .pipeline_name(name.clone())
+                .selector(selector)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Unable to retrieve pipeline events",
+                    1,
+                ))
+                .unwrap();
+            match format {
+                OutputFormat::Text => {
+                    if selector == PipelineMonitorEventFieldSelector::All {
+                        let mut rows = vec![];
+                        rows.push([
+                            "event_id".to_string(),
+                            "recorded_at".to_string(),
+                            "deployment_resources_status".to_string(),
+                            "deployment_resources_status_details".to_string(),
+                            "deployment_resources_desired_status".to_string(),
+                            "deployment_runtime_status".to_string(),
+                            "deployment_runtime_status_details".to_string(),
+                            "deployment_runtime_desired_status".to_string(),
+                            "deployment_has_error".to_string(),
+                            "deployment_error".to_string(),
+                            "program_status".to_string(),
+                            "storage_status".to_string(),
+                            "storage_status_details".to_string(),
+                        ]);
+                        for event in response.iter() {
+                            rows.push([
+                                event.event_id.to_string(),
+                                format!(
+                                    "{} ({:.0}s ago)",
+                                    event.recorded_at,
+                                    (Utc::now() - event.recorded_at).as_seconds_f64()
+                                ),
+                                event.deployment_resources_status.to_string(),
+                                event
+                                    .deployment_resources_status_details
+                                    .as_ref()
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event.deployment_resources_desired_status.to_string(),
+                                event
+                                    .deployment_runtime_status
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event
+                                    .deployment_runtime_status_details
+                                    .as_ref()
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event
+                                    .deployment_runtime_desired_status
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event.deployment_has_error.to_string(),
+                                event
+                                    .deployment_error
+                                    .as_ref()
+                                    .map(|v| format!("{v:?}"))
+                                    .unwrap_or("(none)".to_string()),
+                                event.program_status.to_string(),
+                                event.storage_status.to_string(),
+                                event
+                                    .storage_status_details
+                                    .as_ref()
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                            ]);
+                        }
+                        println!(
+                            "{}",
+                            Builder::from_iter(rows).build().with(Style::rounded())
+                        );
+                    } else {
+                        let mut rows = vec![];
+                        rows.push([
+                            "event_id".to_string(),
+                            "recorded_at".to_string(),
+                            "deployment_resources_status".to_string(),
+                            "deployment_resources_desired_status".to_string(),
+                            "deployment_runtime_status".to_string(),
+                            "deployment_runtime_desired_status".to_string(),
+                            "deployment_has_error".to_string(),
+                            "program_status".to_string(),
+                            "storage_status".to_string(),
+                        ]);
+                        for event in response.iter() {
+                            rows.push([
+                                event.event_id.to_string(),
+                                format!(
+                                    "{} ({:.0}s ago)",
+                                    event.recorded_at,
+                                    (Utc::now() - event.recorded_at).as_seconds_f64()
+                                ),
+                                event.deployment_resources_status.to_string(),
+                                event.deployment_resources_desired_status.to_string(),
+                                event
+                                    .deployment_runtime_status
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event
+                                    .deployment_runtime_desired_status
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event.deployment_has_error.to_string(),
+                                event.program_status.to_string(),
+                                event.storage_status.to_string(),
+                            ]);
+                        }
+                        println!(
+                            "{}",
+                            Builder::from_iter(rows).build().with(Style::rounded())
+                        );
+                    }
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize pipeline events")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
+        PipelineAction::Event {
+            name,
+            event_id,
+            selector,
+        } => {
+            let response = client
+                .get_pipeline_event()
+                .pipeline_name(name.clone())
+                .event_id(event_id)
+                .selector(selector)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Unable to retrieve pipeline event",
+                    1,
+                ))
+                .unwrap();
+            match format {
+                OutputFormat::Text => {
+                    let mut rows = vec![];
+                    rows.push(["Field".to_string(), "Value".to_string()]);
+                    rows.push(["event_id".to_string(), response.event_id.to_string()]);
+                    rows.push([
+                        "recorded_at".to_string(),
+                        format!(
+                            "{} ({:.0}s ago)",
+                            response.recorded_at,
+                            (Utc::now() - response.recorded_at).as_seconds_f64()
+                        ),
+                    ]);
+                    rows.push([
+                        "deployment_resources_status".to_string(),
+                        response.deployment_resources_status.to_string(),
+                    ]);
+                    if selector == PipelineMonitorEventFieldSelector::All {
+                        rows.push([
+                            "deployment_resources_status_details".to_string(),
+                            response
+                                .deployment_resources_status_details
+                                .as_ref()
+                                .map(|v| v.to_string())
+                                .unwrap_or("(none)".to_string()),
+                        ]);
+                    }
+                    rows.push([
+                        "deployment_resources_desired_status".to_string(),
+                        response.deployment_resources_desired_status.to_string(),
+                    ]);
+                    rows.push([
+                        "deployment_runtime_status".to_string(),
+                        response
+                            .deployment_runtime_status
+                            .map(|v| v.to_string())
+                            .unwrap_or("(none)".to_string()),
+                    ]);
+                    if selector == PipelineMonitorEventFieldSelector::All {
+                        rows.push([
+                            "deployment_runtime_status_details".to_string(),
+                            response
+                                .deployment_runtime_status_details
+                                .as_ref()
+                                .map(|v| v.to_string())
+                                .unwrap_or("(none)".to_string()),
+                        ]);
+                    }
+                    rows.push([
+                        "deployment_runtime_desired_status".to_string(),
+                        response
+                            .deployment_runtime_desired_status
+                            .map(|v| v.to_string())
+                            .unwrap_or("(none)".to_string()),
+                    ]);
+                    rows.push([
+                        "deployment_has_error".to_string(),
+                        response.deployment_has_error.to_string(),
+                    ]);
+                    if selector == PipelineMonitorEventFieldSelector::All {
+                        rows.push([
+                            "deployment_error".to_string(),
+                            response
+                                .deployment_error
+                                .as_ref()
+                                .map(|v| format!("{v:?}"))
+                                .unwrap_or("(none)".to_string()),
+                        ]);
+                    }
+                    rows.push([
+                        "program_status".to_string(),
+                        response.program_status.to_string(),
+                    ]);
+                    rows.push([
+                        "storage_status".to_string(),
+                        response.storage_status.to_string(),
+                    ]);
+                    if selector == PipelineMonitorEventFieldSelector::All {
+                        rows.push([
+                            "storage_status_details".to_string(),
+                            response
+                                .storage_status_details
+                                .as_ref()
+                                .map(|v| v.to_string())
+                                .unwrap_or("(none)".to_string()),
+                        ]);
+                    }
+                    println!(
+                        "{}",
+                        Builder::from_iter(rows).build().with(Style::rounded())
+                    );
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize pipeline events")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
@@ -2495,7 +2802,8 @@ fn init_logging(default_level: &str) {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
-                .without_time(),
+                .without_time()
+                .with_writer(std::io::stderr),
         )
         .try_init();
 }

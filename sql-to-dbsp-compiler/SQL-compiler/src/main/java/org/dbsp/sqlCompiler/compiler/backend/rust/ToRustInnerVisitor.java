@@ -388,19 +388,23 @@ public class ToRustInnerVisitor extends InnerVisitor {
         this.builder.append("<");
         // In the type parameter we do not put the Option<>
         sequence.dataType.withMayBeNull(false).accept(this);
-        this.builder.append(", ");
-        sequence.dataConvertedType.accept(this);
-        this.builder.append(", ");
-        sequence.intermediateType.accept(this);
-        this.builder.append(", ");
-        sequence.unsignedType.accept(this);
+        if (sequence.dataConvertedType.signed) {
+            this.builder.append(", ");
+            sequence.dataConvertedType.accept(this);
+            this.builder.append(", ");
+            sequence.intermediateType.accept(this);
+        }
+        if (!sequence.unsignedType.sameType(sequence.dataType)) {
+            this.builder.append(", ");
+            sequence.unsignedType.accept(this);
+        }
         this.builder.append(">");
     }
 
     @Override
     public VisitDecision preorder(DBSPUnsignedWrapExpression expression) {
         this.push(expression);
-        this.builder.append("UnsignedWrapper")
+        this.builder.append(DBSPUnsignedWrapExpression.RUST_IMPLEMENTATION)
                 .append("::")
                 .append(expression.getMethod())
                 .append("::");
@@ -430,7 +434,7 @@ public class ToRustInnerVisitor extends InnerVisitor {
     @Override
     public VisitDecision preorder(DBSPUnsignedUnwrapExpression expression) {
         this.push(expression);
-        this.builder.append("UnsignedWrapper")
+        this.builder.append(DBSPUnsignedWrapExpression.RUST_IMPLEMENTATION)
                 .append("::")
                 .append(expression.getMethod())
                 .append("::");
@@ -729,6 +733,17 @@ public class ToRustInnerVisitor extends InnerVisitor {
                 .append(val)
                 .append("*/");
         this.pop(literal);
+        return VisitDecision.STOP;
+    }
+
+    @Override
+    public VisitDecision preorder(DBSPWindowBoundExpression bound) {
+        String beforeAfter = bound.isPreceding ? "Before" : "After";
+        this.builder.append("RelOffset::")
+                .append(beforeAfter)
+                .append("(");
+        bound.representation.accept(this);
+        this.builder.append(")");
         return VisitDecision.STOP;
     }
 
@@ -1711,14 +1726,14 @@ public class ToRustInnerVisitor extends InnerVisitor {
                 this.builder.append(")");
                 break;
             }
-            case ARRAY_CONVERT_SAFE, ARRAY_CONVERT, MAP_CONVERT, MAP_CONVERT_SAFE, DIV_NULL: {
+            case ARRAY_CONVERT_SAFE, ARRAY_CONVERT, MAP_CONVERT, MAP_CONVERT_SAFE: {
                 this.builder.append(expression.opcode.toString())
                         .append(expression.left.getType().nullableUnderlineSuffix())
                         .append(expression.right.getType().nullableUnderlineSuffix())
                         .append("(").increase();
                 this.visitingChild = 0;
                 expression.left.accept(this);
-                this.builder.append(", ");
+                this.builder.append(",").newline();
                 this.visitingChild = 1;
                 expression.right.accept(this);
                 this.builder.newline().decrease().append(")");
@@ -1767,7 +1782,9 @@ public class ToRustInnerVisitor extends InnerVisitor {
                                     expression.opcode == DBSPOpcode.SUB ||
                                     expression.opcode == DBSPOpcode.MUL ||
                                     expression.opcode == DBSPOpcode.DIV ||
-                                    expression.opcode == DBSPOpcode.MOD;
+                                    expression.opcode == DBSPOpcode.MOD ||
+                                    expression.opcode == DBSPOpcode.DIV_NULL
+                            ;
                     if (genericArgCount > 0 && needsGenericArguments) {
                         this.builder.append("::<");
                         boolean first = expression.left.getType().emitGenericArguments(builder, true);
@@ -1884,7 +1901,9 @@ public class ToRustInnerVisitor extends InnerVisitor {
             this.pop(expression);
             return VisitDecision.STOP;
         } else if (expression.opcode == DBSPOpcode.INTEGER_TO_SHORT_INTERVAL ||
-                expression.opcode == DBSPOpcode.SHORT_INTERVAL_TO_INTEGER) {
+                expression.opcode == DBSPOpcode.SHORT_INTERVAL_TO_INTEGER ||
+                expression.opcode == DBSPOpcode.INTEGER_TO_UUID ||
+                expression.opcode == DBSPOpcode.UUID_TO_INTEGER) {
             this.builder.append(expression.opcode.toString())
                     .append("(");
             expression.source.accept(this);
@@ -2010,7 +2029,9 @@ public class ToRustInnerVisitor extends InnerVisitor {
             NeedsSourceMap finder = new NeedsSourceMap(this.compiler);
             finder.apply(function.body);
             if (finder.found) {
-                SourcePositionResource.generateReference(this.builder, CircuitWriter.SOURCE_MAP_VARIABLE_NAME);
+                SourcePositionResource.generateReference(
+                        this.builder, CircuitWriter.SOURCE_MAP_VARIABLE_NAME,
+                        Objects.requireNonNull(this.circuitContext).name);
             }
             function.body.accept(this);
             this.builder.decrease()

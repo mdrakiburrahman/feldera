@@ -10,7 +10,7 @@
     "license": {
       "name": "MIT OR Apache-2.0"
     },
-    "version": "0.290.0"
+    "version": "0.300.0"
   },
   "paths": {
     "/config/authentication": {
@@ -2977,6 +2977,75 @@
         ]
       }
     },
+    "/v0/pipelines/{pipeline_name}/clock/advance": {
+      "post": {
+        "tags": [
+          "Metrics & Debugging"
+        ],
+        "summary": "Advance Clock",
+        "description": "Moves `NOW()` forward by a specified amount. Returns the\ncurrent clock time of the circuit.\n\nRequires `dev_tweaks.now_http_driven = true` on the pipeline.\n\nForward-only: `delta_ms` is `u64`, so negative bodies are rejected at\nJSON parse time.  `delta_ms = null` or omitted advances by one\n`clock_resolution`.  Non-zero values round up to the next\n`clock_resolution` boundary, so a sub-resolution delta still moves\nthe clock by one full tick.\n\nThe returned `now_ms` is the value the worker will emit on its next\npipeline step; queries against materialized views may observe the\nprevious `NOW()` until that step completes.  Callers that need\nread-after-write semantics should poll the view.",
+        "operationId": "clock_advance",
+        "parameters": [
+          {
+            "name": "pipeline_name",
+            "in": "path",
+            "description": "Unique pipeline name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Milliseconds to add to NOW(); zero reads the current value, null/omitted: advance by one clock_resolution.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClockAdvanceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Clock advanced successfully; body contains the new NOW().",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClockAdvanceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Clock not in http-driven mode, or malformed body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Pipeline is not running.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "JSON web token (JWT) or API key": []
+          }
+        ]
+      }
+    },
     "/v0/pipelines/{pipeline_name}/commit_transaction": {
       "post": {
         "tags": [
@@ -3383,7 +3452,7 @@
           "Output Connectors"
         ],
         "summary": "Subscribe to View",
-        "description": "Subscribe to a stream of updates from a SQL view or table.\n\nThe pipeline responds with a continuous stream of changes to the specified\ntable or view, encoded using the format specified in the `?format=`\nparameter. Updates are split into `Chunk`s.\n\nThe pipeline continues sending updates until the client closes the\nconnection or the pipeline is stopped.",
+        "description": "Subscribe to a stream of updates from a SQL view or table.\n\nThe pipeline responds with a continuous stream of changes to the specified\ntable or view.  The stream is configurable two ways:\n\n- Simple configuration of the format may be provided using query parameters.\nUse `format` to specify `csv` or `json` output and, for `json` only, `array`\nto specify whether to group updates into JSON arrays.  Specify\n`backpressure` to specify behavior when the HTTP client cannot keep up.\n\n- Comprehensive configuration may be provided by providing a connector\nconfiguration as a JSON body.  In this case, no query parameters are\nallowed.\n\nUpdates are split into `Chunk`s.\n\nThe pipeline continues sending updates until the client closes the\nconnection or the pipeline is stopped.",
         "operationId": "http_output",
         "parameters": [
           {
@@ -3407,10 +3476,20 @@
           {
             "name": "format",
             "in": "query",
-            "description": "Output data format, e.g., 'csv' or 'json'.",
+            "description": "Output data format, either 'csv' or 'json'.",
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "send_snapshot",
+            "in": "query",
+            "description": "Set to `true` to send a full snapshot of a materialized view before streaming incremental updates. The default is `false`. Works on a paused pipeline: the snapshot is delivered from the latest cached view state without requiring the pipeline to be running.",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "nullable": true
             }
           },
           {
@@ -3538,6 +3617,162 @@
                       }
                     }
                   }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "JSON web token (JWT) or API key": []
+          }
+        ]
+      }
+    },
+    "/v0/pipelines/{pipeline_name}/events": {
+      "get": {
+        "tags": [
+          "Metrics & Debugging"
+        ],
+        "summary": "List Pipeline Events",
+        "description": "Retrieve monitoring events in reverse chronological order.\n\nPipeline health is monitored regularly every several seconds.\nNot every monitoring action results in a pipeline monitor event being\nconstructed and inserted into the database. This happens if:\n- Any status changed\n- Only the status details changed, and it has been 10s since the last event\n- Nothing has changed for more than 10 minutes\n\nThis endpoint returns the most recent persisted events, up to by default approximately 720.",
+        "operationId": "list_pipeline_events",
+        "parameters": [
+          {
+            "name": "pipeline_name",
+            "in": "path",
+            "description": "Unique pipeline name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "selector",
+            "in": "query",
+            "description": "The `selector` parameter limits which fields are returned.\nLimiting which fields is particularly handy for instance when frequently\nmonitoring over low bandwidth connections while being only interested\nin status.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PipelineMonitorEventFieldSelector"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PipelineMonitorEventSelectedInfo"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "JSON web token (JWT) or API key": []
+          }
+        ]
+      }
+    },
+    "/v0/pipelines/{pipeline_name}/events/{event_id}": {
+      "get": {
+        "tags": [
+          "Metrics & Debugging"
+        ],
+        "summary": "Get Pipeline Event",
+        "description": "Get a specific pipeline monitor event.\n\nThe identifiers of the events can be retrieved via `GET /v0/pipelines/<pipeline>/events`.\nThe most recent approximately 720 (default) events are retained.\nThis endpoint can return a 404 for an event that no longer exists due to a cleanup.",
+        "operationId": "get_pipeline_event",
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "description": "Pipeline monitor event identifier or `latest`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pipeline_name",
+            "in": "path",
+            "description": "Unique pipeline name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "selector",
+            "in": "query",
+            "description": "The `selector` parameter limits which fields are returned.\nLimiting which fields is particularly handy for instance when frequently\nmonitoring over low bandwidth connections while being only interested\nin status.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PipelineMonitorEventFieldSelector"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PipelineMonitorEventSelectedInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -3721,7 +3956,7 @@
           {
             "name": "format",
             "in": "query",
-            "description": "Input data format, e.g., 'csv' or 'json'.",
+            "description": "Input data format, either `csv' or 'json'.",
             "required": true,
             "schema": {
               "type": "string"
@@ -4382,149 +4617,6 @@
         ]
       }
     },
-    "/v0/pipelines/{pipeline_name}/reset_status": {
-      "get": {
-        "tags": [
-          "Output Connectors"
-        ],
-        "summary": "Check Reset Status",
-        "description": "Check the status of a reset token returned by the output connector\nreset endpoint.",
-        "operationId": "reset_status",
-        "parameters": [
-          {
-            "name": "pipeline_name",
-            "in": "path",
-            "description": "Unique pipeline name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "token",
-            "in": "query",
-            "description": "Reset token returned by the output connector reset endpoint.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Reset token status has been retrieved"
-          },
-          "400": {
-            "description": "An invalid reset token was provided",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Pipeline with that name does not exist",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                },
-                "example": {
-                  "message": "Unknown pipeline name 'non-existent-pipeline'",
-                  "error_code": "UnknownPipelineName",
-                  "details": {
-                    "pipeline_name": "non-existent-pipeline"
-                  }
-                }
-              }
-            }
-          },
-          "410": {
-            "description": "Reset token was created by a previous incarnation of the pipeline; the server cannot validate the reset across incarnations. Reissue the reset.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                },
-                "examples": {
-                  "Disconnected during response": {
-                    "value": {
-                      "message": "Error sending HTTP request to pipeline: the pipeline disconnected while it was processing this HTTP request. This could be because the pipeline either (a) encountered a fatal error or panic, (b) was stopped, or (c) experienced network issues -- retrying might help in the last case. Alternatively, check the pipeline logs. Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
-                      "error_code": "PipelineInteractionUnreachable",
-                      "details": {
-                        "pipeline_name": "my_pipeline",
-                        "request": "/pause",
-                        "error": "the pipeline disconnected while it was processing this HTTP request. This could be because the pipeline either (a) encountered a fatal error or panic, (b) was stopped, or (c) experienced network issues -- retrying might help in the last case. Alternatively, check the pipeline logs."
-                      }
-                    }
-                  },
-                  "Pipeline is currently unavailable": {
-                    "value": {
-                      "message": "Error sending HTTP request to pipeline: deployment status is currently 'unavailable' -- wait for it to become 'running' or 'paused' again Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
-                      "error_code": "PipelineInteractionUnreachable",
-                      "details": {
-                        "pipeline_name": "my_pipeline",
-                        "request": "/pause",
-                        "error": "deployment status is currently 'unavailable' -- wait for it to become 'running' or 'paused' again"
-                      }
-                    }
-                  },
-                  "Pipeline is not deployed": {
-                    "value": {
-                      "message": "Unable to interact with pipeline because the deployment status (stopped) indicates it is not (yet) fully provisioned pipeline-id=N/A pipeline-name=\"my_pipeline\"",
-                      "error_code": "PipelineInteractionNotDeployed",
-                      "details": {
-                        "pipeline_name": "my_pipeline",
-                        "status": "Stopped",
-                        "desired_status": "Provisioned"
-                      }
-                    }
-                  },
-                  "Response timeout": {
-                    "value": {
-                      "message": "Error sending HTTP request to pipeline: timeout (10s) was reached: this means the pipeline took too long to respond -- this can simply be because the request was too difficult to process in time, or other reasons (e.g., deadlock): the pipeline logs might contain additional information (original send request error: Timeout while waiting for response) Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
-                      "error_code": "PipelineInteractionUnreachable",
-                      "details": {
-                        "pipeline_name": "my_pipeline",
-                        "request": "/pause",
-                        "error": "timeout (10s) was reached: this means the pipeline took too long to respond -- this can simply be because the request was too difficult to process in time, or other reasons (e.g., deadlock): the pipeline logs might contain additional information (original send request error: Timeout while waiting for response)"
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "JSON web token (JWT) or API key": []
-          }
-        ]
-      }
-    },
     "/v0/pipelines/{pipeline_name}/resume": {
       "post": {
         "tags": [
@@ -4988,6 +5080,120 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "JSON web token (JWT) or API key": []
+          }
+        ]
+      }
+    },
+    "/v0/pipelines/{pipeline_name}/start_compaction": {
+      "post": {
+        "tags": [
+          "Pipeline Lifecycle"
+        ],
+        "summary": "Initiate compaction.",
+        "description": "Initiate immediate compaction of the pipeline's state.",
+        "operationId": "post_pipeline_start_compaction",
+        "parameters": [
+          {
+            "name": "pipeline_name",
+            "in": "path",
+            "description": "Unique pipeline name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Compaction started successfully"
+          },
+          "404": {
+            "description": "Pipeline with that name does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "message": "Unknown pipeline name 'non-existent-pipeline'",
+                  "error_code": "UnknownPipelineName",
+                  "details": {
+                    "pipeline_name": "non-existent-pipeline"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "examples": {
+                  "Disconnected during response": {
+                    "value": {
+                      "message": "Error sending HTTP request to pipeline: the pipeline disconnected while it was processing this HTTP request. This could be because the pipeline either (a) encountered a fatal error or panic, (b) was stopped, or (c) experienced network issues -- retrying might help in the last case. Alternatively, check the pipeline logs. Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
+                      "error_code": "PipelineInteractionUnreachable",
+                      "details": {
+                        "pipeline_name": "my_pipeline",
+                        "request": "/pause",
+                        "error": "the pipeline disconnected while it was processing this HTTP request. This could be because the pipeline either (a) encountered a fatal error or panic, (b) was stopped, or (c) experienced network issues -- retrying might help in the last case. Alternatively, check the pipeline logs."
+                      }
+                    }
+                  },
+                  "Pipeline is currently unavailable": {
+                    "value": {
+                      "message": "Error sending HTTP request to pipeline: deployment status is currently 'unavailable' -- wait for it to become 'running' or 'paused' again Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
+                      "error_code": "PipelineInteractionUnreachable",
+                      "details": {
+                        "pipeline_name": "my_pipeline",
+                        "request": "/pause",
+                        "error": "deployment status is currently 'unavailable' -- wait for it to become 'running' or 'paused' again"
+                      }
+                    }
+                  },
+                  "Pipeline is not deployed": {
+                    "value": {
+                      "message": "Unable to interact with pipeline because the deployment status (stopped) indicates it is not (yet) fully provisioned pipeline-id=N/A pipeline-name=\"my_pipeline\"",
+                      "error_code": "PipelineInteractionNotDeployed",
+                      "details": {
+                        "pipeline_name": "my_pipeline",
+                        "status": "Stopped",
+                        "desired_status": "Provisioned"
+                      }
+                    }
+                  },
+                  "Response timeout": {
+                    "value": {
+                      "message": "Error sending HTTP request to pipeline: timeout (10s) was reached: this means the pipeline took too long to respond -- this can simply be because the request was too difficult to process in time, or other reasons (e.g., deadlock): the pipeline logs might contain additional information (original send request error: Timeout while waiting for response) Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
+                      "error_code": "PipelineInteractionUnreachable",
+                      "details": {
+                        "pipeline_name": "my_pipeline",
+                        "request": "/pause",
+                        "error": "timeout (10s) was reached: this means the pipeline took too long to respond -- this can simply be because the request was too difficult to process in time, or other reasons (e.g., deadlock): the pipeline logs might contain additional information (original send request error: Timeout while waiting for response)"
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -6463,152 +6669,6 @@
         ]
       }
     },
-    "/v0/pipelines/{pipeline_name}/views/{view_name}/connectors/{connector_name}/reset": {
-      "post": {
-        "tags": [
-          "Output Connectors"
-        ],
-        "summary": "Reset Output Connector",
-        "description": "Reset an output connector configured in `snapshot_and_follow` mode.\n\nThis clears buffered output, asks the sink to reset itself, and then replays\na full snapshot before resuming incremental updates.",
-        "operationId": "post_pipeline_output_connector_reset",
-        "parameters": [
-          {
-            "name": "pipeline_name",
-            "in": "path",
-            "description": "Unique pipeline name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "view_name",
-            "in": "path",
-            "description": "SQL view name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "connector_name",
-            "in": "path",
-            "description": "Output connector name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Output connector reset request has been processed"
-          },
-          "400": {
-            "description": "The output connector does not support reset",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Pipeline, view and/or output connector with that name does not exist",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                },
-                "examples": {
-                  "Pipeline with that name does not exist": {
-                    "value": {
-                      "message": "Unknown pipeline name 'non-existent-pipeline'",
-                      "error_code": "UnknownPipelineName",
-                      "details": {
-                        "pipeline_name": "non-existent-pipeline"
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                },
-                "examples": {
-                  "Disconnected during response": {
-                    "value": {
-                      "message": "Error sending HTTP request to pipeline: the pipeline disconnected while it was processing this HTTP request. This could be because the pipeline either (a) encountered a fatal error or panic, (b) was stopped, or (c) experienced network issues -- retrying might help in the last case. Alternatively, check the pipeline logs. Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
-                      "error_code": "PipelineInteractionUnreachable",
-                      "details": {
-                        "pipeline_name": "my_pipeline",
-                        "request": "/pause",
-                        "error": "the pipeline disconnected while it was processing this HTTP request. This could be because the pipeline either (a) encountered a fatal error or panic, (b) was stopped, or (c) experienced network issues -- retrying might help in the last case. Alternatively, check the pipeline logs."
-                      }
-                    }
-                  },
-                  "Pipeline is currently unavailable": {
-                    "value": {
-                      "message": "Error sending HTTP request to pipeline: deployment status is currently 'unavailable' -- wait for it to become 'running' or 'paused' again Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
-                      "error_code": "PipelineInteractionUnreachable",
-                      "details": {
-                        "pipeline_name": "my_pipeline",
-                        "request": "/pause",
-                        "error": "deployment status is currently 'unavailable' -- wait for it to become 'running' or 'paused' again"
-                      }
-                    }
-                  },
-                  "Pipeline is not deployed": {
-                    "value": {
-                      "message": "Unable to interact with pipeline because the deployment status (stopped) indicates it is not (yet) fully provisioned pipeline-id=N/A pipeline-name=\"my_pipeline\"",
-                      "error_code": "PipelineInteractionNotDeployed",
-                      "details": {
-                        "pipeline_name": "my_pipeline",
-                        "status": "Stopped",
-                        "desired_status": "Provisioned"
-                      }
-                    }
-                  },
-                  "Response timeout": {
-                    "value": {
-                      "message": "Error sending HTTP request to pipeline: timeout (10s) was reached: this means the pipeline took too long to respond -- this can simply be because the request was too difficult to process in time, or other reasons (e.g., deadlock): the pipeline logs might contain additional information (original send request error: Timeout while waiting for response) Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
-                      "error_code": "PipelineInteractionUnreachable",
-                      "details": {
-                        "pipeline_name": "my_pipeline",
-                        "request": "/pause",
-                        "error": "timeout (10s) was reached: this means the pipeline took too long to respond -- this can simply be because the request was too difficult to process in time, or other reasons (e.g., deadlock): the pipeline logs might contain additional information (original send request error: Timeout while waiting for response)"
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "JSON web token (JWT) or API key": []
-          }
-        ]
-      }
-    },
     "/v0/pipelines/{pipeline_name}/views/{view_name}/connectors/{connector_name}/stats": {
       "get": {
         "tags": [
@@ -7270,7 +7330,8 @@
         "type": "object",
         "description": "A set of updates to a SQL table or view.\n\nThe `sequence_number` field stores the offset of the chunk relative to the\nstart of the stream and can be used to implement reliable delivery.\nThe payload is stored in the `bin_data`, `text_data`, or `json_data` field\ndepending on the data format used.",
         "required": [
-          "sequence_number"
+          "sequence_number",
+          "snapshot"
         ],
         "properties": {
           "bin_data": {
@@ -7289,10 +7350,43 @@
             "format": "int64",
             "minimum": 0
           },
+          "snapshot": {
+            "type": "boolean",
+            "description": "`true` when this chunk is part of the initial snapshot delivered in\n`send_snapshot` mode; `false` for incremental delta updates."
+          },
           "text_data": {
             "type": "string",
             "description": "Text payload, e.g., CSV.",
             "nullable": true
+          }
+        }
+      },
+      "ClockAdvanceRequest": {
+        "type": "object",
+        "description": "Body of `POST /clock/advance`.\n\n`delta_ms` is unsigned; negative values fail JSON deserialization.\n`Some(0)` reads the current `NOW()` without moving it or rounding\nit; `Some(n)` advances by `n` ms; `None` (`null` or omitted)\nadvances by one `clock_resolution`.  Non-zero values round up to\nthe next `clock_resolution` boundary, so a sub-resolution delta\nstill moves the clock by one full tick.",
+        "properties": {
+          "delta_ms": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "minimum": 0
+          }
+        }
+      },
+      "ClockAdvanceResponse": {
+        "type": "object",
+        "description": "Response of `POST /clock/advance`: the new `NOW()` value as both\nmilliseconds since epoch (signed; pre-1970 anchors yield negative\nvalues) and an RFC 3339 string.",
+        "required": [
+          "now_ms",
+          "now"
+        ],
+        "properties": {
+          "now": {
+            "type": "string"
+          },
+          "now_ms": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -7306,6 +7400,16 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "http_driven": {
+            "type": "boolean",
+            "description": "If `true`, the clock does not advance on wall-clock cadence.\n`NOW()` is held at its current value and only advances when an\nexternal caller invokes the pipeline's `POST /clock/advance`\nendpoint.  Populated from `DevTweaks::now_http_driven`."
+          },
+          "now_offset_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Target value for `NOW()` at the worker's first emitted tick, in\nmilliseconds since the Unix epoch.\n\nPopulated verbatim from `DevTweaks::now_offset` at endpoint\nconstruction; the wall-clock delta is computed inside the\nconnector's worker task from a single `SystemTime::now()`\nreading, so there is no drift between config construction and\nthe first emitted tick.  `None` means no shift is applied.",
+            "nullable": true
           }
         }
       },
@@ -7815,6 +7919,10 @@
                 },
                 "nullable": true
               },
+              "send_snapshot": {
+                "type": "boolean",
+                "description": "Send a full snapshot of a materialized view when the connector first\nstarts. Valid for output connectors only.\n\nWhen `true`, the pipeline emits the current contents of the view as the\ninitial batch the first time the connector runs. The view must be\nmaterialized (declared with `CREATE MATERIALIZED VIEW`).\n\nThe snapshot is sent exactly once per connector lifetime: it does not\nfire again when the pipeline resumes from a checkpoint. Modifying the\nconnector configuration or invoking the reset API triggers a fresh\nsnapshot when the connector supports reset (e.g., Delta Lake in\n`truncate` mode and Postgres)."
+              },
               "start_after": {
                 "type": "array",
                 "items": {
@@ -7828,8 +7936,7 @@
               }
             }
           }
-        ],
-        "description": "A data connector's configuration"
+        ]
       },
       "ConnectorError": {
         "type": "object",
@@ -8372,11 +8479,12 @@
       },
       "DeltaTableTransactionMode": {
         "type": "string",
-        "description": "Delta table transaction mode.\n\nDetermines how the connector breaks up its input into transactions.\n\n* `none` - the connector does not break up its input into transactions.\n* `snapshot` - ingest the initial snapshot of the table in one or several transactions. If the connector is\nconfigured in the `snapshot_and_follow` mode, it will ingest the transaction log of the table without transactions.\n* `always` - all updates generated by the connector are broken up into transactions, both during the initial snapshot\nand when following the transaction log.\n\n# How table snapshot is ingested using transactions\n\nIf the connector is configured in the `snapshot` or `snapshot_and_follow` mode, and its\n`transaction_mode` is set to `snapshot` or `always`, it will ingest the snapshot of the\ntable in one or several transactions. The exact behavior depends on the value of the `timestamp_column` option.\nIf `timestamp_column` is not set, the connector will ingest the snapshot of the table in one big transaction.\n\nIf `timestamp_column` is set, the connector will ingest the snapshot of the table in a series of batches, one for\neach timestamp range of width equal to the `LATENESS` attribute of the `timestamp_column`. Each range will be\ningested in a separate transaction.\n\nSee `timestamp_column` documentation for more details.\n\n# How transaction log is ingested using transactions\n\nIf the connector is configured in the `follow`, `snapshot_and_follow`, or `cdc` mode, and its\n`transaction_mode` is set to `always`, it will ingest the transaction log of the table in a series of transactions,\ngenerating exactly one transaction for each entry in the table's transaction log.\n\nIn other words, Feldera transaction boundaries will precisely match the transaction boundaries of the Delta Lake table.",
+        "description": "Delta table transaction mode.\n\nDetermines how the connector breaks up its input into transactions.\n\n* `none` - the connector does not break up its input into transactions.\n* `snapshot` - ingest the initial snapshot of the table in one or several transactions. If the connector is\nconfigured in the `snapshot_and_follow` mode, it will ingest the transaction log of the table without transactions.\n* `catchup` - batch the initial snapshot and transaction-log catch-up into Feldera transactions (see below).\n* `always` - all updates generated by the connector are broken up into transactions, both during the initial snapshot\nand when following the transaction log.\n\n# How table snapshot is ingested using transactions\n\nIf the connector is configured in the `snapshot` or `snapshot_and_follow` mode, and its\n`transaction_mode` is set to `snapshot`, `catchup`, or `always`, it will ingest the snapshot of the\ntable in one or several transactions. The exact behavior depends on the value of the `timestamp_column` option.\nIf `timestamp_column` is not set, `catchup` and `always` ingest the snapshot in one Feldera transaction; `snapshot`\nmode uses the same one-transaction behavior when `timestamp_column` is not set.\n\nIf `timestamp_column` is set, the connector will ingest the snapshot of the table in a series of batches, one for\neach timestamp range of width equal to the `LATENESS` attribute of the `timestamp_column`. Each range will be\ningested in a separate transaction.\n\nSee `timestamp_column` documentation for more details.\n\n# How transaction log is ingested using transactions\n\nIf the connector is configured in the `follow`, `snapshot_and_follow`, or `cdc` mode, and its\n`transaction_mode` is set to `catchup`, it ingests the transaction log in batches. When it starts a\nFeldera transaction, it reads the latest available version of the Delta table (capped by `end_version` if set) and\ningests all log entries up to and including that version in a single Feldera transaction before committing. It then\nrepeats for subsequent versions as they appear in the log.\n\nThe `catchup` mode offers the most efficient way for the connector to process the entire contents\nof the table during backfill and keep up with table changes in steady state.\n\nIf `transaction_mode` is set to `always`, the connector ingests the transaction log in a series of transactions,\ngenerating exactly one Feldera transaction for each entry in the table's transaction log. Feldera transaction\nboundaries then match the transaction boundaries of the Delta Lake table: as long as the table keeps changing, each log\nentry initiates a new Feldera transaction. Use `always` when that one-to-one alignment is required.",
         "enum": [
           "none",
           "snapshot",
-          "always"
+          "always",
+          "catchup"
         ]
       },
       "DeltaTableWriteMode": {
@@ -8536,9 +8644,21 @@
             "nullable": true,
             "minimum": 0
           },
+          "disable_auto_transaction": {
+            "type": "boolean",
+            "description": "Don't automatically start a transaction for every step.",
+            "default": null,
+            "nullable": true
+          },
           "eager_evict": {
             "type": "boolean",
             "description": "Evict eagerly from buffer caches as files get deleted.\n\nThis is an optimization that drops files from\nthe cache as soon as they are deleted.\n\nIt has unknown (no?) performance benefits from what I can tell.\n\nHistorically it made sense to do this for two reasons:\na) we know with 100% guarantee that the file won't ever be\nread again.\nb) we could do this in O(logn) time with the LRU cache.\nThis is no longer true for s3-fifo where it is O(n).\n\nIf the eviction is expensive, (many small objects in the cache)\nthis can cause a regression.\n\nNew default disables this behavior by making it false.\n\nIf this doesn't cause regression we will remove this option\nin the future.",
+            "default": null,
+            "nullable": true
+          },
+          "enable_roaring": {
+            "type": "boolean",
+            "description": "Whether file-backed batches may use roaring membership filters when the\nkey type supports them.",
             "default": null,
             "nullable": true
           },
@@ -8594,6 +8714,19 @@
             "nullable": true,
             "minimum": 0
           },
+          "now_http_driven": {
+            "type": "boolean",
+            "description": "Drive `NOW()` from an external HTTP endpoint instead of wall clock.\n\nWhen `true`, the clock connector emits one initial tick (using\n`now_offset` if set, otherwise wall clock) and then holds that\nvalue.  Subsequent calls to `POST /clock/advance` move `NOW()`\nforward by the requested delta.  Negative deltas are rejected;\nthe clock is forward-only.",
+            "default": null,
+            "nullable": true
+          },
+          "now_offset": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Override the timestamp returned by SQL `NOW()` at pipeline start.\n\nWhen set, the clock connector anchors `NOW()` to this RFC 3339\ntimestamp the first time the pipeline starts and advances at\nwall-clock cadence from there:\n`NOW() = now_offset + (wall_clock - wall_clock_at_start)`.\n\nAny RFC 3339 timestamp parseable by `chrono::DateTime<Utc>` is\naccepted (years `0001` through `9999`), in the past or future\nrelative to wall clock.\n\nThis is a testing knob for queries that depend on `NOW()`.\n\nOn resume the clock continues from the last journaled `NOW()`;\n`now_offset`'s value is honored only on a fresh start:\n\n| Initial run | Resume from checkpoint | Post-replay `NOW()` |\n|---|---|---|\n| no offset | no offset | wall clock (unchanged) |\n| offset    | offset    | wall-clock pace from the last journaled value; the new offset value is ignored |\n| offset    | no offset | jumps to wall clock (explicit opt-out of the anchor) |\n| no offset | offset    | wall-clock pace from the last journaled value; the new offset value is ignored |",
+            "default": null,
+            "nullable": true
+          },
           "splitter_chunk_size_records": {
             "type": "integer",
             "format": "int64",
@@ -8611,7 +8744,7 @@
           "storage_mb_max": {
             "type": "integer",
             "format": "int64",
-            "description": "If set, the maximum amount of storage, in MiB, for the POSIX backend to\nallow to be in use before failing all writes with [StorageFull].  This\nis useful for testing on top of storage that does not implement its own\nquota mechanism.\n\n[StorageFull]: std::io::ErrorKind::StorageFull",
+            "description": "If set, the maximum amount of storage, in MiB, for the POSIX backend to\nallow to be in use before failing all writes with `StorageFull`.  This\nis useful for testing on top of storage that does not implement its own\nquota mechanism.",
             "default": null,
             "nullable": true,
             "minimum": 0
@@ -8951,6 +9084,15 @@
           }
         }
       },
+      "GetPipelineEventParameters": {
+        "type": "object",
+        "description": "Query parameters to GET a pipeline monitor event.",
+        "properties": {
+          "selector": {
+            "$ref": "#/components/schemas/PipelineMonitorEventFieldSelector"
+          }
+        }
+      },
       "GetPipelineParameters": {
         "type": "object",
         "description": "Query parameters to GET a pipeline or a list of pipelines.",
@@ -9231,7 +9373,7 @@
       },
       "HttpInputConfig": {
         "type": "object",
-        "description": "Configuration for reading data via HTTP.\n\nHTTP input adapters cannot be usefully configured as part of pipeline\nconfiguration.  Instead, instantiate them through the REST API as\n`/pipelines/{pipeline_name}/ingress/{table_name}`.",
+        "description": "Configuration for data input via HTTP.\n\nHTTP input adapters cannot be usefully configured as part of pipeline\nconfiguration.  Instead, instantiate them through the REST API as\n`/pipelines/{pipeline_name}/ingress/{table_name}`.",
         "required": [
           "name"
         ],
@@ -9239,6 +9381,17 @@
           "name": {
             "type": "string",
             "description": "Autogenerated name."
+          }
+        }
+      },
+      "HttpOutputConfig": {
+        "type": "object",
+        "description": "Configuration for data output via HTTP.\n\nHTTP output adapters cannot be usefully configured as part of pipeline\nconfiguration.  Instead, instantiate them through the REST API as\n`/pipelines/{pipeline_name}/egress`.",
+        "properties": {
+          "backpressure": {
+            "type": "boolean",
+            "description": "Apply backpressure on the pipeline when the HTTP client cannot receive\ndata fast enough.\n\nWhen this flag is set to false (the default), the HTTP connector drops data\nchunks if the client is not keeping up with its output.  This prevents\na slow HTTP client from slowing down the entire pipeline.\n\nWhen the flag is set to true, the connector waits for the client to receive\neach chunk and blocks the pipeline if the client cannot keep up.",
+            "default": false
           }
         }
       },
@@ -10934,6 +11087,88 @@
           }
         }
       },
+      "PipelineMonitorEventFieldSelector": {
+        "type": "string",
+        "enum": [
+          "all",
+          "status"
+        ]
+      },
+      "PipelineMonitorEventId": {
+        "type": "string",
+        "format": "uuid",
+        "description": "Pipeline monitor event identifier."
+      },
+      "PipelineMonitorEventSelectedInfo": {
+        "type": "object",
+        "description": "Pipeline monitor event information which has a selected subset of optional fields.\nIf an optional field is not selected (i.e., is `None`), it will not be serialized.",
+        "required": [
+          "event_id",
+          "recorded_at",
+          "deployment_resources_status",
+          "deployment_resources_desired_status",
+          "deployment_has_error",
+          "program_status",
+          "storage_status"
+        ],
+        "properties": {
+          "deployment_error": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ErrorResponse"
+              }
+            ],
+            "nullable": true
+          },
+          "deployment_has_error": {
+            "type": "boolean"
+          },
+          "deployment_resources_desired_status": {
+            "$ref": "#/components/schemas/ResourcesDesiredStatus"
+          },
+          "deployment_resources_status": {
+            "$ref": "#/components/schemas/ResourcesStatus"
+          },
+          "deployment_resources_status_details": {
+            "nullable": true
+          },
+          "deployment_runtime_desired_status": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeDesiredStatus"
+              }
+            ],
+            "nullable": true
+          },
+          "deployment_runtime_status": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeStatus"
+              }
+            ],
+            "nullable": true
+          },
+          "deployment_runtime_status_details": {
+            "nullable": true
+          },
+          "event_id": {
+            "$ref": "#/components/schemas/PipelineMonitorEventId"
+          },
+          "program_status": {
+            "$ref": "#/components/schemas/ProgramStatus"
+          },
+          "recorded_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "storage_status": {
+            "$ref": "#/components/schemas/StorageStatus"
+          },
+          "storage_status_details": {
+            "nullable": true
+          }
+        }
+      },
       "PipelineSelectedInfo": {
         "type": "object",
         "description": "Pipeline information which has a selected subset of optional fields.\nIt both includes fields which are user-provided and system-generated.\nIf an optional field is not selected (i.e., is `None`), it will not be serialized.",
@@ -11212,6 +11447,79 @@
             "description": "The `force` parameter determines whether to immediately deprovision the pipeline compute\nresources (`force=true`) or first attempt to atomically checkpoint before doing so\n(`force=false`, which is the default)."
           }
         }
+      },
+      "PostgresCdcReaderConfig": {
+        "allOf": [
+          {
+            "type": "object",
+            "description": "TLS/SSL configuration for PostgreSQL connectors.",
+            "properties": {
+              "ssl_ca_location": {
+                "type": "string",
+                "description": "Path to a file containing a sequence of CA certificates in PEM format.",
+                "nullable": true
+              },
+              "ssl_ca_pem": {
+                "type": "string",
+                "description": "A sequence of CA certificates in PEM format.",
+                "nullable": true
+              },
+              "ssl_certificate_chain_location": {
+                "type": "string",
+                "description": "The path to the certificate chain file.\nThe file must contain a sequence of PEM-formatted certificates,\nthe first being the leaf certificate, and the remainder forming\nthe chain of certificates up to and including the trusted root certificate.",
+                "nullable": true
+              },
+              "ssl_client_key": {
+                "type": "string",
+                "description": "The client certificate key in PEM format.",
+                "nullable": true
+              },
+              "ssl_client_key_location": {
+                "type": "string",
+                "description": "Path to the client certificate key.",
+                "nullable": true
+              },
+              "ssl_client_location": {
+                "type": "string",
+                "description": "Path to the client certificate.",
+                "nullable": true
+              },
+              "ssl_client_pem": {
+                "type": "string",
+                "description": "The client certificate in PEM format.",
+                "nullable": true
+              },
+              "verify_hostname": {
+                "type": "boolean",
+                "description": "True to enable hostname verification when using TLS. True by default.",
+                "nullable": true
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "uri",
+              "publication",
+              "source_table"
+            ],
+            "properties": {
+              "publication": {
+                "type": "string",
+                "description": "Name of the pre-created Postgres publication to replicate from."
+              },
+              "source_table": {
+                "type": "string",
+                "description": "Postgres table to replicate (e.g. \"public.orders\").\nMust be included in the publication."
+              },
+              "uri": {
+                "type": "string",
+                "description": "Postgres connection URI. The user must have REPLICATION privilege.\nSee: <https://docs.rs/tokio-postgres/0.7.12/tokio_postgres/config/struct.Config.html>"
+              }
+            }
+          }
+        ],
+        "description": "Postgres CDC input connector configuration.\n\nUses logical replication to capture ongoing changes from a Postgres database.\nRequires a pre-created publication and a user with REPLICATION privilege.\nTables must have primary keys and `REPLICA IDENTITY FULL` is recommended\nfor UPDATE/DELETE support."
       },
       "PostgresReaderConfig": {
         "allOf": [
@@ -11910,6 +12218,13 @@
               },
               "materialized": {
                 "type": "boolean"
+              },
+              "primary_key": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "nullable": true
               },
               "properties": {
                 "type": "object",
@@ -13537,6 +13852,24 @@
             ],
             "properties": {
               "config": {
+                "$ref": "#/components/schemas/PostgresCdcReaderConfig"
+              },
+              "name": {
+                "type": "string",
+                "enum": [
+                  "postgres_cdc_input"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "config"
+            ],
+            "properties": {
+              "config": {
                 "$ref": "#/components/schemas/PostgresWriterConfig"
               },
               "name": {
@@ -13604,9 +13937,13 @@
           {
             "type": "object",
             "required": [
-              "name"
+              "name",
+              "config"
             ],
             "properties": {
+              "config": {
+                "$ref": "#/components/schemas/HttpOutputConfig"
+              },
               "name": {
                 "type": "string",
                 "enum": [

@@ -4,7 +4,9 @@ use std::fmt::Display;
 use std::path::PathBuf;
 
 use crate::make_client;
-use feldera_rest_api::types::{ClusterMonitorEventFieldSelector, CompilationProfile};
+use feldera_rest_api::types::{
+    ClusterMonitorEventFieldSelector, CompilationProfile, PipelineMonitorEventFieldSelector,
+};
 
 /// Autocompletion for pipeline names by trying to fetch them from the server.
 fn pipeline_names(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
@@ -701,6 +703,33 @@ pub enum PipelineAction {
         #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
         name: String,
     },
+    /// Advance the externally-driven `NOW()` clock by `delta_ms` and
+    /// print the new value.
+    ///
+    /// Requires `dev_tweaks.now_http_driven = true` on the pipeline.
+    /// The clock is forward-only; `delta_ms = 0` reads the current value
+    /// without moving it; omitting `--delta-ms` advances by one
+    /// `clock_resolution` (one configured tick).
+    ///
+    /// The printed value is the `NOW()` the worker will emit on its
+    /// next pipeline step; ad-hoc queries against materialized views
+    /// may still observe the previous value until that step completes.
+    #[clap(aliases = &["clock-set", "set-clock"])]
+    ClockAdvance {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+        /// Milliseconds to add to `NOW()`.  Omit to advance by one
+        /// `clock_resolution`.
+        #[arg(long)]
+        delta_ms: Option<u64>,
+    },
+    /// Initiate compaction.
+    StartCompaction {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+    },
     /// Clear the storage resources of a pipeline.
     ///
     /// Note that the pipeline must be stopped before clearing its storage resources.
@@ -728,6 +757,26 @@ pub enum PipelineAction {
         /// The name of the pipeline.
         #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
         name: String,
+    },
+    /// Retrieves all pipeline events and prints them.
+    Events {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+        /// Either `all` or `status` (default).
+        #[arg(default_value = "status")]
+        selector: PipelineMonitorEventFieldSelector,
+    },
+    /// Retrieve specific pipeline event.
+    Event {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+        /// Identifier (UUID) of the event or `latest`.
+        event_id: String,
+        /// Either `all` or `status` (default).
+        #[arg(default_value = "status")]
+        selector: PipelineMonitorEventFieldSelector,
     },
 }
 

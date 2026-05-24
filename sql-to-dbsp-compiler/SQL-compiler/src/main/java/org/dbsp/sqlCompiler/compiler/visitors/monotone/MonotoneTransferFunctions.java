@@ -505,7 +505,7 @@ public class MonotoneTransferFunctions extends TranslateVisitor<MonotoneExpressi
         DBSPExpression reduced = null;
 
         if (source.mayBeMonotone()) {
-            reduced = new DBSPUnwrapExpression(expression.message, source.getReducedExpression());
+            reduced = new DBSPUnwrapExpression(expression.getNode(), expression.message, source.getReducedExpression());
         }
         if (this.positiveExpressions.contains(expression.expression))
             this.positiveExpressions.add(expression);
@@ -660,8 +660,8 @@ public class MonotoneTransferFunctions extends TranslateVisitor<MonotoneExpressi
         if (left.mayBeMonotone() &&
                 (expression.opcode == DBSPOpcode.DIV ||
                         expression.opcode == DBSPOpcode.MUL ||
-                        expression.opcode == DBSPOpcode.INTERVAL_MUL ||
-                        expression.opcode == DBSPOpcode.INTERVAL_DIV)) {
+                        expression.opcode == DBSPOpcode.MUL_INTERVAL ||
+                        expression.opcode == DBSPOpcode.DIV_INTERVAL)) {
             // Multiplying or dividing a monotone expression by
             // a positive constant produces a monotone result
             // TODO: multiplication is commutative.
@@ -743,7 +743,9 @@ public class MonotoneTransferFunctions extends TranslateVisitor<MonotoneExpressi
     static final Set<DBSPOpcode> monotoneUnary = Set.of(
             DBSPOpcode.UNARY_PLUS, DBSPOpcode.TYPEDBOX,
             DBSPOpcode.DECIMAL_TO_INTEGER, DBSPOpcode.INTEGER_TO_DECIMAL,
-            DBSPOpcode.SHORT_INTERVAL_TO_INTEGER, DBSPOpcode.INTEGER_TO_SHORT_INTERVAL);
+            DBSPOpcode.SHORT_INTERVAL_TO_INTEGER, DBSPOpcode.INTEGER_TO_SHORT_INTERVAL,
+            DBSPOpcode.UUID_TO_INTEGER, DBSPOpcode.INTEGER_TO_UUID
+    );
 
     @Override
     public void postorder(DBSPUnaryExpression expression) {

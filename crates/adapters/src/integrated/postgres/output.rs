@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{io::Write, str::FromStr, sync::Weak, time::Duration};
 
 use super::{
@@ -17,7 +18,7 @@ use crate::{
 };
 use anyhow::{Context, Result as AnyResult, anyhow, bail};
 use feldera_adapterlib::catalog::SplitCursorBuilder;
-use feldera_adapterlib::transport::{AsyncErrorCallback, CommandHandler, Step};
+use feldera_adapterlib::transport::{AsyncErrorCallback, CommandHandler, OutputBatchType, Step};
 use feldera_types::{
     format::json::JsonFlavor,
     program_schema::{Relation, SqlIdentifier},
@@ -53,7 +54,7 @@ struct PostgresWorker {
     table: String,
     client: postgres::Client,
     config: PostgresWriterConfig,
-    extra_columns: Arc<RwLock<BTreeMap<String, Option<String>>>>,
+    extra_columns: Arc<RwLock<BTreeMap<String, Option<serde_json::Value>>>>,
     transaction: Option<postgres::Transaction<'static>>,
     prepared_statements: PreparedStatements,
     insert_buf: Vec<u8>,
@@ -67,6 +68,10 @@ struct PostgresWorker {
     controller: Weak<ControllerInner>,
     num_bytes: usize,
     num_rows: usize,
+    /// Shared counter of records sent to postgres in the current batch.
+    /// Updated atomically after each successful `execute()` call across all
+    /// workers; reset to 0 by the endpoint at batch boundaries.
+    records_written: Arc<AtomicU64>,
 }
 
 impl Drop for PostgresWorker {
@@ -104,10 +109,11 @@ impl PostgresWorker {
         endpoint_id: EndpointId,
         endpoint_name: &str,
         config: &PostgresWriterConfig,
-        extra_columns: Arc<RwLock<BTreeMap<String, Option<String>>>>,
+        extra_columns: Arc<RwLock<BTreeMap<String, Option<serde_json::Value>>>>,
         key_schema: &Relation,
         value_schema: &Relation,
         controller: Weak<ControllerInner>,
+        records_written: Arc<AtomicU64>,
     ) -> Result<Self, BackoffError> {
         let table = config.table.to_owned();
         let mut client = connect(config, endpoint_name)?;
@@ -136,6 +142,7 @@ impl PostgresWorker {
             upsert_buf: Vec::with_capacity(config.max_buffer_size_bytes),
             delete_buf: Vec::with_capacity(config.max_buffer_size_bytes),
             value_schema: value_schema.to_owned(),
+            records_written,
         })
     }
 
@@ -157,9 +164,15 @@ impl PostgresWorker {
         ))
     }
 
-    fn exec_statement(&mut self, stmt: Statement, mut value: Vec<u8>, name: &str) {
+    fn exec_statement(
+        &mut self,
+        stmt: Statement,
+        mut value: Vec<u8>,
+        name: &str,
+        num_records: usize,
+    ) {
         loop {
-            match self.exec_statement_inner(stmt.clone(), &mut value, name) {
+            match self.exec_statement_inner(stmt.clone(), &mut value, name, num_records) {
                 Ok(_) => return,
                 Err(e) => {
                     let retry = e.should_retry();
@@ -188,6 +201,7 @@ impl PostgresWorker {
         stmt: Statement,
         value: &mut Vec<u8>,
         name: &str,
+        num_records: usize,
     ) -> Result<(), BackoffError> {
         if value.last() != Some(&b']') {
             value.push(b']');
@@ -209,6 +223,12 @@ impl PostgresWorker {
             .map_err(|e| {
                 BackoffError::from(e).context(format!("while executing {name} statement: {v}"))
             })?;
+
+        // Report progress: these records have now been sent to postgres within
+        // the open transaction.  The endpoint resets the counter to 0 at batch
+        // boundaries (start, successful commit, failed commit).
+        self.records_written
+            .fetch_add(num_records as u64, Ordering::Relaxed);
 
         value.clear();
         value.push(b'[');
@@ -402,7 +422,7 @@ These statements were successfully prepared before reconnecting. Does the table 
     fn encode_cursor(
         &mut self,
         cursor: &mut dyn SerCursor,
-        extra_columns: BTreeMap<String, Option<String>>,
+        extra_columns: BTreeMap<String, Option<serde_json::Value>>,
     ) -> anyhow::Result<()> {
         while cursor.key_valid() {
             if let Some(op) = indexed_operation_type(self.view_name(), self.index_name(), cursor)? {
@@ -487,7 +507,7 @@ These statements were successfully prepared before reconnecting. Does the table 
     fn serialize_extra_columns(
         &self,
         buf: &mut Vec<u8>,
-        extra_columns: &BTreeMap<String, Option<String>>,
+        extra_columns: &BTreeMap<String, Option<serde_json::Value>>,
     ) -> Result<(), anyhow::Error> {
         if extra_columns.is_empty() {
             return Ok(());
@@ -600,12 +620,16 @@ pub struct PostgresOutputEndpoint {
     endpoint_id: EndpointId,
     endpoint_name: String,
     config: PostgresWriterConfig,
-    extra_columns: Arc<RwLock<BTreeMap<String, Option<String>>>>,
+    extra_columns: Arc<RwLock<BTreeMap<String, Option<serde_json::Value>>>>,
     controller: Weak<ControllerInner>,
     handles: Vec<WorkerHandle>,
     txn_start: std::time::Instant,
     num_bytes: usize,
     num_rows: usize,
+    /// Running count of records sent to postgres in the current batch, shared
+    /// across all worker threads.  Registered with the controller's metrics
+    /// during construction; reset to 0 at batch boundaries.
+    records_written: Arc<AtomicU64>,
 }
 
 /// Commands supported by the Postgres output connector.
@@ -613,17 +637,17 @@ pub struct PostgresOutputEndpoint {
 enum PostgresOutputEndpointCommand {
     /// Set the values of a subset of extra columns.
     #[serde(rename = "set_extra_columns")]
-    SetExtraColumns(BTreeMap<String, Option<String>>),
+    SetExtraColumns(BTreeMap<String, Option<serde_json::Value>>),
 }
 
 struct PostgresOutputEndpointCommandHandler {
-    extra_columns: Arc<RwLock<BTreeMap<String, Option<String>>>>,
+    extra_columns: Arc<RwLock<BTreeMap<String, Option<serde_json::Value>>>>,
     allowed_extra_column_names: HashSet<String>,
 }
 
 impl PostgresOutputEndpointCommandHandler {
     fn new(
-        extra_columns: Arc<RwLock<BTreeMap<String, Option<String>>>>,
+        extra_columns: Arc<RwLock<BTreeMap<String, Option<serde_json::Value>>>>,
         config: &PostgresWriterConfig,
     ) -> Self {
         Self {
@@ -724,6 +748,7 @@ impl PostgresOutputEndpoint {
         key_schema: &Option<Relation>,
         value_schema: &Relation,
         controller: Weak<ControllerInner>,
+        is_index: bool,
     ) -> Result<Self, ControllerError> {
         config.validate().map_err(|e| {
             ControllerError::invalid_transport_configuration(endpoint_name, &e.to_string())
@@ -731,17 +756,28 @@ impl PostgresOutputEndpoint {
 
         validate_extra_columns_against_value_schema(endpoint_name, config, value_schema)?;
 
-        let key_schema = key_schema
-            .to_owned()
-            .ok_or(ControllerError::not_supported(
-                "Postgres output connector requires the view to have a unique key. Please specify the `index` property in the connector configuration. For more details, see: https://docs.feldera.com/connectors/unique_keys"
-            ))?;
+        if !is_index || key_schema.is_none() {
+            return Err(ControllerError::not_supported(
+                "Postgres output connector requires the view to have a unique key. Please specify the `index` property in the connector configuration. For more details, see: https://docs.feldera.com/connectors/unique_keys",
+            ));
+        }
+
+        let key_schema = key_schema.as_ref().unwrap().clone();
 
         let num_threads = config.threads;
         let mut handles = Vec::with_capacity(num_threads);
 
         // Extra columns are not set initially.
         let extra_columns = Arc::new(RwLock::new(BTreeMap::new()));
+
+        // Shared progress counter.  Register with the controller so the metric
+        // is exposed; `add_output()` has already been called by this point so
+        // the metrics slot exists.
+        let records_written = Arc::new(AtomicU64::new(0));
+        if let Some(c) = controller.upgrade() {
+            c.status
+                .register_batch_progress_counter(&endpoint_id, records_written.clone());
+        }
 
         for i in 0..num_threads {
             let worker = PostgresWorker::new(
@@ -753,6 +789,7 @@ impl PostgresOutputEndpoint {
                 &key_schema,
                 value_schema,
                 controller.clone(),
+                records_written.clone(),
             )
             .map_err(|e| ControllerError::output_transport_error(endpoint_name, true, e.inner()))?;
 
@@ -788,6 +825,7 @@ impl PostgresOutputEndpoint {
             txn_start: std::time::Instant::now(),
             num_bytes: 0,
             num_rows: 0,
+            records_written,
         })
     }
 
@@ -835,8 +873,9 @@ impl OutputConsumer for PostgresOutputEndpoint {
         self.config.max_buffer_size_bytes
     }
 
-    fn batch_start(&mut self, _step: Step) {
+    fn batch_start(&mut self, _step: Step, _batch_type: OutputBatchType) {
         self.txn_start = std::time::Instant::now();
+        self.records_written.store(0, Ordering::Relaxed);
 
         match self.broadcast_and_collect(BroadcastCommand::BatchStart) {
             Ok(()) => (),
@@ -871,7 +910,12 @@ impl OutputConsumer for PostgresOutputEndpoint {
     }
 
     fn batch_end(&mut self) {
-        match self.broadcast_and_collect(BroadcastCommand::BatchEnd) {
+        let result = self.broadcast_and_collect(BroadcastCommand::BatchEnd);
+        // Reset progress on every batch_end, regardless of outcome: on success
+        // the records have been committed; on failure the counter would
+        // otherwise leak across batches.
+        self.records_written.store(0, Ordering::Relaxed);
+        match result {
             Ok(()) => {
                 let elapsed = self.txn_start.elapsed();
                 let num_bytes = std::mem::take(&mut self.num_bytes);
@@ -995,7 +1039,7 @@ impl OutputEndpoint for PostgresOutputEndpoint {
         false
     }
 
-    fn batch_start(&mut self, _step: Step) -> AnyResult<()> {
+    fn batch_start(&mut self, _step: Step, _batch_type: OutputBatchType) -> AnyResult<()> {
         todo!()
     }
 
@@ -1051,12 +1095,7 @@ mod tests {
     }
 
     fn relation(name: &str, fields: Vec<Field>, materialized: bool) -> Relation {
-        Relation {
-            name: name.into(),
-            fields,
-            materialized,
-            properties: Default::default(),
-        }
+        Relation::new(name.into(), fields, materialized, Default::default())
     }
 
     fn postgres_url() -> String {
@@ -1092,6 +1131,7 @@ mod tests {
             &idx_rel,
             &main_rel,
             Weak::new(),
+            true,
         )
     }
 
@@ -1227,6 +1267,7 @@ mod tests {
         use std::collections::BTreeMap;
         use std::sync::{Arc, Weak};
 
+        use chrono::NaiveDateTime;
         use dbsp::OrdIndexedZSet;
         use dbsp::utils::Tup2;
         use feldera_adapterlib::transport::OutputEndpoint;
@@ -1240,6 +1281,7 @@ mod tests {
         use crate::controller::EndpointId;
         use crate::format::Encoder;
         use crate::static_compile::seroutput::SerBatchImpl;
+        use feldera_adapterlib::transport::OutputBatchType;
 
         use super::super::PostgresOutputEndpoint;
         use feldera_types::transport::postgres::{
@@ -1311,23 +1353,8 @@ mod tests {
         });
 
         #[derive(
-            Debug,
-            Default,
-            PartialEq,
-            Eq,
-            PartialOrd,
-            Ord,
-            serde::Serialize,
-            serde::Deserialize,
-            Clone,
-            Hash,
-            SizeOf,
-            rkyv::Archive,
-            rkyv::Serialize,
-            rkyv::Deserialize,
-            IsNone,
+            Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, Clone, Hash, IsNone,
         )]
-        #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
         struct TestRecordWithExtraColumns {
             id: i32,
             b: bool,
@@ -1335,7 +1362,9 @@ mod tests {
             s: String,
             #[serde(rename = "EXTRA.COLUMN1")]
             extra_column1: Option<String>,
-            extra_column2: Option<String>,
+            extra_column2: Option<NaiveDateTime>,
+            extra_column3: Option<i64>,
+            extra_column4: Option<serde_json::Value>,
         }
 
         deserialize_without_context!(TestRecordWithExtraColumns);
@@ -1348,6 +1377,7 @@ mod tests {
                 fields: vec![Field::new("id".into(), ColumnType::int(false))],
                 materialized: false,
                 properties: BTreeMap::new(),
+                primary_key: None,
             }
         }
 
@@ -1362,6 +1392,7 @@ mod tests {
                 ],
                 materialized: true,
                 properties: BTreeMap::new(),
+                primary_key: Some(vec!["id".into()]),
             }
         }
 
@@ -1411,7 +1442,9 @@ mod tests {
                             i int8,
                             s varchar NOT NULL,
                             "EXTRA.COLUMN1" varchar,
-                            extra_column2 varchar
+                            extra_column2 timestamp,
+                            extra_column3 bigint,
+                            extra_column4 json
                         )"#
                     ),
                     &[],
@@ -1449,6 +1482,7 @@ mod tests {
                 &Some(key_relation()),
                 &value_relation(),
                 Weak::new(),
+                true,
             )
             .expect("failed to create endpoint")
         }
@@ -1488,7 +1522,7 @@ mod tests {
         }
 
         fn encode_batch(endpoint: &mut PostgresOutputEndpoint, batch: &Arc<dyn SerBatch>) {
-            endpoint.consumer().batch_start(0);
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
             endpoint
                 .encode(batch.clone().arc_as_batch_reader())
                 .unwrap();
@@ -1517,7 +1551,7 @@ mod tests {
         ) -> Vec<TestRecordWithExtraColumns> {
             let rows = client
                 .query(
-                    &format!(r#"SELECT id, b, i, s, "EXTRA.COLUMN1", extra_column2 FROM "{TEST_TABLE}" ORDER BY id"#),
+                    &format!(r#"SELECT id, b, i, s, "EXTRA.COLUMN1", extra_column2, extra_column3, extra_column4 FROM "{TEST_TABLE}" ORDER BY id"#),
                     &[],
                 )
                 .expect("failed to query");
@@ -1529,6 +1563,8 @@ mod tests {
                     s: row.get(3),
                     extra_column1: row.get(4),
                     extra_column2: row.get(5),
+                    extra_column3: row.get(6),
+                    extra_column4: row.get(7),
                 })
                 .collect()
         }
@@ -1629,7 +1665,12 @@ mod tests {
             let batch4 = build_insert_batch(&records[75..100]);
             let mut endpoint = make_endpoint_with_extra_columns(
                 2,
-                vec!["EXTRA.COLUMN1".to_string(), "extra_column2".to_string()],
+                vec![
+                    "EXTRA.COLUMN1".to_string(),
+                    "extra_column2".to_string(),
+                    "extra_column3".to_string(),
+                    "extra_column4".to_string(),
+                ],
             );
 
             encode_batch(&mut endpoint, &batch1);
@@ -1640,7 +1681,9 @@ mod tests {
                 .command(serde_json::json!({
                     "set_extra_columns": {
                         "EXTRA.COLUMN1": "foo1",
-                        "extra_column2": "bar1",
+                        "extra_column2": "2026-04-23 14:30:00.123456",
+                        "extra_column3": 100,
+                        "extra_column4": { "foo": "bar" },
                     }
                 }))
                 .unwrap();
@@ -1653,7 +1696,9 @@ mod tests {
                 .command(serde_json::json!({
                     "set_extra_columns": {
                         "EXTRA.COLUMN1": "foo2",
-                        "extra_column2": "bar2",
+                        "extra_column2": "2026-04-23T15:30:00",
+                        "extra_column3": 200,
+                        "extra_column4": ["foo", "bar"],
                     }
                 }))
                 .unwrap();
@@ -1667,6 +1712,8 @@ mod tests {
                     "set_extra_columns": {
                         "EXTRA.COLUMN1": null,
                         "extra_column2": null,
+                        "extra_column3": null,
+                        "extra_column4": null,
                     }
                 }))
                 .unwrap();
@@ -1683,6 +1730,8 @@ mod tests {
                     s: r.s.clone(),
                     extra_column1: None,
                     extra_column2: None,
+                    extra_column3: None,
+                    extra_column4: None,
                 })
                 .collect();
             let expected2: Vec<_> = records[25..50]
@@ -1693,7 +1742,15 @@ mod tests {
                     i: r.i,
                     s: r.s.clone(),
                     extra_column1: Some("foo1".to_string()),
-                    extra_column2: Some("bar1".to_string()),
+                    extra_column2: Some(
+                        NaiveDateTime::parse_from_str(
+                            "2026-04-23 14:30:00.123456",
+                            "%Y-%m-%d %H:%M:%S%.f",
+                        )
+                        .unwrap(),
+                    ),
+                    extra_column3: Some(100),
+                    extra_column4: Some(serde_json::json!({ "foo": "bar" })),
                 })
                 .collect();
             let expected3: Vec<_> = records[50..75]
@@ -1704,7 +1761,12 @@ mod tests {
                     i: r.i,
                     s: r.s.clone(),
                     extra_column1: Some("foo2".to_string()),
-                    extra_column2: Some("bar2".to_string()),
+                    extra_column2: Some(
+                        NaiveDateTime::parse_from_str("2026-04-23T15:30:00", "%Y-%m-%dT%H:%M:%S")
+                            .unwrap(),
+                    ),
+                    extra_column3: Some(200),
+                    extra_column4: Some(serde_json::json!(["foo", "bar"])),
                 })
                 .collect();
             let expected4: Vec<_> = records[75..100]
@@ -1716,6 +1778,8 @@ mod tests {
                     s: r.s.clone(),
                     extra_column1: None,
                     extra_column2: None,
+                    extra_column3: None,
+                    extra_column4: None,
                 })
                 .collect();
             let expected: Vec<_> = expected1
@@ -1743,7 +1807,9 @@ mod tests {
                 .command(serde_json::json!({
                     "set_extra_columns": {
                         "EXTRA.COLUMN1": "foo3",
-                        "extra_column2": "bar3",
+                        "extra_column2": "2026-04-23T16:30:00",
+                        "extra_column3": 300,
+                        "extra_column4": "foo",
                     }
                 }))
                 .unwrap();
@@ -1757,7 +1823,12 @@ mod tests {
                     let mut new = r.clone();
                     new.s = format!("updated_{}", r.id);
                     new.extra_column1 = Some("foo3".to_string());
-                    new.extra_column2 = Some("bar3".to_string());
+                    new.extra_column2 = Some(
+                        NaiveDateTime::parse_from_str("2026-04-23T16:30:00", "%Y-%m-%dT%H:%M:%S")
+                            .unwrap(),
+                    );
+                    new.extra_column3 = Some(300);
+                    new.extra_column4 = Some(serde_json::json!("foo"));
                     new
                 })
                 .collect();
@@ -1774,6 +1845,7 @@ mod tests {
                 &Some(key_relation()),
                 &value_relation(),
                 Weak::new(),
+                true,
             ) {
                 Ok(_) => panic!("expected duplicate extra_columns to be rejected"),
                 Err(e) => e,
@@ -1794,6 +1866,7 @@ mod tests {
                 &Some(key_relation()),
                 &value_relation(),
                 Weak::new(),
+                true,
             ) {
                 Ok(_) => panic!("expected extra column name clash with view to be rejected"),
                 Err(e) => e,
@@ -1973,6 +2046,196 @@ mod tests {
         #[serial_test::serial]
         fn test_multiple_batches_multi_thread() {
             multiple_batches_test(4);
+        }
+
+        // ── Progress counter tests ────────────────────────────────────
+
+        use std::sync::atomic::Ordering;
+
+        fn records_written(endpoint: &PostgresOutputEndpoint) -> u64 {
+            endpoint.records_written.load(Ordering::Relaxed)
+        }
+
+        /// Build a config that forces frequent in-batch flushes by capping the
+        /// number of records buffered between `execute()` calls.  This lets
+        /// tests observe the progress counter advance mid-batch instead of
+        /// only at commit time.
+        fn make_endpoint_flush_every(threads: usize, max_records: usize) -> PostgresOutputEndpoint {
+            let mut cfg = make_config_with_extra_columns(threads, Vec::new());
+            cfg.max_records_in_buffer = Some(max_records);
+            PostgresOutputEndpoint::new(
+                EndpointId::default(),
+                "test_endpoint",
+                &cfg,
+                &Some(key_relation()),
+                &value_relation(),
+                Weak::new(),
+                true,
+            )
+            .expect("failed to create endpoint")
+        }
+
+        fn progress_basic(threads: usize) {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let records = make_records(100);
+            let batch = build_insert_batch(&records);
+            let mut endpoint = make_endpoint(threads);
+
+            assert_eq!(records_written(&endpoint), 0);
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
+            assert_eq!(records_written(&endpoint), 0);
+            endpoint
+                .encode(batch.clone().arc_as_batch_reader())
+                .unwrap();
+            endpoint.consumer().batch_end();
+            // Counter resets to 0 at the end of every batch.
+            assert_eq!(records_written(&endpoint), 0);
+
+            // Sanity check: data actually landed in postgres.
+            let got = query_all(&mut client);
+            assert_eq!(got, records);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_single_thread() {
+            progress_basic(1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_multi_thread() {
+            progress_basic(4);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_empty_batch() {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let batch = build_insert_batch(&[]);
+            let mut endpoint = make_endpoint(1);
+
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
+            endpoint
+                .encode(batch.clone().arc_as_batch_reader())
+                .unwrap();
+            assert_eq!(records_written(&endpoint), 0);
+            endpoint.consumer().batch_end();
+            assert_eq!(records_written(&endpoint), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_advances_mid_batch_single_thread() {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let records = make_records(50);
+            let batch = build_insert_batch(&records);
+            // Force flushes during encode so the counter advances mid-batch.
+            let mut endpoint = make_endpoint_flush_every(1, 10);
+
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
+            endpoint
+                .encode(batch.clone().arc_as_batch_reader())
+                .unwrap();
+            // After encode, completed flushes are visible in the counter.
+            // With max_records_in_buffer=10 and 50 records, at least 4 flushes
+            // (40 records) have run; the trailing partial buffer is flushed
+            // during batch_end.
+            assert!(
+                records_written(&endpoint) >= 40,
+                "expected mid-batch progress, got {}",
+                records_written(&endpoint)
+            );
+
+            endpoint.consumer().batch_end();
+            assert_eq!(records_written(&endpoint), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_batch_start_resets() {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let mut endpoint = make_endpoint(1);
+
+            // Simulate a stale counter value from an earlier (presumably
+            // crashed) batch and verify that batch_start clears it.
+            endpoint.records_written.store(99, Ordering::Relaxed);
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
+            assert_eq!(records_written(&endpoint), 0);
+
+            // Close out cleanly so the worker transaction doesn't leak.
+            endpoint.consumer().batch_end();
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_multiple_batches() {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let mut endpoint = make_endpoint(1);
+
+            // Batch 1: 50 records.
+            let records1 = make_records(50);
+            let batch1 = build_insert_batch(&records1);
+            encode_batch(&mut endpoint, &batch1);
+            assert_eq!(records_written(&endpoint), 0);
+
+            // Batch 2: 30 more records (ids 50..80).
+            let records2: Vec<_> = (50..80)
+                .map(|i| TestRecord {
+                    id: i,
+                    b: i % 2 == 0,
+                    i: Some(i as i64),
+                    s: format!("record_{i}"),
+                })
+                .collect();
+            let batch2 = build_insert_batch(&records2);
+            encode_batch(&mut endpoint, &batch2);
+            assert_eq!(records_written(&endpoint), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_advances_mid_batch_multi_thread() {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            // 4 workers, force flush every 5 records so each worker flushes
+            // multiple times.  With 100 records spread across 4 workers, every
+            // worker has ~25 records; 5 flushes of 5 records each.
+            let mut endpoint = make_endpoint_flush_every(4, 5);
+
+            let records = make_records(100);
+            let batch = build_insert_batch(&records);
+
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
+            endpoint
+                .encode(batch.clone().arc_as_batch_reader())
+                .unwrap();
+
+            // After encode, completed flushes from all 4 workers are visible.
+            // We can't predict the exact number (depends on how the trailing
+            // partial buffer per worker shakes out), but it must be > 0 and
+            // <= 100.
+            let mid = records_written(&endpoint);
+            assert!(mid > 0, "expected mid-batch progress, got 0");
+            assert!(mid <= 100, "counter exceeds total records: {mid}");
+
+            endpoint.consumer().batch_end();
+            assert_eq!(records_written(&endpoint), 0);
+
+            // Final state in postgres matches all input records.
+            let got = query_all(&mut client);
+            assert_eq!(got, records);
         }
     }
 }

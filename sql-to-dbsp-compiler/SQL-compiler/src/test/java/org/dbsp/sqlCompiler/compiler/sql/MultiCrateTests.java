@@ -439,4 +439,28 @@ public class MultiCrateTests extends BaseSQLTests {
         Utilities.deleteFile(udf, false);
         udf.deleteOnExit();
     }
+
+    @Test
+    public void issue6150() throws IOException, SQLException, InterruptedException {
+        StringBuilder builder = new StringBuilder();
+        builder.append("CREATE TABLE T(x INT, y INT, z INT);\n");
+        builder.append("CREATE LOCAL VIEW V AS SELECT z, y, COUNT(X)");
+        for (int i = 0; i < 140; i++) {
+            builder.append(",\n");
+            builder.append("  MAX(x + ").append(i).append(") AS a").append(i);
+        }
+        builder.append(" FROM T GROUP BY y, z;\n");
+        builder.append("CREATE VIEW W AS SELECT * FROM V JOIN T ON V.y = T.y;");
+        File file = createInputScript(builder.toString());
+        compileToMultiCrate(file.getAbsolutePath(), true, true);
+    }
+
+    @Test
+    public void testHints() throws SQLException, IOException, InterruptedException {
+        String sql = """
+                CREATE TABLE T(x INT);
+                CREATE TABLE S(x INT);
+                CREATE VIEW V AS SELECT /*+ broadcast(T), shard(S) */ * FROM T JOIN S USING (x);""";
+        compileProgramToMultiCrate(sql, true);
+    }
 }

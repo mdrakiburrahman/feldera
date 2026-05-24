@@ -127,6 +127,7 @@ pub const MERGING_MEMORY_RECORDS_COUNT: MetricId =
 pub const MERGING_STORAGE_RECORDS_COUNT: MetricId =
     MetricId(Cow::Borrowed("merging_storage_records_count"));
 pub const COMPLETED_MERGES: MetricId = MetricId(Cow::Borrowed("completed_merges"));
+pub const COMPACTION_STATE: MetricId = MetricId(Cow::Borrowed("compaction_state"));
 pub const NEGATIVE_WEIGHT_COUNT: MetricId = MetricId(Cow::Borrowed("negative_weight_count"));
 pub const BLOOM_FILTER_BITS_PER_KEY: MetricId =
     MetricId(Cow::Borrowed("bloom_filter_bits_per_key"));
@@ -136,12 +137,21 @@ pub const BLOOM_FILTER_MISSES_COUNT: MetricId =
 pub const BLOOM_FILTER_HIT_RATE_PERCENT: MetricId =
     MetricId(Cow::Borrowed("bloom_filter_hit_rate_percent"));
 pub const BLOOM_FILTER_SIZE_BYTES: MetricId = MetricId(Cow::Borrowed("bloom_filter_size_bytes"));
+pub const ROARING_FILTER_HITS_COUNT: MetricId =
+    MetricId(Cow::Borrowed("roaring_filter_hits_count"));
+pub const ROARING_FILTER_MISSES_COUNT: MetricId =
+    MetricId(Cow::Borrowed("roaring_filter_misses_count"));
+pub const ROARING_FILTER_HIT_RATE_PERCENT: MetricId =
+    MetricId(Cow::Borrowed("roaring_filter_hit_rate_percent"));
+pub const ROARING_FILTER_SIZE_BYTES: MetricId =
+    MetricId(Cow::Borrowed("roaring_filter_size_bytes"));
 pub const RANGE_FILTER_HITS_COUNT: MetricId = MetricId(Cow::Borrowed("range_filter_hits_count"));
 pub const RANGE_FILTER_MISSES_COUNT: MetricId =
     MetricId(Cow::Borrowed("range_filter_misses_count"));
 pub const RANGE_FILTER_HIT_RATE_PERCENT: MetricId =
     MetricId(Cow::Borrowed("range_filter_hit_rate_percent"));
 pub const RANGE_FILTER_SIZE_BYTES: MetricId = MetricId(Cow::Borrowed("range_filter_size_bytes"));
+pub const SPINE_COUNT: MetricId = MetricId(Cow::Borrowed("spine_count"));
 pub const SPINE_BATCHES_COUNT: MetricId = MetricId(Cow::Borrowed("spine_batches_count"));
 pub const SPINE_STORAGE_SIZE_BYTES: MetricId = MetricId(Cow::Borrowed("spine_storage_size_bytes"));
 pub const MERGING_SIZE_BYTES: MetricId = MetricId(Cow::Borrowed("merging_size_bytes"));
@@ -167,7 +177,7 @@ pub const PREFIX_BATCHES_STATS: MetricId = MetricId(Cow::Borrowed("prefix_batche
 pub const INPUT_INTEGRAL_RECORDS_COUNT: MetricId =
     MetricId(Cow::Borrowed("input_integral_records_count"));
 
-pub const CIRCUIT_METRICS: [CircuitMetric; 70] = [
+pub const CIRCUIT_METRICS: [CircuitMetric; 75] = [
     // State
     CircuitMetric {
         name: USED_MEMORY_BYTES,
@@ -269,7 +279,7 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 70] = [
         name: BLOOM_FILTER_BITS_PER_KEY,
         category: CircuitMetricCategory::State,
         advanced: false,
-        description: "Average number of bits per key in the Bloom filter.",
+        description: "Average number of bits per key across batches that use a Bloom filter.",
     },
     CircuitMetric {
         name: BLOOM_FILTER_SIZE_BYTES,
@@ -294,6 +304,30 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 70] = [
         category: CircuitMetricCategory::State,
         advanced: false,
         description: "Hit rate of the Bloom filter.",
+    },
+    CircuitMetric {
+        name: ROARING_FILTER_SIZE_BYTES,
+        category: CircuitMetricCategory::State,
+        advanced: false,
+        description: "Size of the bitmap filter in bytes.",
+    },
+    CircuitMetric {
+        name: ROARING_FILTER_HITS_COUNT,
+        category: CircuitMetricCategory::State,
+        advanced: false,
+        description: "The number of hits across all bitmap filters. The hits are summed across the bitmap filters for all batches in the spine.",
+    },
+    CircuitMetric {
+        name: ROARING_FILTER_MISSES_COUNT,
+        category: CircuitMetricCategory::State,
+        advanced: false,
+        description: "The number of misses across all bitmap filters. The misses are summed across the bitmap filters for all batches in the spine.",
+    },
+    CircuitMetric {
+        name: ROARING_FILTER_HIT_RATE_PERCENT,
+        category: CircuitMetricCategory::State,
+        advanced: false,
+        description: "Hit rate of the bitmap filter.",
     },
     CircuitMetric {
         name: RANGE_FILTER_SIZE_BYTES,
@@ -336,6 +370,12 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 70] = [
         category: CircuitMetricCategory::State,
         advanced: true,
         description: "Information about the batches that were compacted (merged).",
+    },
+    CircuitMetric {
+        name: COMPACTION_STATE,
+        category: CircuitMetricCategory::State,
+        advanced: true,
+        description: "State of the compaction process.",
     },
     // Inputs
     CircuitMetric {

@@ -26,6 +26,7 @@ use std::{borrow::Cow, cell::RefCell, marker::PhantomData, ops::Neg, rc::Rc};
 
 mod lag;
 mod rank;
+mod row_number;
 mod topk;
 
 #[cfg(test)]
@@ -38,6 +39,7 @@ use futures::Stream as AsyncStream;
 use crate::dynamic::{ClonableTrait, Erase};
 pub use lag::{LagCustomOrdFactories, LagFactories};
 pub use rank::RankCustomOrdFactories;
+pub use row_number::RowNumberCustomOrdFactories;
 pub use topk::{TopKCustomOrdFactories, TopKFactories, TopKRankCustomOrdFactories};
 
 /// Specifies the order in which a group transformer produces output tuples.
@@ -322,20 +324,19 @@ where
         OB: IndexedZSet<Key = B::Key>,
     {
         let circuit = self.circuit();
-        let stream = self.dyn_shard(input_factories);
 
         // ```
-        //       ┌────────────────────────────────────────────┐
-        //       │                                            │
-        //       │                                            ▼
-        // stream│  ┌─────────────────────────┐        ┌──────────────┐  output    ┌──────────────────┐
-        // ──────┴─►│integrate().delay_trace()├───────►│GroupTransform├────────────┤UntimedTraceAppend├───┐
-        //          └─────────────────────────┘        └──────────────┘            └──────────────────┘   │
-        //                                                    ▲                          ▲                │
-        //                                                    │                          │                │
-        //                                                    │        delayed_trace   ┌─┴──┐             │
-        //                                                    └────────────────────────┤Z^-1│◄────────────┘
-        //                                                                             └────┘
+        //                                  ┌────────────────────────────────────────────┐
+        //                                  │                                            │
+        //                                  │                                            ▼
+        // stream┌────────────────────────┐ │  ┌─────────────────────────┐        ┌──────────────┐  output    ┌──────────────────┐
+        // ─────►│    shard_accumulate    ├─┴─►│integrate().delay_trace()├───────►│GroupTransform├────────────┤UntimedTraceAppend├───┐
+        //       └────────────────────────┘    └─────────────────────────┘        └──────────────┘            └──────────────────┘   │
+        //                                                                               ▲                          ▲                │
+        //                                                                               │                          │                │
+        //                                                                               │        delayed_trace   ┌─┴──┐             │
+        //                                                                               └────────────────────────┤Z^-1│◄────────────┘
+        //                                                                                                        └────┘
         // ```
         let bounds = TraceBounds::unbounded();
         let feedback = circuit.add_accumulate_integrate_trace_feedback::<Spine<OB>>(
@@ -347,9 +348,9 @@ where
         let output = circuit
             .add_ternary_operator(
                 StreamingTernaryWrapper::new(GroupTransform::new(output_factories, transform)),
-                &stream.dyn_accumulate(input_factories),
-                &stream
-                    .dyn_accumulate_integrate_trace(input_factories)
+                &self.dyn_shard_accumulate(input_factories),
+                &self
+                    .dyn_shard_accumulate_integrate_trace(input_factories)
                     .accumulate_delay_trace(),
                 &feedback.delayed_trace,
             )
@@ -474,7 +475,7 @@ where
             );
 
             let mut buffer = self.output_factories.weighted_items_factory().default_box();
-            buffer.reserve(2 * chunk_size);
+            buffer.try_reserve(chunk_size.saturating_mul(2));
             let monotonicity = self.transformer.borrow().monotonicity();
 
             while delta_cursor.key_valid() {
