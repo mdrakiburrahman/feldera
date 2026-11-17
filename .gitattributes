@@ -1,2 +1,3 @@
 Cargo.lock merge=binary linguist-generated=true
 proptest-regressions/**/* -diff linguist-generated=true
+dev/*.sh text eol=lf

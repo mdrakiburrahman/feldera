@@ -1,0 +1,36 @@
+version: '3'
+
+vars:
+  DISTRO: Ubuntu-24.04
+  REPO: /workspaces/feldera
+  UNC: \\wsl.localhost\{{.DISTRO}}\workspaces\feldera
+
+tasks:
+  default:
+    desc: Recreate WSL, clone this checkout's branch, and start the devcontainer
+    platforms: [windows]
+    cmds:
+      - pwsh -NoProfile -NonInteractive -File bootstrap-dev-env.ps1
+      - task: up
+
+  up:
+    desc: Prepare the existing WSL checkout, start its devcontainer, and open VS Code
+    platforms: [windows]
+    cmds:
+      - pwsh -NoProfile -NonInteractive -File initialize-vscode.ps1
+      - wsl -d {{.DISTRO}} --cd {{.REPO}} --exec ./dev/bootstrap-dev-env.sh
+      - >-
+        wsl -d {{.DISTRO}} --cd {{.REPO}} --exec devcontainer up --workspace-folder {{.REPO}}
+        --id-label 'devcontainer.local_folder={{.UNC}}'
+        --id-label 'devcontainer.config_file={{.REPO}}/.devcontainer/devcontainer.json'
+      - code --folder-uri 'vscode-remote://dev-container+{{printf "%x" .UNC}}{{.REPO}}'
+
+  build-container:
+    desc: Build the pipeline-manager image from sources inside the devcontainer
+    platforms: [windows]
+    cmds:
+      - >-
+        wsl -d {{.DISTRO}} --cd {{.REPO}} --exec devcontainer exec --workspace-folder {{.REPO}}
+        --id-label 'devcontainer.local_folder={{.UNC}}'
+        --id-label 'devcontainer.config_file={{.REPO}}/.devcontainer/devcontainer.json'
+        bash dev/build-container.sh
