@@ -39,7 +39,8 @@ them under `build/` and builds `deploy/Dockerfile` as
 dependencies too. Subsequent runs reuse Cargo, Maven, Gradle, and Docker caches.
 Allow substantial disk space and time for the first build.
 
-Sign in with `gh auth login` first unless repo-bootstrapper already configured
-GitHub access. The embedded PostgreSQL dependency needs authenticated GitHub
-API access during compilation. Azure CLI is installed, but Azure login is not
+Repo-bootstrapper configures GitHub credentials automatically. Otherwise, set
+`GITHUB_TOKEN` or configure Git credentials for `github.com` before building.
+The embedded PostgreSQL dependency needs authenticated GitHub API access
+during compilation. Azure CLI is installed in WSL, but Azure login is not
 required to bootstrap or build.

@@ -3,7 +3,12 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-  GITHUB_TOKEN="$(gh auth token)"
+  GITHUB_TOKEN="$(printf 'protocol=https\nhost=github.com\n\n' |
+    GIT_TERMINAL_PROMPT=0 git credential fill | sed -n 's/^password=//p')"
+fi
+if [[ -z "$GITHUB_TOKEN" ]]; then
+  echo 'Set GITHUB_TOKEN or configure Git credentials for github.com before building.' >&2
+  exit 1
 fi
 export GITHUB_TOKEN
 export FELDERA_PLATFORM_VERSION_SUFFIX="$(git rev-parse HEAD)"
