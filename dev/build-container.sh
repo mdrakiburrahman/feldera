@@ -2,7 +2,10 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-export GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}"
+if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+  GITHUB_TOKEN="$(gh auth token)"
+fi
+export GITHUB_TOKEN
 export FELDERA_PLATFORM_VERSION_SUFFIX="$(git rev-parse HEAD)"
 export FELDERA_BUILD_ORIGIN=source
 target="$(rustc -vV | sed -n 's/^host: //p')"
