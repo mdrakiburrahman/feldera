@@ -212,6 +212,24 @@ The following table lists supported Delta Lake data types and corresponding Feld
 | `VARIANT`                   | `VARIANT`        | Read from the Parquet variant binary encoding, keeping the types the writer encoded (dates, decimals, timestamps and binary stay typed inside the `VARIANT`). A table that enables variant shredding (the `variantShredding` or `variantShredding-preview` table feature) is refused. Timestamps with nanosecond precision are truncated to microseconds. A `VARIANT` column stored as a JSON string is also accepted. |
 
 
+## Retaining ingested rows when source files are removed
+
+Use `ignore_deletes: true` when the source appends data and expires whole files (for
+example, when retention drops time partitions). Feldera skips those file removals
+without opening the removed Parquet files. If one commit both adds and removes
+data-changing files, the connector fails before ingesting any rows from that commit.
+
+Use `ignore_changes: true` for Spark-style rewrite handling. Feldera still skips
+removals but inserts all live rows from data-changing adds. This can emit duplicates,
+including when a commit replaces a file's deletion vector without changing its path:
+Feldera reads the added file with the new vector and does not retract prior rows.
+If both options are enabled, `ignore_changes` takes precedence.
+
+Both options default to `false`. They leave the initial snapshot unchanged and apply
+only while following updates in `follow` or `snapshot_and_follow`. They ignore actions
+with `dataChange: false`, do not use Change Data Feed, and cannot be combined with
+`change_feed: auto` or `require`.
+
 ## Reading the Change Data Feed
 
 The `follow` and `snapshot_and_follow` modes reconstruct each change from the
