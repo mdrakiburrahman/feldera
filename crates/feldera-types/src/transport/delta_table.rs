@@ -931,6 +931,30 @@ fn test_delta_change_feed_excludes_cdc_mode() {
 
 #[cfg(test)]
 #[test]
+fn test_delta_ignore_policies_require_file_following() {
+    use serde_json::json;
+
+    for option in ["ignore_changes", "ignore_deletes"] {
+        for (mode, cdf, expected_error) in [
+            ("snapshot", "off", "snapshot_and_follow"),
+            ("cdc", "off", "snapshot_and_follow"),
+            ("follow", "auto", "change_feed"),
+            ("snapshot_and_follow", "require", "change_feed"),
+        ] {
+            let mut raw = json!({"uri": "memory://", "mode": mode, "change_feed": cdf});
+            raw[option] = json!(true);
+            let config: DeltaTableReaderConfig = serde_json::from_value(raw).unwrap();
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.contains(option) && error.contains(expected_error),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn test_delta_transaction_mode_catchup_serde() {
     let config: DeltaTableReaderConfig = serde_json::from_str(
         r#"{"uri":"s3://bucket/t","mode":"follow","transaction_mode":"catchup"}"#,
