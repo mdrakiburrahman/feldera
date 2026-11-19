@@ -555,8 +555,14 @@ pub struct DeltaTableReaderConfig {
     /// Table read mode.
     pub mode: DeltaTableIngestMode,
 
+    /// While following, skip file removals and insert all live rows from each data-changing Add.
+    /// Rewrites can re-emit rows that were already ingested. Takes precedence over `ignore_deletes`.
+    /// Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ignore_changes: bool,
+
     /// While following, skip commits that only remove files. Reject commits that both add and
-    /// remove data.
+    /// remove data unless `ignore_changes` is also enabled.
     /// Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
     #[serde(default, skip_serializing_if = "is_default")]
     pub ignore_deletes: bool,
@@ -1267,8 +1273,12 @@ impl DeltaTableReaderConfig {
     /// Reject settings the connector cannot act on, so a misconfigured pipeline
     /// fails at startup naming the setting rather than at the first read.
     pub fn validate(&self) -> Result<(), String> {
-        if self.ignore_deletes {
-            let option = "ignore_deletes";
+        if self.ignore_changes || self.ignore_deletes {
+            let option = if self.ignore_changes {
+                "ignore_changes"
+            } else {
+                "ignore_deletes"
+            };
             if !self.follow() || self.is_cdc() {
                 return Err(format!(
                     "'{option}' is only valid in 'follow' and 'snapshot_and_follow' modes"
@@ -1329,8 +1339,8 @@ impl DeltaTableReaderConfig {
     /// A configured value always wins: the override sets the default, it does
     /// not replace an explicit choice.
     pub fn change_feed(&self) -> DeltaTableChangeFeed {
-        // This policy operates on file actions, even if the global CDF default is enabled.
-        if self.ignore_deletes {
+        // These policies operate on file actions, even if the global CDF default is enabled.
+        if self.ignore_changes || self.ignore_deletes {
             return self.change_feed.unwrap_or(DeltaTableChangeFeed::Off);
         }
         self.change_feed.unwrap_or_else(default_change_feed)

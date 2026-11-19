@@ -219,9 +219,15 @@ example, when retention drops time partitions). Feldera skips those file removal
 without opening the removed Parquet files. If one commit both adds and removes
 data-changing files, the connector fails before ingesting any rows from that commit.
 
-The option defaults to `false`, leaves the initial snapshot unchanged, and applies
-only while following updates in `follow` or `snapshot_and_follow`. It ignores actions
-with `dataChange: false`, does not use Change Data Feed, and cannot be combined with
+Use `ignore_changes: true` for Spark-style rewrite handling. Feldera still skips
+removals but inserts all live rows from data-changing adds. This can emit duplicates,
+including when a commit replaces a file's deletion vector without changing its path:
+Feldera reads the added file with the new vector and does not retract prior rows.
+If both options are enabled, `ignore_changes` takes precedence.
+
+Both options default to `false`. They leave the initial snapshot unchanged and apply
+only while following updates in `follow` or `snapshot_and_follow`. They ignore actions
+with `dataChange: false`, do not use Change Data Feed, and cannot be combined with
 `change_feed: auto` or `require`.
 
 ## Reading the Change Data Feed
