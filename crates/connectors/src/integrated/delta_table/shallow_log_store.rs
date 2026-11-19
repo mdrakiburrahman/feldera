@@ -98,7 +98,7 @@ impl LocalDeltaLog {
                     });
                 }
                 // The kernel sorts `file://` listings itself.
-                Ok(stream::iter(objects.into_iter().map(Ok)))
+                Ok::<_, Error>(stream::iter(objects.into_iter().map(Ok)))
             })
             .await
             .map_err(|source| Error::Generic {
