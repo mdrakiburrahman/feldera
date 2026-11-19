@@ -5759,7 +5759,7 @@ fn change_feed_row(id: u32, s: &str) -> Value {
 #[engine_test(requires(Storage))]
 pub fn delta_follow_retention_policies_test(engine: &dyn PipelineTestEngine) {
     run_async_on(2, async {
-        for policy in [None, Some("ignore_deletes")] {
+        for policy in [None, Some("ignore_changes"), Some("ignore_deletes")] {
             let table_dir = TempDir::new().unwrap();
             let uri = table_dir.path().to_str().unwrap();
             let relation = basic_relation();
@@ -5844,7 +5844,11 @@ pub fn delta_follow_retention_policies_test(engine: &dyn PipelineTestEngine) {
             } else {
                 let mut rewritten = expected[0].clone();
                 rewritten["b"] = json!(true);
-                expected[0] = rewritten;
+                if policy == Some("ignore_changes") {
+                    expected.push(rewritten);
+                } else {
+                    expected[0] = rewritten;
+                }
                 wait_or_connector_error(&pipeline, &output, &relation, &expected, &errors).await;
             }
             pipeline.stop().unwrap();

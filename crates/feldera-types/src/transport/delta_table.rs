@@ -959,32 +959,26 @@ fn test_delta_change_feed_excludes_cdc_mode() {
 
 #[cfg(test)]
 #[test]
-fn test_delta_ignore_deletes_requires_file_following() {
+fn test_delta_ignore_policies_require_file_following() {
     use serde_json::json;
 
-    for (mode, cdf, expected_error) in [
-        ("snapshot", "off", "snapshot_and_follow"),
-        ("cdc", "off", "snapshot_and_follow"),
-        ("follow", "auto", "change_feed"),
-        ("snapshot_and_follow", "require", "change_feed"),
-    ] {
-        let raw =
-            json!({"uri": "memory://", "mode": mode, "change_feed": cdf, "ignore_deletes": true});
-        let config: DeltaTableReaderConfig = serde_json::from_value(raw).unwrap();
-        let error = config.validate().unwrap_err();
-        assert!(
-            error.contains("ignore_deletes") && error.contains(expected_error),
-            "{error}"
-        );
+    for option in ["ignore_changes", "ignore_deletes"] {
+        for (mode, cdf, expected_error) in [
+            ("snapshot", "off", "snapshot_and_follow"),
+            ("cdc", "off", "snapshot_and_follow"),
+            ("follow", "auto", "change_feed"),
+            ("snapshot_and_follow", "require", "change_feed"),
+        ] {
+            let mut raw = json!({"uri": "memory://", "mode": mode, "change_feed": cdf});
+            raw[option] = json!(true);
+            let config: DeltaTableReaderConfig = serde_json::from_value(raw).unwrap();
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.contains(option) && error.contains(expected_error),
+                "{error}"
+            );
+        }
     }
-    let config: DeltaTableReaderConfig = serde_json::from_value(
-        json!({"uri": "memory://", "mode": "snapshot_and_follow", "ignore_deletes": true}),
-    )
-    .unwrap();
-    assert!(config.ignore_deletes);
-    assert!(config.object_store_config.is_empty());
-    assert!(config.validate().is_ok());
-    assert_eq!(config.change_feed(), DeltaTableChangeFeed::Off);
 }
 
 #[cfg(test)]
