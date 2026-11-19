@@ -54,10 +54,10 @@ use deltalake::kernel::{
     Action, Add as AddAction, AddCDCFile as AddCdcAction, DeletionVectorDescriptor,
     Remove as RemoveAction,
 };
-use deltalake::logstore::{self, IORuntime};
+use deltalake::logstore;
 use deltalake::table::builder::ensure_table_uri;
 use deltalake::table::config::TablePropertiesExt;
-use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, Path, datafusion};
+use deltalake::{DeltaTable, DeltaTableError, Path, datafusion};
 use feldera_adapterlib::format::{ParseError, StagedInputBuffer};
 use feldera_adapterlib::metrics::{ConnectorMetrics, ValueType};
 use feldera_adapterlib::transport::{InputQueueEntry, Resume, Watermark, parse_resume_info};
@@ -3077,7 +3077,6 @@ impl DeltaTableInputEndpointInner {
             &self.endpoint_name, &self.config.uri
         );
 
-        // DeltaTableBuilder::from_uri panics on error, so we use `from_valid_uri` instead.
         let url = ensure_table_uri(&self.config.uri).map_err(|e| {
             ControllerError::invalid_transport_configuration(
                 &self.endpoint_name,
@@ -3101,15 +3100,15 @@ impl DeltaTableInputEndpointInner {
 
             loop {
                 // DeltaTableBuilder doesn't implement Clone, so we need to create a new instance every time.
-                let table_builder = DeltaTableBuilder::from_url(url.clone())
-                    .map_err(|e| {
-                        ControllerError::invalid_transport_configuration(
-                            &self.endpoint_name,
-                            &format!("invalid Delta table URL '{url}': {e}"),
-                        )
-                    })?
-                    .with_storage_options(self.config.object_store_config.clone())
-                    .with_io_runtime(IORuntime::RT(TOKIO_DEDICATED_IO.handle().clone()));
+                let table_builder =
+                    super::shallow_log_store::table_builder(&url, TOKIO_DEDICATED_IO.handle())
+                        .map_err(|e| {
+                            ControllerError::invalid_transport_configuration(
+                                &self.endpoint_name,
+                                &format!("invalid Delta table URL '{url}': {e}"),
+                            )
+                        })?
+                        .with_storage_options(self.config.object_store_config.clone());
 
                 let table_builder = if let Some(DeltaResumeInfo {
                     version: Some(version),
@@ -4630,10 +4629,9 @@ impl DeltaTableInputEndpointInner {
                 Some("delta-schema-load"),
                 || async {
                     // DeltaTableBuilder isn't Clone, so build it anew on each retry.
-                    DeltaTableBuilder::from_url(url.clone())
+                    super::shallow_log_store::table_builder(&url, TOKIO_DEDICATED_IO.handle())
                         .map_err(|e| anyhow!("invalid Delta table URL '{url}': {e}"))?
                         .with_storage_options(self.config.object_store_config.clone())
-                        .with_io_runtime(IORuntime::RT(TOKIO_DEDICATED_IO.handle().clone()))
                         .with_version(version)
                         .load()
                         .await

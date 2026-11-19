@@ -20,6 +20,10 @@ The Delta Lake input connector supports checkpoint and resume and
 at-least-once [fault tolerance](/pipelines/fault-tolerance), but not
 exactly once fault tolerance.
 
+For local `file://` tables, the reader discovers commits and checkpoints by listing only
+files directly inside `_delta_log`. It does not scan auxiliary subdirectories; log files
+referenced by an explicit path, such as checkpoint sidecars, remain accessible.
+
 ## Delta Lake input connector configuration
 
 | Property                    | Type   | Default    | Description   |

@@ -4,6 +4,7 @@ mod field_id_adapter;
 pub(crate) mod input;
 pub(crate) mod merge;
 pub(crate) mod output;
+mod shallow_log_store;
 
 pub use output::delta_output_serde_config;
 

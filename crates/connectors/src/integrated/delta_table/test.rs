@@ -5770,6 +5770,15 @@ pub fn delta_follow_retention_policies_test(engine: &dyn PipelineTestEngine) {
             let delta = create_table_from_arrow(uri, &change_feed_arrow_schema(), &["s"]).await;
             let delta = write_data_to_table(delta, &relation, &initial).await;
 
+            let stats = table_dir.path().join("_delta_log/_stats/region/date");
+            std::fs::create_dir_all(&stats).unwrap();
+            for id in 0..128 {
+                std::fs::write(stats.join(format!("{id}.json")), "{}").unwrap();
+            }
+            // A recursive walk follows this loop and fails before the kernel can filter it.
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(".", stats.join("loop")).unwrap();
+
             let storage_dir = TempDir::new().unwrap();
             let errors = Arc::new(Mutex::new(Vec::new()));
             let mut config = json!({"mode": "snapshot_and_follow", "change_feed": "off"});
@@ -5783,6 +5792,9 @@ pub fn delta_follow_retention_policies_test(engine: &dyn PipelineTestEngine) {
             pipeline.start();
             let output = SqlIdentifier::from("test_output1");
             wait_or_connector_error(&pipeline, &output, &relation, &initial, &errors).await;
+            // Fixture commits are written by the unwrapped delta-rs writer.
+            #[cfg(unix)]
+            std::fs::remove_file(stats.join("loop")).unwrap();
 
             pipeline
                 .pause_input_endpoint(DELTA_TEST_INPUT_ENDPOINT)
