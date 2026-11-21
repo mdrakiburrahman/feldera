@@ -212,6 +212,12 @@ class FelderaConnectionManager(BaseConnectionManager):
         else:
             column_names = []
 
+        if column_names == ["failures", "should_warn", "should_error"]:
+            return agate.Table(
+                rows=rows,
+                column_names=column_names,
+                column_types=[agate.Number(), agate.Boolean(), agate.Boolean()],
+            )
         return agate.Table(rows=rows, column_names=column_names)
 
 

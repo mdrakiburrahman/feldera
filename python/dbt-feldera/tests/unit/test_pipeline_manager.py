@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 from feldera.enums import PipelineStatus
 from feldera.runtime_config import RuntimeConfig
 
-from dbt.adapters.feldera.pipeline_manager import PipelineStateManager
+from dbt.adapters.feldera.pipeline_manager import PipelineStateManager, _normalize_runtime_config
 
 
 class TestPipelineStateManager(unittest.TestCase):
@@ -200,6 +200,43 @@ class TestPipelineStateManagerRename(unittest.TestCase):
 
 
 class TestPipelineReuse(unittest.TestCase):
+    def test_server_expanded_runtime_config(self):
+        expanded = {
+            "workers": 8,
+            "max_rss": "44Gi",
+            "hosts": 1,
+            "storage": {"backend": {"name": "default"}, "compression": "default", "compression_level": None},
+            "fault_tolerance": {"model": "none"},
+            "cpu_profiler": True,
+            "tracing": False,
+            "tracing_endpoint_jaeger": "127.0.0.1:6831",
+            "min_batch_size_records": 0,
+            "resources": {
+                "cpu_cores_min": None,
+                "cpu_cores_max": None,
+                "storage_class": None,
+                "service_account_name": None,
+                "namespace": None,
+            },
+            "clock_timezone_offset": None,
+            "pin_cpus": [],
+            "max_parallel_connector_init": None,
+            "init_containers": None,
+            "checkpoint_during_suspend": True,
+            "http_workers": None,
+            "io_workers": None,
+            "env": {},
+            "dev_tweaks": {},
+            "logging": None,
+            "pipeline_template_configmap": None,
+        }
+        actual = _normalize_runtime_config(expanded)
+        self.assertEqual(actual, _normalize_runtime_config({"workers": 8, "max_rss": "44Gi"}))
+        self.assertEqual(actual, _normalize_runtime_config({"workers": 8, "max_rss": "44Gi", "storage": True}))
+        self.assertNotEqual(actual, _normalize_runtime_config({"workers": 8}))
+        self.assertNotEqual(actual, _normalize_runtime_config({"workers": 8, "max_rss": "45Gi"}))
+        self.assertNotEqual(actual, _normalize_runtime_config({"workers": 8, "max_rss": "44Gi", "storage": False}))
+
     def setUp(self):
         self.manager = PipelineStateManager()
         self.manager.register_table("pipe", "events", "CREATE TABLE events (id INT)")

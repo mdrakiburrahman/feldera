@@ -1,6 +1,25 @@
 import unittest
+from unittest.mock import Mock
 
+import agate
+
+from dbt.adapters.feldera.connections import FelderaConnectionManager
 from dbt.adapters.feldera.impl import FelderaAdapter
+
+
+class TestResultTable(unittest.TestCase):
+    def test_dbt_test_counts_are_numeric(self):
+        cursor = Mock()
+        cursor.description = [("failures",), ("should_warn",), ("should_error",)]
+        for failures in (0, 1):
+            with self.subTest(failures=failures):
+                cursor.fetchall.return_value = [(failures, False, failures > 0)]
+                table = FelderaConnectionManager._get_result_table(cursor)
+                self.assertIsInstance(table.column_types[0], agate.Number)
+                self.assertIsInstance(table.column_types[1], agate.Boolean)
+                self.assertIsInstance(table.column_types[2], agate.Boolean)
+                self.assertEqual(table.rows[0][0], failures)
+                self.assertEqual(table.rows[0][2], failures > 0)
 
 
 class TestFelderaAdapterStaticMethods(unittest.TestCase):
