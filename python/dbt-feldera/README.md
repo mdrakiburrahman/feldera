@@ -252,10 +252,7 @@ dbt seed --full-refresh # stop, clear storage, redeploy, then push
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and
 project layout.
 
-## License
-
-Apache-2.0 — see [LICENSE](../../LICENSE) for details.
-# Pipeline UDFs and runtime configuration
+## Pipeline UDFs and runtime configuration
 
 Set project variables to paths relative to the dbt project root. The SQL file
 contains the `CREATE FUNCTION` declarations; the Rust and TOML files contain
@@ -293,3 +290,7 @@ UDFs, runtime configuration, and compilation profile match. `--full-refresh`
 clears state. Seed runs still replace the pipeline and reload seed data.
 Tests in `dbt build` run before the on-run-end deployment; deploy models with
 `dbt run` before testing a new or changed pipeline.
+
+## License
+
+Apache-2.0 — see [LICENSE](../../LICENSE) for details.

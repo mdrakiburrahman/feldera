@@ -16,41 +16,6 @@ The following are required to build images and deploy them:
 First, clone the `feldera` repository and navigate into it.
 All commands below should be run from the root directory of the repository.
 
-### Build and publish a source image
-
-Use the source-build prerequisites in the root README. From a clean checkout,
-build the SQL compiler and pipeline manager for the target architecture, then
-place their artifacts in `build/` for the runtime Dockerfile:
-
-```bash
-(cd sql-to-dbsp-compiler && bash build.sh -pl SQL-compiler)
-cargo build --locked --release --bin pipeline-manager
-mkdir -p build
-cp target/release/pipeline-manager build/
-cp sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp*.jar build/
-```
-
-Authenticate Docker to your registry, set `IMAGE_REPOSITORY` to the desired
-repository, and build and push from the same commit:
-
-```bash
-IMAGE_REPOSITORY=registry.example.com/team/feldera
-IMAGE="$IMAGE_REPOSITORY:$(git rev-parse --short=12 HEAD)"
-docker buildx build --platform linux/amd64 -f deploy/Dockerfile \
-  --tag "$IMAGE" --push .
-```
-
-Record the pushed index digest, the linux/amd64 manifest digest, and its config
-digest. These commands require `jq` and registry read access:
-
-```bash
-docker buildx imagetools inspect "$IMAGE"
-MANIFEST=$(docker buildx imagetools inspect --raw "$IMAGE" |
-  jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest')
-echo "amd64 manifest: $MANIFEST"
-docker buildx imagetools inspect --raw "$IMAGE_REPOSITORY@$MANIFEST" | jq -r '.config.digest'
-```
-
 - **Latest release (same as Quickstart):**
   ```bash
   docker compose -f deploy/docker-compose.yml up
@@ -112,6 +77,41 @@ docker buildx imagetools inspect --raw "$IMAGE_REPOSITORY@$MANIFEST" | jq -r '.c
                  -f deploy/docker-compose-extra.yml \
                  --profile postgres --profile kafka-connect up --build
   ```
+
+### Build and publish a source image
+
+Use the source-build prerequisites in the root README. From a clean checkout,
+build the SQL compiler and pipeline manager for the target architecture, then
+place their artifacts in `build/` for the runtime Dockerfile:
+
+```bash
+(cd sql-to-dbsp-compiler && bash build.sh -pl SQL-compiler)
+cargo build --locked --release --bin pipeline-manager
+mkdir -p build
+cp target/release/pipeline-manager build/
+cp sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp*.jar build/
+```
+
+Authenticate Docker to your registry, set `IMAGE_REPOSITORY` to the desired
+repository, and build and push from the same commit:
+
+```bash
+IMAGE_REPOSITORY=registry.example.com/team/feldera
+IMAGE="$IMAGE_REPOSITORY:$(git rev-parse --short=12 HEAD)"
+docker buildx build --platform linux/amd64 -f deploy/Dockerfile \
+  --tag "$IMAGE" --push .
+```
+
+Record the pushed index digest, the linux/amd64 manifest digest, and its config
+digest. These commands require `jq` and registry read access:
+
+```bash
+docker buildx imagetools inspect "$IMAGE"
+MANIFEST=$(docker buildx imagetools inspect --raw "$IMAGE" |
+  jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest')
+echo "amd64 manifest: $MANIFEST"
+docker buildx imagetools inspect --raw "$IMAGE_REPOSITORY@$MANIFEST" | jq -r '.config.digest'
+```
 
 # How to add a new package to the Docker images
 
