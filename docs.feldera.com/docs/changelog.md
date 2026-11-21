@@ -10,6 +10,8 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- Delta Lake sources support `ignore_deletes` to retain rows when source files expire.
+
 - Incompatible change (REST API, fda): the endpoint
   `GET /v0/pipelines/{pipeline_name}/circuit_profile`, which returned the
   circuit profile as graphviz `.dot` files in a zip archive, is removed, and so

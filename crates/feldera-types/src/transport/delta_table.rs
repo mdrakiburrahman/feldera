@@ -553,6 +553,12 @@ pub struct DeltaTableReaderConfig {
     /// Table read mode.
     pub mode: DeltaTableIngestMode,
 
+    /// While following, skip commits that only remove files. Reject commits that both add and
+    /// remove data.
+    /// Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ignore_deletes: bool,
+
     /// Transaction mode.
     ///
     /// Determines how the connector breaks up its input into transactions.
@@ -919,6 +925,34 @@ fn test_delta_change_feed_excludes_cdc_mode() {
 
 #[cfg(test)]
 #[test]
+fn test_delta_ignore_deletes_requires_file_following() {
+    use serde_json::json;
+
+    for (mode, cdf, expected_error) in [
+        ("snapshot", "off", "snapshot_and_follow"),
+        ("cdc", "off", "snapshot_and_follow"),
+        ("follow", "auto", "change_feed"),
+        ("snapshot_and_follow", "require", "change_feed"),
+    ] {
+        let raw =
+            json!({"uri": "memory://", "mode": mode, "change_feed": cdf, "ignore_deletes": true});
+        let config: DeltaTableReaderConfig = serde_json::from_value(raw).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.contains("ignore_deletes") && error.contains(expected_error),
+            "{error}"
+        );
+    }
+    let config: DeltaTableReaderConfig = serde_json::from_value(
+        json!({"uri": "memory://", "mode": "snapshot_and_follow", "ignore_deletes": true}),
+    )
+    .unwrap();
+    assert!(config.validate().is_ok());
+    assert_eq!(config.change_feed(), DeltaTableChangeFeed::Off);
+}
+
+#[cfg(test)]
+#[test]
 fn test_delta_transaction_mode_catchup_serde() {
     let config: DeltaTableReaderConfig = serde_json::from_str(
         r#"{"uri":"s3://bucket/t","mode":"follow","transaction_mode":"catchup"}"#,
@@ -1203,6 +1237,22 @@ impl DeltaTableReaderConfig {
     /// Reject settings the connector cannot act on, so a misconfigured pipeline
     /// fails at startup naming the setting rather than at the first read.
     pub fn validate(&self) -> Result<(), String> {
+        if self.ignore_deletes {
+            let option = "ignore_deletes";
+            if !self.follow() || self.is_cdc() {
+                return Err(format!(
+                    "'{option}' is only valid in 'follow' and 'snapshot_and_follow' modes"
+                ));
+            }
+            if self
+                .change_feed
+                .is_some_and(|feed| feed != DeltaTableChangeFeed::Off)
+            {
+                return Err(format!(
+                    "'{option}' requires 'change_feed' to be 'off' or omitted"
+                ));
+            }
+        }
         if self.batch_size.is_some_and(|n| n == 0) {
             return Err("'batch_size' must be greater than 0".to_string());
         }
@@ -1249,6 +1299,10 @@ impl DeltaTableReaderConfig {
     /// A configured value always wins: the override sets the default, it does
     /// not replace an explicit choice.
     pub fn change_feed(&self) -> DeltaTableChangeFeed {
+        // This policy operates on file actions, even if the global CDF default is enabled.
+        if self.ignore_deletes {
+            return self.change_feed.unwrap_or(DeltaTableChangeFeed::Off);
+        }
         self.change_feed.unwrap_or_else(default_change_feed)
     }
 

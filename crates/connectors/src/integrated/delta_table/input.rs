@@ -4079,6 +4079,19 @@ impl DeltaTableInputEndpointInner {
         let used_column_names = self.used_columns();
         let used_columns: Vec<&str> = used_column_names.iter().map(String::as_str).collect();
 
+        if self.config.ignore_deletes
+            && actions
+                .iter()
+                .any(|a| matches!(a, Action::Add(add) if add.data_change))
+            && actions
+                .iter()
+                .any(|a| matches!(a, Action::Remove(remove) if remove.data_change))
+        {
+            bail!(
+                "Delta table version {version} rewrites data, which is not supported with 'ignore_deletes'"
+            );
+        }
+
         // TODO: consider processing all Add actions and all Remove actions in one
         // go using `ListingTable`, which understands partitioning and can probably
         // parallelize the load.
@@ -4136,6 +4149,9 @@ impl DeltaTableInputEndpointInner {
         // data-change pairs, so a metadata-only action never matches.
         for action in actions {
             if let Action::Remove(remove) = action {
+                if self.config.ignore_deletes {
+                    continue;
+                }
                 let newly_deleted = dv_deltas
                     .get(remove.path.as_str())
                     .map(|(newly_deleted, _)| newly_deleted);
