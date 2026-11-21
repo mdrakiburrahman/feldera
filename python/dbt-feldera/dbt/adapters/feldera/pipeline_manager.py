@@ -216,6 +216,7 @@ class PipelineStateManager:
         udf_sql: str = "",
         udf_rust: str = "",
         udf_toml: str = "",
+        replace: bool = False,
     ) -> Pipeline:
         """
         Deploy the assembled pipeline to Feldera.
@@ -247,6 +248,25 @@ class PipelineStateManager:
 
             config = dict(runtime_config or {})
             config.setdefault("workers", workers)
+
+            if not replace:
+                try:
+                    existing = Pipeline.get(pipeline, client)
+                except FelderaAPIError as exc:
+                    if exc.status_code != 404:
+                        raise
+                else:
+                    if (
+                        existing.status() == PipelineStatus.RUNNING
+                        and existing.program_code() == sql
+                        and existing.udf_rust() == udf_rust
+                        and existing.udf_toml() == udf_toml
+                        and existing.runtime_config().to_dict() == config
+                        and existing.program_config().get("profile") == compilation_profile
+                    ):
+                        self._deployed_sql[pipeline] = sql
+                        self._pipelines[pipeline] = existing
+                        return existing
 
             builder = PipelineBuilder(
                 client,

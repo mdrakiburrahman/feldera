@@ -438,7 +438,13 @@ class FelderaAdapter(BaseAdapter):
         return ""
 
     @available
-    def deploy_pipeline(self, pipeline_name: str) -> str:
+    def deploy_pipeline(
+        self,
+        pipeline_name: str,
+        udf_sql_path: str | None = None,
+        udf_rust_path: str | None = None,
+        udf_toml_path: str | None = None,
+    ) -> str:
         """
         Deploy the assembled pipeline to Feldera.
 
@@ -450,12 +456,17 @@ class FelderaAdapter(BaseAdapter):
         """
         client = self._get_client()
         creds = self._get_credentials()
+        udf_sql, udf_rust, udf_toml = self._read_udfs(udf_sql_path, udf_rust_path, udf_toml_path)
         _pipeline_state.deploy(
             client,
             pipeline_name,
             compilation_profile=creds.compilation_profile,
             workers=creds.workers,
             timeout=creds.timeout,
+            runtime_config=creds.runtime_config,
+            udf_sql=udf_sql,
+            udf_rust=udf_rust,
+            udf_toml=udf_toml,
         )
         return ""
 
@@ -570,12 +581,7 @@ class FelderaAdapter(BaseAdapter):
         client = self._get_client()
         creds = self._get_credentials()
 
-        def read_file(path: str | None) -> str:
-            return (Path(self.config.project_root) / path).read_text(encoding="utf-8") if path else ""
-
-        udf_sql = read_file(udf_sql_path)
-        udf_rust = read_file(udf_rust_path)
-        udf_toml = read_file(udf_toml_path)
+        udf_sql, udf_rust, udf_toml = self._read_udfs(udf_sql_path, udf_rust_path, udf_toml_path)
 
         seed_pipelines = _pipeline_state.get_pending_seed_pipelines()
         for pipeline_name in seed_pipelines:
@@ -591,6 +597,7 @@ class FelderaAdapter(BaseAdapter):
                 udf_sql=udf_sql,
                 udf_rust=udf_rust,
                 udf_toml=udf_toml,
+                replace=True,
             )
 
             for table_name, agate_table, column_types in _pipeline_state.pop_pending_seeds(pipeline_name):
@@ -625,6 +632,12 @@ class FelderaAdapter(BaseAdapter):
             )
 
         return ""
+
+    def _read_udfs(self, sql_path: str | None, rust_path: str | None, toml_path: str | None) -> tuple[str, str, str]:
+        def read_file(path: str | None) -> str:
+            return (Path(self.config.project_root) / path).read_text(encoding="utf-8") if path else ""
+
+        return read_file(sql_path), read_file(rust_path), read_file(toml_path)
 
     @staticmethod
     def _convert_agate_rows(agate_table: agate.Table, column_types: dict | None = None) -> list:

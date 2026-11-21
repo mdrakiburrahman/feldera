@@ -2,9 +2,10 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from dbt.adapters.feldera.pipeline_manager import PipelineStateManager
 from feldera.enums import PipelineStatus
 from feldera.runtime_config import RuntimeConfig
+
+from dbt.adapters.feldera.pipeline_manager import PipelineStateManager
 
 
 class TestPipelineStateManager(unittest.TestCase):
@@ -231,6 +232,20 @@ class TestPipelineReuse(unittest.TestCase):
         self.pipeline.stop.assert_not_called()
         self.pipeline.modify.assert_not_called()
         self.pipeline.start.assert_not_called()
+
+    def test_deploy_reuses_running_pipeline(self):
+        with patch("dbt.adapters.feldera.pipeline_manager.Pipeline.get", return_value=self.pipeline):
+            with patch("dbt.adapters.feldera.pipeline_manager.PipelineBuilder") as builder:
+                result = self.manager.deploy(
+                    Mock(),
+                    "pipe",
+                    runtime_config=self.config,
+                    udf_sql=self.udf_sql,
+                    udf_rust="rust",
+                    udf_toml="toml",
+                )
+        self.assertIs(result, self.pipeline)
+        builder.assert_not_called()
 
     def test_changes_and_full_refresh_redeploy(self):
         for overrides in (

@@ -30,7 +30,7 @@
     {{ adapter.register_table(pipeline_name, model.name ~ '__pipeline_program', sql) }}
 
     {# Deploy the full pipeline #}
-    {{ adapter.deploy_pipeline(pipeline_name) }}
+    {{ adapter.deploy_pipeline(pipeline_name, var('feldera_udf_sql', none), var('feldera_udf_rust', none), var('feldera_udf_toml', none)) }}
 
     {{ return({'relations': [this]}) }}
 {% endmaterialization %}

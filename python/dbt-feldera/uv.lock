@@ -305,7 +305,7 @@ wheels = [
 
 [[package]]
 name = "dbt-feldera"
-version = "0.370.0"
+version = "0.384.0"
 source = { editable = "." }
 dependencies = [
     { name = "agate" },
