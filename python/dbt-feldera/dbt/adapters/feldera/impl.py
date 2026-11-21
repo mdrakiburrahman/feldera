@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from typing import FrozenSet, List, Optional, Set, Tuple
 
 import agate
@@ -537,7 +538,13 @@ class FelderaAdapter(BaseAdapter):
         return ""
 
     @available
-    def finalize_seeds(self, full_refresh: bool = False) -> str:
+    def finalize_seeds(
+        self,
+        full_refresh: bool = False,
+        udf_sql_path: str | None = None,
+        udf_rust_path: str | None = None,
+        udf_toml_path: str | None = None,
+    ) -> str:
         """
         Deploy pipelines with pending seeds and push all stashed data,
         then update any pipelines with pending views.
@@ -563,6 +570,13 @@ class FelderaAdapter(BaseAdapter):
         client = self._get_client()
         creds = self._get_credentials()
 
+        def read_file(path: str | None) -> str:
+            return (Path(self.config.project_root) / path).read_text(encoding="utf-8") if path else ""
+
+        udf_sql = read_file(udf_sql_path)
+        udf_rust = read_file(udf_rust_path)
+        udf_toml = read_file(udf_toml_path)
+
         seed_pipelines = _pipeline_state.get_pending_seed_pipelines()
         for pipeline_name in seed_pipelines:
             logger.info("Finalizing seeds for pipeline '%s'", pipeline_name)
@@ -573,6 +587,10 @@ class FelderaAdapter(BaseAdapter):
                 compilation_profile=creds.compilation_profile,
                 workers=creds.workers,
                 timeout=creds.timeout,
+                runtime_config=creds.runtime_config,
+                udf_sql=udf_sql,
+                udf_rust=udf_rust,
+                udf_toml=udf_toml,
             )
 
             for table_name, agate_table, column_types in _pipeline_state.pop_pending_seeds(pipeline_name):
@@ -600,6 +618,10 @@ class FelderaAdapter(BaseAdapter):
                 workers=creds.workers,
                 timeout=creds.timeout,
                 full_refresh=full_refresh,
+                runtime_config=creds.runtime_config,
+                udf_sql=udf_sql,
+                udf_rust=udf_rust,
+                udf_toml=udf_toml,
             )
 
         return ""
