@@ -1,7 +1,7 @@
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import agate
 
@@ -13,6 +13,66 @@ from feldera.rest.feldera_client import FelderaClient
 from feldera.runtime_config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
+
+_RUNTIME_DEFAULTS = {
+    "hosts": 1,
+    "storage": True,
+    "fault_tolerance": {"model": "none"},
+    "cpu_profiler": True,
+    "tracing": False,
+    "tracing_endpoint_jaeger": "127.0.0.1:6831",
+    "min_batch_size_records": 0,
+    "resources": {},
+    "pin_cpus": [],
+    "checkpoint_during_suspend": True,
+    "env": {},
+    "dev_tweaks": {},
+}
+_OPTIONAL_RUNTIME_FIELDS = {
+    "max_rss",
+    "datafusion_memory",
+    "max_buffering_delay",
+    "clock_resolution",
+    "clock_timezone_offset",
+    "provisioning_timeout",
+    "max_parallel_connector_init",
+    "init_containers",
+    "http_workers",
+    "io_workers",
+    "logging",
+    "pipeline_template_configmap",
+}
+
+
+def _normalize_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
+    result = {**_RUNTIME_DEFAULTS, **config}
+    for key in _OPTIONAL_RUNTIME_FIELDS:
+        if result.get(key) is None:
+            result.pop(key, None)
+
+    resources = result["resources"]
+    if isinstance(resources, dict):
+        result["resources"] = {key: value for key, value in resources.items() if value is not None}
+
+    storage = result["storage"]
+    if storage is True:
+        storage = {}
+    elif storage is False:
+        storage = None
+    if isinstance(storage, dict):
+        storage = {
+            "backend": {"name": "default"},
+            "compression": "default",
+            "compression_level": None,
+            **storage,
+        }
+    result["storage"] = storage
+
+    if result["fault_tolerance"] is None:
+        result["fault_tolerance"] = {"model": "none"}
+    elif isinstance(result["fault_tolerance"], dict) and "fault_tolerance" in config:
+        result["fault_tolerance"] = {"model": "exactly_once", **result["fault_tolerance"]}
+    return result
 
 
 class PipelineStateManager:
@@ -212,6 +272,11 @@ class PipelineStateManager:
         compilation_profile: str = "dev",
         workers: int = 4,
         timeout: int = 300,
+        runtime_config: Optional[dict[str, Any]] = None,
+        udf_sql: str = "",
+        udf_rust: str = "",
+        udf_toml: str = "",
+        replace: bool = False,
     ) -> Pipeline:
         """
         Deploy the assembled pipeline to Feldera.
@@ -229,7 +294,7 @@ class PipelineStateManager:
         :return: The deployed Pipeline object.
         """
         with self._lock:
-            sql = self.assemble_program(pipeline)
+            sql = "\n\n".join(part for part in (udf_sql.strip(), self.assemble_program(pipeline)) if part)
             if not sql.strip():
                 raise RuntimeError(f"Pipeline '{pipeline}' has no tables or views registered")
 
@@ -241,15 +306,37 @@ class PipelineStateManager:
             elif compilation_profile == "unoptimized":
                 profile = CompilationProfile.UNOPTIMIZED
 
-            runtime_config = RuntimeConfig.default()
-            runtime_config.workers = workers
+            config = dict(runtime_config or {})
+            config.setdefault("workers", workers)
+
+            if not replace:
+                try:
+                    existing = Pipeline.get(pipeline, client)
+                except FelderaAPIError as exc:
+                    if exc.status_code != 404:
+                        raise
+                else:
+                    if (
+                        existing.status() == PipelineStatus.RUNNING
+                        and existing.program_code() == sql
+                        and existing.udf_rust() == udf_rust
+                        and existing.udf_toml() == udf_toml
+                        and _normalize_runtime_config(vars(existing.runtime_config()))
+                        == _normalize_runtime_config(config)
+                        and existing.program_config().get("profile") == compilation_profile
+                    ):
+                        self._deployed_sql[pipeline] = sql
+                        self._pipelines[pipeline] = existing
+                        return existing
 
             builder = PipelineBuilder(
                 client,
                 name=pipeline,
                 sql=sql,
                 compilation_profile=profile,
-                runtime_config=runtime_config,
+                runtime_config=RuntimeConfig.from_dict(config),
+                udf_rust=udf_rust,
+                udf_toml=udf_toml,
             )
 
             p = builder.create_or_replace(wait=True)
@@ -271,6 +358,10 @@ class PipelineStateManager:
         workers: int = 4,
         timeout: int = 300,
         full_refresh: bool = False,
+        runtime_config: Optional[dict[str, Any]] = None,
+        udf_sql: str = "",
+        udf_rust: str = "",
+        udf_toml: str = "",
     ) -> Pipeline:
         """
         Update and redeploy an existing pipeline with new views.
@@ -311,10 +402,14 @@ class PipelineStateManager:
             try:
                 p = Pipeline.get(pipeline, client)
                 existing_sql = p.program_code()
-            except FelderaAPIError:
+            except FelderaAPIError as exc:
+                if exc.status_code != 404:
+                    raise
                 # Pipeline doesn't exist yet — fall back to full deploy
                 logger.info("Pipeline '%s' not found, falling back to full deploy", pipeline)
-                return self.deploy(client, pipeline, compilation_profile, workers, timeout)
+                return self.deploy(
+                    client, pipeline, compilation_profile, workers, timeout, runtime_config, udf_sql, udf_rust, udf_toml
+                )
 
             # Extract only CREATE TABLE statements from existing SQL
             # (discard existing CREATE VIEW statements to avoid duplicates)
@@ -324,11 +419,12 @@ class PipelineStateManager:
             # existing pipeline
             local_tables = self._tables.get(pipeline, {})
             if local_tables:
-                existing_names = self._extract_table_names(table_parts)
+                local_names = {name.lower() for name in local_tables}
+                table_parts = [
+                    ddl for ddl in table_parts if not self._extract_table_names([ddl]).intersection(local_names)
+                ]
                 for name, ddl in local_tables.items():
-                    if name.lower() not in existing_names:
-                        table_parts.append(ddl.rstrip().rstrip(";") + ";")
-                        logger.debug("Added locally registered table '%s' to pipeline '%s'", name, pipeline)
+                    table_parts.append(ddl.rstrip().rstrip(";") + ";")
 
             # Assemble new views
             view_parts = []
@@ -336,7 +432,23 @@ class PipelineStateManager:
                 view_parts.append(ddl.rstrip().rstrip(";") + ";")
 
             # Combine existing tables with new views
-            full_sql = "\n\n".join(table_parts + view_parts)
+            full_sql = "\n\n".join(([udf_sql.strip()] if udf_sql.strip() else []) + table_parts + view_parts)
+            config = dict(runtime_config or {})
+            config.setdefault("workers", workers)
+            program_config = dict(p.program_config())
+            config_unchanged = _normalize_runtime_config(vars(p.runtime_config())) == _normalize_runtime_config(config)
+            if (
+                not full_refresh
+                and p.status() == PipelineStatus.RUNNING
+                and existing_sql == full_sql
+                and p.udf_rust() == udf_rust
+                and p.udf_toml() == udf_toml
+                and config_unchanged
+                and program_config.get("profile") == compilation_profile
+            ):
+                self._deployed_sql[pipeline] = full_sql
+                self._pipelines[pipeline] = p
+                return p
 
             logger.info(
                 "Updating pipeline '%s' with %d views (%d chars total SQL)",
@@ -346,22 +458,24 @@ class PipelineStateManager:
             )
 
             # Stop the pipeline before modifying its SQL
-            try:
+            if p.status() != PipelineStatus.STOPPED:
                 p.stop(force=True)
-            except Exception:
-                pass  # May already be stopped
 
             # On full-refresh, clear all stored state so the pipeline
             # recomputes everything from scratch when restarted.
             if full_refresh:
-                try:
-                    p.clear_storage()
-                    logger.info("Cleared storage for pipeline '%s' (full-refresh)", pipeline)
-                except Exception as exc:
-                    logger.warning("Failed to clear storage for pipeline '%s': %s", pipeline, exc)
+                p.clear_storage()
+                logger.info("Cleared storage for pipeline '%s' (full-refresh)", pipeline)
 
             # Update SQL and wait for recompilation
-            p.modify(sql=full_sql)
+            program_config["profile"] = compilation_profile
+            p.modify(
+                sql=full_sql,
+                udf_rust=udf_rust,
+                udf_toml=udf_toml,
+                runtime_config=config,
+                program_config=program_config,
+            )
             self._wait_for_compilation(p, timeout)
 
             logger.info("Pipeline '%s' recompiled with views, starting...", pipeline)
