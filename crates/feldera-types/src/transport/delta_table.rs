@@ -947,6 +947,8 @@ fn test_delta_ignore_deletes_requires_file_following() {
         json!({"uri": "memory://", "mode": "snapshot_and_follow", "ignore_deletes": true}),
     )
     .unwrap();
+    assert!(config.ignore_deletes);
+    assert!(config.object_store_config.is_empty());
     assert!(config.validate().is_ok());
     assert_eq!(config.change_feed(), DeltaTableChangeFeed::Off);
 }
