@@ -7,7 +7,7 @@ use crate::integrated::delta_table::deletion_vector::{
 use crate::integrated::delta_table::field_id_adapter::FieldIdAdapterFactory;
 use crate::integrated::delta_table::table_error_text;
 use crate::integrated::delta_table::{
-    ReadSchema, delta_input_serde_config, register_storage_handlers,
+    ReadSchema, add_identity_endpoint, delta_input_serde_config, register_storage_handlers,
 };
 use crate::transport::{InputEndpoint, InputQueue, InputReaderCommand, IntegratedInputEndpoint};
 use crate::{ControllerError, InputConsumer, InputReader, PipelineState};
@@ -1079,6 +1079,9 @@ impl DeltaTableInputReader {
             );
         }
 
+        add_identity_endpoint(&config.uri, &mut config.object_store_config, |name| {
+            std::env::var(name).ok()
+        });
         Self::prepare_unity_config(&config.object_store_config);
 
         let input_stream = input_handle

@@ -95,7 +95,7 @@ The following configuration options are supported for Azure Blob Storage object 
 | `azure_storage_use_emulator`, `object_store_use_emulator`, `use_emulator` | `AZURE_STORAGE_USE_EMULATOR`             | Use object store with azurite storage emulator.                                   |
 | `azure_storage_endpoint`, `azure_endpoint`, `endpoint`                    | `AZURE_STORAGE_ENDPOINT`, `AZURE_ENDPOINT` | Override the endpoint used to communicate with blob storage.                    |
 | `azure_use_fabric_endpoint`, `use_fabric_endpoint`                        | `AZURE_USE_FABRIC_ENDPOINT`              | Use object store with url scheme `account.dfs.fabric.microsoft.com`               |
-| `azure_msi_endpoint`, `azure_identity_endpoint`, `identity_endpoint`, `msi_endpoint`| `AZURE_MSI_ENDPOINT`, `AZURE_IDENTITY_ENDPOINT`| Endpoint to request a IMDS managed identity token.                |
+| `azure_msi_endpoint`, `azure_identity_endpoint`, `identity_endpoint`, `msi_endpoint`| `AZURE_MSI_ENDPOINT`, `AZURE_IDENTITY_ENDPOINT`, `IDENTITY_ENDPOINT`| Endpoint to request a IMDS managed identity token. `IDENTITY_ENDPOINT` has the lowest precedence. |
 | `azure_object_id`, `object_id`                                            | `AZURE_OBJECT_ID`                        | Object id for use with managed identity authentication.                           |
 | `azure_msi_resource_id`, `msi_resource_id`                                | `AZURE_MSI_RESOURCE_ID`                  | Msi resource id for use with managed identity authentication.                     |
 | `azure_federated_token_file`, `federated_token_file`                      | `AZURE_FEDERATED_TOKEN_FILE`             | File containing token for Azure AD workload identity federation.                  |
