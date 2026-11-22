@@ -5756,6 +5756,102 @@ fn change_feed_row(id: u32, s: &str) -> Value {
     json!({ "id": id, "b": false, "i": null, "s": s })
 }
 
+#[engine_test(requires(Storage))]
+pub fn delta_follow_retention_policies_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        for policy in [None, Some("ignore_deletes")] {
+            let table_dir = TempDir::new().unwrap();
+            let uri = table_dir.path().to_str().unwrap();
+            let relation = basic_relation();
+            let expired = change_feed_row(1, "expired");
+            let live = change_feed_row(2, "kept");
+            let appended = change_feed_row(3, "new");
+            let initial = [expired.clone(), live.clone()];
+            let delta = create_table_from_arrow(uri, &change_feed_arrow_schema(), &["s"]).await;
+            let delta = write_data_to_table(delta, &relation, &initial).await;
+
+            let storage_dir = TempDir::new().unwrap();
+            let errors = Arc::new(Mutex::new(Vec::new()));
+            let mut config = json!({"mode": "snapshot_and_follow", "change_feed": "off"});
+            if let Some(policy) = policy {
+                config[policy] = json!(true);
+            }
+            let pipeline =
+                delta_input_controller(engine, uri, config, &relation, storage_dir.path(), &errors)
+                    .await
+                    .unwrap();
+            pipeline.start();
+            let output = SqlIdentifier::from("test_output1");
+            wait_or_connector_error(&pipeline, &output, &relation, &initial, &errors).await;
+
+            pipeline
+                .pause_input_endpoint(DELTA_TEST_INPUT_ENDPOINT)
+                .unwrap();
+            wait(
+                || {
+                    pipeline
+                        .is_input_endpoint_paused(DELTA_TEST_INPUT_ENDPOINT)
+                        .unwrap_or(false)
+                },
+                60_000,
+            )
+            .expect("Delta input must pause before retention");
+            let delta = delta
+                .delete()
+                .with_predicate(col("s").eq(lit("expired")))
+                .await
+                .unwrap()
+                .0;
+            if policy.is_some() {
+                // Make a read of the deleted file impossible before releasing the commit to Feldera.
+                let partition = table_dir.path().join("s=expired");
+                let mut files = std::fs::read_dir(&partition).unwrap();
+                let file = files.next().unwrap().unwrap().path();
+                assert_eq!(file.extension().unwrap(), "parquet");
+                assert!(files.next().is_none());
+                std::fs::remove_file(file).unwrap();
+            }
+            let delta =
+                write_data_to_table(delta, &relation, std::slice::from_ref(&appended)).await;
+            pipeline
+                .start_input_endpoint(DELTA_TEST_INPUT_ENDPOINT)
+                .unwrap();
+
+            let mut expected = vec![live, appended];
+            if policy.is_some() {
+                expected.push(expired);
+            }
+            wait_or_connector_error(&pipeline, &output, &relation, &expected, &errors).await;
+
+            let _rewritten = delta
+                .update()
+                .with_predicate(col("id").eq(lit(2i64)))
+                .with_update("b", lit(true))
+                .await
+                .unwrap();
+            if policy == Some("ignore_deletes") {
+                wait(
+                    || {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|e| e.contains("rewrites data") && e.contains("ignore_deletes"))
+                    },
+                    60_000,
+                )
+                .expect("ignore_deletes must reject the rewrite");
+            } else {
+                let mut rewritten = expected[0].clone();
+                rewritten["b"] = json!(true);
+                expected[0] = rewritten;
+                wait_or_connector_error(&pipeline, &output, &relation, &expected, &errors).await;
+            }
+            pipeline.stop().unwrap();
+        }
+    })
+}
+
 /// The Arrow schema of [`basic_relation`], as the Delta writer sees it.
 fn change_feed_arrow_schema() -> Arc<ArrowSchema> {
     arrow_schema_of(&basic_relation().fields)

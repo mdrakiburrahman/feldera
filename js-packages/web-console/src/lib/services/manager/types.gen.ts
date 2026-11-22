@@ -1411,6 +1411,12 @@ export type DeltaTableReaderConfig = {
    */
   filter?: string | null
   /**
+   * While following, skip commits that only remove files. Reject commits that both add and
+   * remove data.
+   * Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
+   */
+  ignore_deletes?: boolean
+  /**
    * Maximum number of concurrent object store reads performed by all Delta Lake connectors.
    *
    * This setting is used to limit the number of concurrent reads of the object store in a
@@ -1571,6 +1577,7 @@ export type DeltaTableReaderConfig = {
     | null
     | string
     | null
+    | boolean
     | number
     | null
     | number
@@ -1579,7 +1586,6 @@ export type DeltaTableReaderConfig = {
     | number
     | number
     | null
-    | boolean
     | string
     | null
     | string

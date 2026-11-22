@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from dbt.adapters.contracts.connection import Credentials
 
@@ -34,6 +34,7 @@ class FelderaCredentials(Credentials):
     pipeline_name: Optional[str] = None
     compilation_profile: str = "dev"
     workers: int = 4
+    runtime_config: Optional[dict[str, Any]] = None
     timeout: int = 300
 
     @property

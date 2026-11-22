@@ -1,7 +1,11 @@
 import threading
 import unittest
+from unittest.mock import Mock, patch
 
-from dbt.adapters.feldera.pipeline_manager import PipelineStateManager
+from feldera.enums import PipelineStatus
+from feldera.runtime_config import RuntimeConfig
+
+from dbt.adapters.feldera.pipeline_manager import PipelineStateManager, _normalize_runtime_config
 
 
 class TestPipelineStateManager(unittest.TestCase):
@@ -193,6 +197,142 @@ class TestPipelineStateManagerRename(unittest.TestCase):
         gamma_pos = program.index("gamma")
         self.assertLess(alpha_pos, beta_pos)
         self.assertLess(beta_pos, gamma_pos)
+
+
+class TestPipelineReuse(unittest.TestCase):
+    def test_server_expanded_runtime_config(self):
+        expanded = {
+            "workers": 8,
+            "max_rss": "44Gi",
+            "hosts": 1,
+            "storage": {"backend": {"name": "default"}, "compression": "default", "compression_level": None},
+            "fault_tolerance": {"model": "none"},
+            "cpu_profiler": True,
+            "tracing": False,
+            "tracing_endpoint_jaeger": "127.0.0.1:6831",
+            "min_batch_size_records": 0,
+            "resources": {
+                "cpu_cores_min": None,
+                "cpu_cores_max": None,
+                "storage_class": None,
+                "service_account_name": None,
+                "namespace": None,
+            },
+            "clock_timezone_offset": None,
+            "pin_cpus": [],
+            "max_parallel_connector_init": None,
+            "init_containers": None,
+            "checkpoint_during_suspend": True,
+            "http_workers": None,
+            "io_workers": None,
+            "env": {},
+            "dev_tweaks": {},
+            "logging": None,
+            "pipeline_template_configmap": None,
+        }
+        actual = _normalize_runtime_config(expanded)
+        self.assertEqual(actual, _normalize_runtime_config({"workers": 8, "max_rss": "44Gi"}))
+        self.assertEqual(actual, _normalize_runtime_config({"workers": 8, "max_rss": "44Gi", "storage": True}))
+        self.assertNotEqual(actual, _normalize_runtime_config({"workers": 8}))
+        self.assertNotEqual(actual, _normalize_runtime_config({"workers": 8, "max_rss": "45Gi"}))
+        self.assertNotEqual(actual, _normalize_runtime_config({"workers": 8, "max_rss": "44Gi", "storage": False}))
+
+    def setUp(self):
+        self.manager = PipelineStateManager()
+        self.manager.register_table("pipe", "events", "CREATE TABLE events (id INT)")
+        self.manager.register_view("pipe", "result", "CREATE VIEW result AS SELECT * FROM events")
+        self.udf_sql = "CREATE FUNCTION f(x INTEGER) RETURNS INTEGER;"
+        self.sql = self.udf_sql + "\n\n" + self.manager.assemble_program("pipe")
+        self.config = {"workers": 2, "resources": {"memory_max": "4Gi"}, "storage": True}
+        self.pipeline = Mock()
+        self.pipeline.program_code.return_value = self.sql
+        self.pipeline.program_config.return_value = {"profile": "dev"}
+        self.pipeline.runtime_config.return_value = RuntimeConfig.from_dict(
+            {
+                "workers": 2,
+                "hosts": 1,
+                "storage": {"backend": {"name": "default"}, "compression": "default", "compression_level": None},
+                "fault_tolerance": {"model": "none"},
+                "cpu_profiler": True,
+                "tracing": False,
+                "tracing_endpoint_jaeger": "127.0.0.1:6831",
+                "min_batch_size_records": 0,
+                "resources": {"memory_max": "4Gi", "cpu_cores_min": None, "cpu_cores_max": None},
+                "pin_cpus": [],
+                "checkpoint_during_suspend": True,
+                "env": {},
+                "dev_tweaks": {},
+                "clock_timezone_offset": None,
+                "logging": None,
+            }
+        )
+        self.pipeline.status.return_value = PipelineStatus.RUNNING
+        self.pipeline.udf_rust.return_value = "rust"
+        self.pipeline.udf_toml.return_value = "toml"
+
+    def update(self, **overrides):
+        args = {
+            "runtime_config": self.config,
+            "udf_sql": self.udf_sql,
+            "udf_rust": "rust",
+            "udf_toml": "toml",
+        }
+        args.update(overrides)
+        with patch("dbt.adapters.feldera.pipeline_manager.Pipeline.get", return_value=self.pipeline):
+            with patch.object(self.manager, "_wait_for_compilation"):
+                return self.manager.update_with_views(Mock(), "pipe", **args)
+
+    def test_unchanged_pipeline_is_reused(self):
+        self.assertIs(self.update(), self.pipeline)
+        self.pipeline.stop.assert_not_called()
+        self.pipeline.modify.assert_not_called()
+        self.pipeline.start.assert_not_called()
+
+    def test_deploy_reuses_running_pipeline(self):
+        with patch("dbt.adapters.feldera.pipeline_manager.Pipeline.get", return_value=self.pipeline):
+            with patch("dbt.adapters.feldera.pipeline_manager.PipelineBuilder") as builder:
+                result = self.manager.deploy(
+                    Mock(),
+                    "pipe",
+                    runtime_config=self.config,
+                    udf_sql=self.udf_sql,
+                    udf_rust="rust",
+                    udf_toml="toml",
+                )
+        self.assertIs(result, self.pipeline)
+        builder.assert_not_called()
+
+    def test_changes_and_full_refresh_redeploy(self):
+        for overrides in (
+            {"udf_sql": "CREATE FUNCTION g() RETURNS INTEGER;"},
+            {"udf_rust": "changed"},
+            {"udf_toml": "changed"},
+            {"runtime_config": {"workers": 3}},
+            {"full_refresh": True},
+        ):
+            with self.subTest(overrides=overrides):
+                self.pipeline.reset_mock()
+                self.update(**overrides)
+                self.pipeline.stop.assert_called_once_with(force=True)
+                self.pipeline.modify.assert_called_once()
+                self.pipeline.start.assert_called_once()
+                self.assertEqual(self.pipeline.clear_storage.called, overrides.get("full_refresh", False))
+
+    def test_changed_table_is_not_masked_by_existing_ddl(self):
+        self.pipeline.program_code.return_value = self.sql.replace("id INT", "id BIGINT")
+        self.update()
+        self.assertIn("id INT", self.pipeline.modify.call_args.kwargs["sql"])
+        self.assertNotIn("id BIGINT", self.pipeline.modify.call_args.kwargs["sql"])
+
+    def test_removed_setting_and_server_drift_redeploy(self):
+        self.update(runtime_config={"workers": 2, "storage": True})
+        self.pipeline.modify.assert_called_once()
+        self.pipeline.reset_mock()
+        self.pipeline.runtime_config.return_value = RuntimeConfig.from_dict(
+            {"workers": 2, "storage": True, "resources": {"memory_max": "8Gi"}}
+        )
+        self.update()
+        self.pipeline.modify.assert_called_once()
 
 
 if __name__ == "__main__":

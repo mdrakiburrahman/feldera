@@ -252,6 +252,45 @@ dbt seed --full-refresh # stop, clear storage, redeploy, then push
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and
 project layout.
 
+## Pipeline UDFs and runtime configuration
+
+Set project variables to paths relative to the dbt project root. The SQL file
+contains the `CREATE FUNCTION` declarations; the Rust and TOML files contain
+the corresponding implementation and dependencies.
+
+```yaml
+vars:
+  feldera_udf_sql: udf/functions.sql
+  feldera_udf_rust: udf/functions.rs
+  feldera_udf_toml: udf/dependencies.toml
+```
+
+In `profiles.yml`, configure runtime settings using Feldera's runtime config
+fields. If `runtime_config.workers` is omitted, the profile's `workers` is used.
+Use one dbt thread to keep registration order stable across runs.
+
+```yaml
+outputs:
+  dev:
+    type: feldera
+    host: http://localhost:8080
+    schema: my_pipeline
+    threads: 1
+    workers: 4
+    runtime_config:
+      storage: true
+      resources:
+        cpu_cores_max: 4
+        memory_max: 8Gi
+        storage_max: 20Gi
+```
+
+The on-run-end hook reuses an already running pipeline when its assembled SQL,
+UDFs, runtime configuration, and compilation profile match. `--full-refresh`
+clears state. Seed runs still replace the pipeline and reload seed data.
+Tests in `dbt build` run before the on-run-end deployment; deploy models with
+`dbt run` before testing a new or changed pipeline.
+
 ## License
 
 Apache-2.0 — see [LICENSE](../../LICENSE) for details.
