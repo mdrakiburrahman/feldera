@@ -1,6 +1,7 @@
 use crate::storage::file::format::{BatchMetadata, ValueStampFlag};
 use crate::storage::file::{
-    FilterKind, FilterStats, TouchedWindowCount, TouchedWindowCounter, collect_roaring_metadata,
+    FilterKind, FilterStats, RuntimeVersion, TouchedWindowCount, TouchedWindowCounter,
+    collect_roaring_metadata,
 };
 use crate::trace::AccessHint;
 use crate::{
@@ -353,6 +354,7 @@ where
             touched_window_count: self.metadata().touched_window_count,
             value_stamp: self.metadata().value_stamp,
             runtime_version: Default::default(),
+            retraction_count: 0,
         };
         let (file, filters) = writer.into_reader(stats).unwrap_storage();
         Self::from_parts(self.factories.clone(), Arc::new(file), filters)
@@ -544,6 +546,10 @@ where
     type Batcher = MergeBatcher<Self>;
     type Builder = FileIndexedWSetBuilder<K, V, R>;
 
+    fn runtime_version(&self) -> RuntimeVersion {
+        self.file.metadata().runtime_version.clone()
+    }
+
     fn file_reader(&self) -> Option<Arc<dyn FileReader>> {
         self.file.mark_for_checkpoint();
         Some(self.file.file_handle().clone())
@@ -581,6 +587,10 @@ where
 
     fn negative_weight_count(&self) -> Option<u64> {
         Some(self.metadata().negative_weight_count)
+    }
+
+    fn retraction_count(&self) -> u64 {
+        self.negative_weight_count().unwrap_or(0)
     }
 
     fn touched_window_count(&self) -> TouchedWindowCount {

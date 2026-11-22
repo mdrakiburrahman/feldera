@@ -13,6 +13,7 @@ pub mod test;
 use arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema, SchemaRef,
 };
+use feldera_types::display_url::{text_without_url, url_without_credentials};
 use feldera_types::serde_with_context::serde_config::{DecimalFormat, UuidFormat};
 use feldera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimestampFormat};
 pub use input::DeltaTableInputEndpoint;
@@ -181,22 +182,67 @@ pub fn register_storage_handlers() {
 
 pub fn delta_input_serde_config() -> SqlSerdeConfig {
     SqlSerdeConfig::default()
-        // Delta standard specifies that the timestamp type uses microseconds.
-        // In reality, delta parquet files can represent timestamps as either
-        // microseconds or nanoseconds.  Other options might be possible.
-        // `serde_arrow` knows the correct type from the Arrow schema, and its
-        // `Deserializer` implementation is nice enough to return the timestamp
-        // formatted as string if the `Deserialize` implementation asks for it
-        // (by calling `deserialize_str`), so we rely on that instead of trying
-        // to deserialize the timestamp as an integer.  A better solution would
-        // require a more flexible SqlSerdeConfig type that would specify a
-        // schema per field.
-        .with_timestamp_format(TimestampFormat::String("%Y-%m-%dT%H:%M:%S%.f%Z"))
+        // Delta specifies microseconds, but a Parquet file can also hold
+        // nanoseconds, and `serde_arrow` gives the raw integer without its unit.
+        // The connector converts each batch with `timestamps_to_micros` and
+        // checks at startup that every TIMESTAMP column is an Arrow timestamp
+        // or a string. Formatting each value to a string and parsing it back,
+        // as before, cost a large part of the parse time. A string column is
+        // parsed with the format that all columns went through before.
+        .with_timestamp_format(TimestampFormat::MicrosSinceEpochOrString(
+            "%Y-%m-%dT%H:%M:%S%.f%Z",
+        ))
         .with_date_format(DateFormat::DaysSinceEpoch)
-        .with_decimal_format(DecimalFormat::String)
+        // `order_columns` gives a decimal as its significand when the scale
+        // matches; otherwise `serde_arrow` gives it as a string.
+        .with_decimal_format(DecimalFormat::I128)
         // DeltaLake doesn't have a native UUID type. We assume that UUID
         // is represented as a string. If a different representation is used, the user
         // will have to deserialize into VARBINARY first. Alternatively, we can make
         // this configurable.
         .with_uuid_format(UuidFormat::String)
+}
+
+/// `what` for the table at `uri`, with the error `error` of a library call.
+/// Both are shown without credentials: the library repeats the URI it was
+/// given in its own message.
+pub(crate) fn table_error_text(what: &str, uri: &str, error: &str) -> String {
+    format!(
+        "{what} '{}': {}",
+        url_without_credentials(uri),
+        text_without_url(error, uri)
+    )
+}
+
+#[cfg(test)]
+mod table_error_tests {
+    use super::table_error_text;
+    use deltalake::table::builder::ensure_table_uri;
+
+    /// The error of a rejected URI repeats the URI; neither copy keeps the
+    /// credentials.
+    #[test]
+    fn rejected_uri_error_omits_the_credentials() {
+        let uri = "s3://ak:secret-key@bucket:not-a-port/table?X-Amz-Signature=sig";
+        let error = ensure_table_uri(uri).expect_err("the port is not a number");
+        let text = table_error_text("invalid Delta table uri", uri, &error.to_string());
+        assert!(!text.contains("secret-key"), "credentials in error: {text}");
+        assert!(!text.contains("sig"), "signature in error: {text}");
+        assert!(text.starts_with("invalid Delta table uri '"), "{text}");
+    }
+
+    /// delta-rs prints the URI it parsed, with the path normalized.
+    #[test]
+    fn normalized_uri_in_error_omits_the_credentials() {
+        let uri = "s3://ak:secret-key@bucket/table?X-Amz-Signature=sig";
+        let normalized = ensure_table_uri(uri).unwrap().to_string();
+        assert_ne!(normalized, uri);
+        let text = table_error_text(
+            "open",
+            uri,
+            &format!("Invalid table location: {normalized}"),
+        );
+        assert!(!text.contains("secret-key"), "{text}");
+        assert!(!text.contains("sig"), "{text}");
+    }
 }

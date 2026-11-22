@@ -50,6 +50,8 @@ pub const fn input_adhoc_arrow_serde_config() -> &'static SqlSerdeConfig {
         variant_format: VariantFormat::JsonString,
         binary_format: BinaryFormat::Array,
         uuid_format: UuidFormat::String,
+        positional_fields: false,
+        absent_columns: None,
     }
 }
 
@@ -67,6 +69,8 @@ pub const fn output_adhoc_arrow_serde_config() -> &'static SqlSerdeConfig {
         // Alternatively we can use byte array encoding. I tried it and it works, but requires
         // adjusting uuid type encoding in `columntype_to_datatype`.
         uuid_format: UuidFormat::String,
+        positional_fields: false,
+        absent_columns: None,
     }
 }
 

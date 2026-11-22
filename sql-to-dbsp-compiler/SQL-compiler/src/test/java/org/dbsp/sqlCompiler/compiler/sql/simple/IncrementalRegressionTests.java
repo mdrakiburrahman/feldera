@@ -1558,6 +1558,23 @@ public class IncrementalRegressionTests extends SqlIoTest {
     }
 
     @Test
+    public void unnestNullableRowsWithOrdinalityAndLateness() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOUR,
+                               items ROW(i INT, label VARCHAR) ARRAY);
+                CREATE VIEW V AS SELECT x.ord, T.ts, x.label, x.i
+                FROM T CROSS JOIN UNNEST(T.items) WITH ORDINALITY AS x(i, label, ord);""")
+                .withStringTrim();
+        ccs.stepWeightOne("""
+                INSERT INTO T VALUES ('2024-01-01 10:00:00',
+                    ARRAY[ROW(4, 'x'), CAST(NULL AS ROW(i INT, label VARCHAR))]);""", """
+                 ord | ts                  | label | i
+                ----------------------------------------
+                 1   | 2024-01-01 10:00:00 | x     | 4
+                 2   | 2024-01-01 10:00:00 |NULL   | NULL""");
+    }
+
+    @Test
     public void unnestOrdinalityLateness() {
         // Monotonicity analysis of UNNEST WITH ORDINALITY whose element type differs from the ordinality type
         var ccs = this.getCCS("""
@@ -2854,5 +2871,126 @@ public class IncrementalRegressionTests extends SqlIoTest {
                  k | a    | weight
                 -------------------
                  6 |NULL  | -1""");
+    }
+
+    @Test
+    public void issue8033() {
+        // Every grouping set () produces one row, also for an empty input
+        var ccs = this.getCCS("""
+                CREATE TABLE orders (id INT NOT NULL, cust INT, amount INT NOT NULL, status VARCHAR);
+                CREATE VIEW r AS SELECT status, cust, COUNT(*) AS n, SUM(amount) AS s, GROUPING(status, cust) AS g
+                FROM orders GROUP BY ROLLUP(status, cust);
+                CREATE VIEW c AS SELECT status, cust, COUNT(*) AS n FROM orders GROUP BY CUBE(status, cust);
+                CREATE VIEW gs AS SELECT status, cust, COUNT(*) AS n
+                FROM orders GROUP BY GROUPING SETS ((status), (cust), ());
+                CREATE VIEW d AS SELECT status, COUNT(*) AS n FROM orders GROUP BY GROUPING SETS ((), (), (status));
+                CREATE VIEW na AS SELECT status FROM orders GROUP BY ROLLUP(status);
+                CREATE VIEW dr AS SELECT status, SUM(amount) AS s, COUNT(DISTINCT cust) AS dc, COUNT(*) AS n
+                FROM orders GROUP BY ROLLUP(status);""").withStringTrim();
+        // Expected outputs validated with Postgres
+        ccs.stepMultiView("", Map.of(
+                "r", """
+                 status | cust | n | s    | g | weight
+                ---------------------------------------
+                NULL    |NULL  | 0 |NULL  | 3 | 1""",
+                "c", """
+                 status | cust | n | weight
+                ---------------------------
+                NULL    |NULL  | 0 | 1""",
+                "gs", """
+                 status | cust | n | weight
+                ---------------------------
+                NULL    |NULL  | 0 | 1""",
+                "d", """
+                 status | n | weight
+                --------------------
+                NULL    | 0 | 2""",
+                "na", """
+                 status | weight
+                ----------------
+                NULL    | 1""",
+                "dr", """
+                 status | s    | dc | n | weight
+                --------------------------------
+                NULL    |NULL  | 0  | 0 | 1"""));
+        ccs.stepMultiView("INSERT INTO orders VALUES (1, 2, 5, 'paid');", Map.of(
+                "r", """
+                 status | cust | n | s    | g | weight
+                ---------------------------------------
+                NULL    |NULL  | 0 |NULL  | 3 | -1
+                NULL    |NULL  | 1 | 5    | 3 | 1
+                 paid   |NULL  | 1 | 5    | 1 | 1
+                 paid   | 2    | 1 | 5    | 0 | 1""",
+                "c", """
+                 status | cust | n | weight
+                ---------------------------
+                NULL    |NULL  | 0 | -1
+                NULL    |NULL  | 1 | 1
+                NULL    | 2    | 1 | 1
+                 paid   |NULL  | 1 | 1
+                 paid   | 2    | 1 | 1""",
+                "gs", """
+                 status | cust | n | weight
+                ---------------------------
+                NULL    |NULL  | 0 | -1
+                NULL    |NULL  | 1 | 1
+                NULL    | 2    | 1 | 1
+                 paid   |NULL  | 1 | 1""",
+                "d", """
+                 status | n | weight
+                --------------------
+                NULL    | 0 | -2
+                NULL    | 1 | 2
+                 paid   | 1 | 1""",
+                "na", """
+                 status | weight
+                ----------------
+                 paid   | 1""",
+                "dr", """
+                 status | s    | dc | n | weight
+                --------------------------------
+                NULL    |NULL  | 0  | 0 | -1
+                NULL    | 5    | 1  | 1 | 1
+                 paid   | 5    | 1  | 1 | 1"""));
+        // Deleting the only row restores the output of the empty input
+        ccs.stepMultiView("REMOVE FROM orders VALUES (1, 2, 5, 'paid');", Map.of(
+                "r", """
+                 status | cust | n | s    | g | weight
+                ---------------------------------------
+                NULL    |NULL  | 0 |NULL  | 3 | 1
+                NULL    |NULL  | 1 | 5    | 3 | -1
+                 paid   |NULL  | 1 | 5    | 1 | -1
+                 paid   | 2    | 1 | 5    | 0 | -1""",
+                "c", """
+                 status | cust | n | weight
+                ---------------------------
+                NULL    |NULL  | 0 | 1
+                NULL    |NULL  | 1 | -1
+                NULL    | 2    | 1 | -1
+                 paid   |NULL  | 1 | -1
+                 paid   | 2    | 1 | -1""",
+                "gs", """
+                 status | cust | n | weight
+                ---------------------------
+                NULL    |NULL  | 0 | 1
+                NULL    |NULL  | 1 | -1
+                NULL    | 2    | 1 | -1
+                 paid   |NULL  | 1 | -1""",
+                "d", """
+                 status | n | weight
+                --------------------
+                NULL    | 0 | 2
+                NULL    | 1 | -2
+                 paid   | 1 | -1""",
+                "na", """
+                 status | weight
+                ----------------
+                 paid   | -1""",
+                "dr", """
+                 status | s    | dc | n | weight
+                --------------------------------
+                NULL    |NULL  | 0  | 0 | 1
+                NULL    | 5    | 1  | 1 | -1
+                 paid   | 5    | 1  | 1 | -1"""));
     }
 }

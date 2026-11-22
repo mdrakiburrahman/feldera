@@ -23,9 +23,100 @@ configuration with their values. We currently only support a single secret provi
 When the pipeline initializes, it replaces all references in the connector configuration
 with their resolved values. Feldera resolves references when a pipeline starts, as well as
 each time it resumes. Feldera does not write resolved values to checkpoints or journals.
+Connector error messages are written to checkpoints; see [Diagnostics](#diagnostics)
+for how resolved values are kept out of them.
 
 Use environment variables for non-sensitive deployment configuration only.
 Storing secrets in environment variables is generally discouraged; use a dedicated secret manager or secret store instead.
+
+## Diagnostics
+
+A user who may reference a secret is not necessarily allowed to read it. The
+pipeline therefore keeps resolved values out of what it reports:
+
+| Output | What is shown instead of a resolved value |
+|---|---|
+| Pipeline log | the reference, `${secret:...}`, for the value as resolved; `[REDACTED ${secret:...}]` for a derived form of it, such as a percent-encoded or escaped copy or the password of a URL value |
+| `deployment_error`, pipeline events, `/status` | the reference, `${secret:...}`, for the value as resolved; `[REDACTED ${secret:...}]` for a derived form of it, such as a percent-encoded or escaped copy or the password of a URL value. This applies to a pipeline on a runtime with this fix |
+| Connector errors in `/stats` and in the support bundle | the reference, `${secret:...}`, for the value as resolved; `[REDACTED ${secret:...}]` for a derived form of it, such as a percent-encoded or escaped copy or the password of a URL value. This applies to a pipeline on a runtime with this fix |
+| Connection errors and debug log lines of the Postgres input, Delta Lake and Kafka connectors, and of the Avro format | the endpoint name and option names only, never the URI, option value, or configuration |
+| Format and connector configuration errors, and the pipeline startup summary | the error category, the expected values and field names from the schema, the endpoint, transport and format names; never a rejected value or a configuration dump |
+
+The API server does not resolve secret references, but a pipeline on an
+older runtime can send it an error that holds a resolved value. In stored
+deployment errors, status details, and support bundles, the server replaces
+the password of a URL and the value of a `password=` parameter with
+`[REDACTED]`. Where it cannot tell where a credential ends, it cuts the text
+off at the credential.
+
+One case is not covered in full. A password with both an unencoded `@` and
+whitespace is replaced only up to its first `@`:
+`postgres://u:pa@ss word@host/db` shows as
+`postgres://u:[REDACTED]@ss word@host/db`. Percent-encode such a password
+(`pa%40ss%20word`), and it is replaced whole.
+
+Format configuration errors report a safe error category and a corrective
+action instead of quoting the rejected value, including for short secrets.
+JSON log fields are redacted before serialization adds JSON escaping.
+
+The pipeline also registers values from declared credential fields and replaces
+matching diagnostic text with `[REDACTED]`. The same length and token limits
+apply. A Secret reference remains protected regardless of its destination field,
+including usernames, topics, and broker addresses; its reference takes precedence
+over the generic marker when a value appears in both forms. A URL with
+credentials in it is itself a declared credential, so a diagnostic message
+that quotes the whole URL shows `[REDACTED]`, not the reference inside it.
+
+| Connector or format | Credential fields replaced in diagnostics | Stays visible |
+|---|---|---|
+| Kafka | SASL password, TLS private key and key passwords, OAuth client secret and JWT assertion private key/passphrase; also fault-tolerance consumer/producer options | |
+| Postgres and Redis | the credentials of a connection string: a URL with userinfo or a query as a whole, and the `password` and `sslpassword` values of a libpq keyword string; Postgres inline TLS client key | a connection string without credentials |
+| S3 and DynamoDB | AWS secret access key and credential-bearing endpoint URLs | |
+| Delta Lake | Known object-store secret keys, session/bearer tokens, SAS tokens, client secrets, service-account keys, customer encryption keys, and Unity catalog access tokens and client secrets, including supported aliases | |
+| Iceberg | Catalog credentials/tokens, authentication headers, and known FileIO credential keys | |
+| NATS | Inline credentials, JWT, NKey seed, token, password, and credential-bearing server URL | |
+| S2 and Pub/Sub | Authentication token and inline credentials, respectively | |
+| URL input and Avro | Credential-bearing URLs, including token-only userinfo; Avro registry password, authorization token, credential-bearing proxy URL, and `Authorization`, `Proxy-Authorization`, or `X-API-Key` headers | a URL without credentials |
+
+An unknown option key or a custom header is not in this table, even if its
+name looks like a credential. Connector errors still leave its value out.
+
+:::warning
+A credential written inline in the `connectors` property is part of the SQL
+program, and a support bundle includes it as written. Use a secret reference
+for every credential: see [Kubernetes](#kubernetes) for how to create one.
+:::
+
+The following limits apply:
+
+- The pipeline log, `/status` and `/stats` show a resolved value of 8 bytes
+  or more as its reference, where the value stands as a whole word or token.
+  A shorter value is shown as it is.
+- A secret whose value is a common word or a non-sensitive value, such as a
+  user name or a broker address, is replaced by its reference in every
+  diagnostic that uses the word on its own. Keep such values out of secrets,
+  or expect them to read as references.
+- A value that a connector transforms before printing it, other than trimming,
+  percent-encoding, or escaping, may not be recognized.
+- An environment variable reference is not protected. Its value is
+  non-sensitive configuration by contract, and a common word in it would be
+  replaced in every diagnostic that uses the word. The exception is a value
+  in one of the credential fields of the table above: it is replaced like an
+  inline value.
+- Pipelines started on a runtime from before this fix (see the
+  [changelog](/changelog)) do not apply these rules. Restart such pipelines
+  after an upgrade.
+- A connector error message written to a checkpoint by an older runtime can
+  contain the resolved value. After the upgrade, the restored message shows the
+  reference if the secret still has that value. A rotated value is not
+  recognized.
+- A value that is part of SQL, UDF code, an endpoint name, or table data is
+  shown as written.
+- A value written inline in the `connectors` property is SQL text, not a
+  resolved value. It shows as written in the program and in compiler messages
+  and their SQL excerpts. The support bundle exports the pipeline
+  configuration as supplied, and its connector settings stay when the bundle
+  is collected without source code. Use a secret reference for a credential.
 
 ## Kubernetes
 

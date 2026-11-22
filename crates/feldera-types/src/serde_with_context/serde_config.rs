@@ -67,6 +67,9 @@ pub enum TimestampFormat {
     MillisSinceEpoch,
     /// Time specified in microseconds since UNIX epoch.
     MicrosSinceEpoch,
+    /// Parsing: accepts microseconds since UNIX epoch, or a string in the
+    /// specified `chrono` format. Encoding: outputs microseconds.
+    MicrosSinceEpochOrString(&'static str),
     /// Time specified in the RFC 3339 format.
     Rfc3339,
 }
@@ -77,6 +80,11 @@ pub enum DecimalFormat {
     #[default]
     Numeric,
     String,
+    /// The significand as a 128-bit integer.
+    ///
+    /// On input, a `DECIMAL(p, s)` value is its significand with the scale
+    /// `s`, as a 128-bit integer or as the 16 bytes of one in native byte
+    /// order. The other representations of a decimal are also accepted.
     I128,
 }
 
@@ -148,6 +156,47 @@ pub struct SqlSerdeConfig {
     pub binary_format: BinaryFormat,
     /// 'UUID' format.
     pub uuid_format: UuidFormat,
+    /// Read the fields of a record by position, not by name.
+    ///
+    /// The input must then hold every column of each record, and of each
+    /// nested `ROW`, in the order of the SQL declaration, with no extra
+    /// columns. Only an input that was put in this order sets this flag;
+    /// see `order_columns` in `feldera_adapterlib`.
+    pub positional_fields: bool,
+    /// With `positional_fields`: the columns that the input does not have.
+    pub absent_columns: Option<AbsentColumns>,
+}
+
+/// The columns of a table record that a positional input does not have.
+///
+/// The input then holds the other columns in the order of the SQL
+/// declaration. An absent column gets the value that it gets when a record is
+/// read by name: its default, `NULL`, or an error. This applies to the table
+/// record only: each nested `ROW` holds all its fields.
+///
+/// A record type with another number of columns than the flags, such as one
+/// without the unused columns of the table, reads the input by name.
+#[derive(Clone, Debug)]
+pub struct AbsentColumns {
+    /// One flag for each column of the table, in declaration order.
+    absent: Vec<bool>,
+    num_present: usize,
+    /// The configuration for the values of the columns.
+    field_config: Box<SqlSerdeConfig>,
+}
+
+impl AbsentColumns {
+    pub fn absent(&self) -> &[bool] {
+        &self.absent
+    }
+
+    pub fn num_present(&self) -> usize {
+        self.num_present
+    }
+
+    pub fn field_config(&self) -> &SqlSerdeConfig {
+        &self.field_config
+    }
 }
 
 impl SqlSerdeConfig {
@@ -192,6 +241,25 @@ impl SqlSerdeConfig {
         self.uuid_format = uuid_format;
         self
     }
+
+    pub fn with_positional_fields(mut self, positional_fields: bool) -> Self {
+        self.positional_fields = positional_fields;
+        self
+    }
+
+    /// Read the table record from a positional input that does not have the
+    /// columns with a `true` flag in `absent`.
+    pub fn with_absent_columns(mut self, absent: Vec<bool>) -> Self {
+        self.positional_fields = true;
+        self.absent_columns = None;
+        let field_config = Box::new(self.clone());
+        self.absent_columns = Some(AbsentColumns {
+            num_present: absent.iter().filter(|absent| !**absent).count(),
+            absent,
+            field_config,
+        });
+        self
+    }
 }
 
 impl From<JsonFlavor> for SqlSerdeConfig {
@@ -212,6 +280,8 @@ impl From<JsonFlavor> for SqlSerdeConfig {
                 variant_format: VariantFormat::JsonString,
                 binary_format: BinaryFormat::Array,
                 uuid_format: UuidFormat::String,
+                positional_fields: false,
+                absent_columns: None,
             },
             JsonFlavor::DebeziumMySql => Self {
                 time_format: TimeFormat::Micros,
@@ -223,6 +293,8 @@ impl From<JsonFlavor> for SqlSerdeConfig {
                 variant_format: VariantFormat::JsonString,
                 binary_format: BinaryFormat::Array,
                 uuid_format: UuidFormat::String,
+                positional_fields: false,
+                absent_columns: None,
             },
             JsonFlavor::DebeziumPostgres => Self {
                 time_format: TimeFormat::Micros,
@@ -233,6 +305,8 @@ impl From<JsonFlavor> for SqlSerdeConfig {
                 variant_format: VariantFormat::JsonString,
                 binary_format: BinaryFormat::Array,
                 uuid_format: UuidFormat::String,
+                positional_fields: false,
+                absent_columns: None,
             },
             JsonFlavor::Snowflake => Self {
                 time_format: TimeFormat::String("%H:%M:%S%.f"),
@@ -243,6 +317,8 @@ impl From<JsonFlavor> for SqlSerdeConfig {
                 variant_format: VariantFormat::JsonString,
                 binary_format: BinaryFormat::Array,
                 uuid_format: UuidFormat::String,
+                positional_fields: false,
+                absent_columns: None,
             },
             JsonFlavor::Pandas => Self {
                 time_format: TimeFormat::String("%H:%M:%S%.f"),
@@ -253,6 +329,8 @@ impl From<JsonFlavor> for SqlSerdeConfig {
                 variant_format: VariantFormat::JsonString,
                 binary_format: BinaryFormat::Array,
                 uuid_format: UuidFormat::String,
+                positional_fields: false,
+                absent_columns: None,
             },
             JsonFlavor::Blockchain => {
                 SqlSerdeConfig::default().with_binary_format(BinaryFormat::Base58)
@@ -267,6 +345,8 @@ impl From<JsonFlavor> for SqlSerdeConfig {
                 variant_format: VariantFormat::JsonString,
                 binary_format: BinaryFormat::Base64,
                 uuid_format: UuidFormat::String,
+                positional_fields: false,
+                absent_columns: None,
             },
             JsonFlavor::ClockInput => {
                 SqlSerdeConfig::default().with_timestamp_format(TimestampFormat::MillisSinceEpoch)
@@ -282,6 +362,8 @@ impl From<JsonFlavor> for SqlSerdeConfig {
                 // as JSON and let Postgres parse it.
                 binary_format: BinaryFormat::PgHex,
                 uuid_format: UuidFormat::String,
+                positional_fields: false,
+                absent_columns: None,
             },
         }
     }

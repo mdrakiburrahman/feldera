@@ -54,7 +54,8 @@ use feldera_adapterlib::PipelineState;
 use feldera_adapterlib::errors::controller::ConfigError;
 use feldera_mtls::{Caller, PipelineClientAuth, PipelinePeerTls};
 use feldera_observability as observability;
-use feldera_observability::json_logging::init_pipeline_logging_with_id;
+use feldera_observability::json_logging::init_pipeline_logging_with_redaction;
+use feldera_observability::log_redaction::LineRedactor;
 use feldera_types::adapter_stats::{
     EndpointErrorStats, InputEndpointErrorMetrics, OutputEndpointErrorMetrics,
     PipelineStatsErrorsResponse,
@@ -87,6 +88,7 @@ use feldera_types::runtime_status::{
     ExtendedRuntimeStatusError, RuntimeDesiredStatus, RuntimeStatus, RuntimeStatusDetails,
     StorageStatusDetails,
 };
+use feldera_types::secret_redaction::secret_redactor;
 use feldera_types::size::ConfigSize;
 use feldera_types::suspend::{SuspendError, SuspendableResponse};
 use feldera_types::time_series::TimeSeries;
@@ -856,6 +858,20 @@ impl Drop for DeferredLogging {
     }
 }
 
+/// Shows a resolved secret value in a log line as its reference.
+struct SecretLineRedactor;
+
+impl LineRedactor for SecretLineRedactor {
+    fn redact<'a>(&self, line: &'a [u8]) -> Cow<'a, [u8]> {
+        secret_redactor().redact_bytes(line)
+    }
+
+    /// The registry does nothing when no secret is registered.
+    fn redact_json(&self, value: &mut serde_json::Value) {
+        secret_redactor().redact_json(value)
+    }
+}
+
 // We pass the engine as trait objects to make sure that this function
 // doesn't have any generics and gets generated, along with the entire web server
 // as part of this crate. This reduces the size of the generated code for
@@ -904,10 +920,11 @@ pub fn run_server(
         .as_ref()
         .and_then(|name| name.strip_prefix("pipeline-"))
         .map(|id| id.to_string());
-    init_pipeline_logging_with_id(
+    init_pipeline_logging_with_redaction(
         pipeline_name,
         pipeline_id,
         get_env_filter(&config, &mut deferred_logging),
+        SecretLineRedactor,
     )
     .unwrap_or_else(|e| {
         // This happens in unit tests when another test has initialized logging.
@@ -1395,10 +1412,15 @@ fn parse_config_with_deferred_logging(
 
     let path = config_file.as_ref();
     let string = read_config_file_as_string(path, deferred_logging)?;
+    // The rejected token can be a credential: keep the category and the
+    // position, not the value.
     let mut config: PipelineConfig = serde_json::from_str(&string).map_err(|e| {
         ControllerError::pipeline_config_parse_error(&format!(
-            "configuration file '{}' must be JSON (YAML is no longer read): {e}",
-            path.display()
+            "configuration file '{}' must be JSON (YAML is no longer read): {} (line {}, column {})",
+            path.display(),
+            feldera_types::config_diagnostics::deserialization_error(&e),
+            e.line(),
+            e.column()
         ))
     })?;
 
@@ -5137,7 +5159,7 @@ pub fn parser_config_from_http_request(
     Ok(FormatConfig {
         name: Cow::from(format_name.to_string()),
         config: serde_json::to_value(config)
-            .map_err(|e| ControllerError::parser_config_parse_error(endpoint_name, &e, ""))?,
+            .map_err(|e| ControllerError::parser_config_parse_error(endpoint_name, &e))?,
     })
 }
 
@@ -5161,7 +5183,7 @@ pub fn encoder_config_from_http_request(
     Ok(FormatConfig {
         name: format.name(),
         config: serde_json::to_value(config)
-            .map_err(|e| ControllerError::encoder_config_parse_error(endpoint_name, &e, ""))?,
+            .map_err(|e| ControllerError::encoder_config_parse_error(endpoint_name, &e))?,
     })
 }
 
@@ -6134,6 +6156,21 @@ mod test_status {
         let json_file = json_config_file(&json!({"name": "test"}));
         let config = parse_config(json_file.path()).unwrap();
         assert_eq!(config.name.as_deref(), Some("test"));
+    }
+
+    /// A credential in a wrong-shaped field is rejected before any
+    /// registration can run: the parse error must not quote it.
+    #[test]
+    fn parse_config_keeps_rejected_values_out_of_the_error() {
+        let file = json_config_file(&json!({"name":"test", "inputs":{"n":{"stream":"s",
+            "transport":{"name":"nats_input", "config":{
+                "connection_config":{"server_url":"nats://h", "auth":{"credentials":"creds-text-2136"}},
+                "stream_name":"s", "consumer_config":{"deliver_policy":"All"}}},
+            "format":{"name":"json", "config":{}}}}}));
+        let error = parse_config(file.path()).unwrap_err().to_string();
+        assert!(!error.contains("creds-text-2136"), "{error}");
+        assert!(error.contains("must be JSON"), "{error}");
+        assert!(error.contains("line "), "{error}");
     }
 
     /// A `Write` that tests can read back after a subscriber writes to it.
@@ -7162,7 +7199,8 @@ pub mod test_http {
                 let body = String::from_utf8_lossy(&body);
                 let expected = match update_format {
                     "redis" => "not supported for JSON input",
-                    _ => "unknown variant `weighted`",
+                    // The rejected value is not echoed: it can be a credential.
+                    _ => "is not supported; expected one of `insert_delete`",
                 };
                 assert!(body.contains(expected), "{update_format}: {body}");
             }
@@ -9438,6 +9476,195 @@ pub mod test_http {
             .await
             .expect("the input queued during the cutover was lost");
         })
+    }
+
+    /// `/status` shows a resolved secret as its reference, not as its value.
+    ///
+    /// The Postgres input takes its URI from a Kubernetes secret, and the
+    /// connection is refused, so the pipeline fails to initialize. The URI
+    /// holds the password, and the error response must not.
+    #[engine_test]
+    pub fn status_error_shows_the_secret_reference_not_the_value(engine: &dyn PipelineTestEngine) {
+        ensure_default_crypto_provider();
+
+        let tempdir = TempDir::new().unwrap();
+        let secret_dir = tempdir.path().join("kubernetes").join("pg");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        // A Unix socket directory that does not exist: the connection fails
+        // at once, and no port is involved that another test could take.
+        let no_socket_dir = tempdir.path().join("nosock").display().to_string();
+        let password = "status-test-secret-2136";
+        let uri = format!("postgres://feldera:{password}@/app?host={no_socket_dir}");
+        std::fs::write(secret_dir.join("uri"), &uri).unwrap();
+
+        let config_json = json!({
+            "name": "test",
+            "workers": 2,
+            "clock_resolution_usecs": null,
+            "secrets_dir": tempdir.path(),
+            "inputs": {
+                "pg_in": {
+                    "stream": "test_input1",
+                    "transport": {
+                        "name": "postgres_input",
+                        "config": {
+                            "uri": "${secret:kubernetes:pg/uri}",
+                            "query": "SELECT * FROM t",
+                        },
+                    },
+                },
+            },
+            "outputs": {},
+        });
+        let config_file = json_config_file(&config_json);
+        let config = parse_config(config_file.path().display().to_string()).unwrap();
+        let builder = ControllerBuilder::new(&config, &engine.open_storage()).unwrap();
+        let state = WebData::new(ServerState::new(
+            PipelinePhase::Initializing(InitializationState::Starting),
+            String::default(),
+            RuntimeDesiredStatus::Paused,
+            BootstrapConfig::from(BootstrapPolicy::Allow),
+            Uuid::now_v7(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        {
+            let state = state.clone();
+            let factory = engine.circuit_factory(&identity(&[None]), None).unwrap();
+            thread::spawn(move || bootstrap(builder, factory, state))
+        }
+        .join()
+        .unwrap();
+
+        let PipelinePhase::InitializationError(_) = state.phase() else {
+            panic!("the refused connection did not fail the initialization");
+        };
+        let status = get_status(&state, false).expect_err("the status does not report the failure");
+        let body = serde_json::to_string(&status.error).unwrap();
+        assert!(body.contains("pg_in"), "{body}");
+        assert!(
+            body.contains("Unable to connect to postgres instance"),
+            "not the connection failure: {body}"
+        );
+        assert!(!body.contains(password), "{body}");
+    }
+
+    /// Format type errors must omit short secrets at their source, because
+    /// the runtime registry deliberately ignores values shorter than 8 bytes.
+    #[engine_test]
+    pub fn status_format_error_omits_short_secret(engine: &dyn PipelineTestEngine) {
+        ensure_default_crypto_provider();
+
+        let tempdir = TempDir::new().unwrap();
+        let secret_dir = tempdir.path().join("kubernetes").join("pg");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let password = "hunter2";
+        std::fs::write(secret_dir.join("uri"), password).unwrap();
+        let input_path = tempdir.path().join("input.json");
+        std::fs::write(&input_path, b"").unwrap();
+
+        let config_json = json!({
+            "name": "test",
+            "workers": 2,
+            "clock_resolution_usecs": null,
+            "secrets_dir": tempdir.path(),
+            "inputs": {
+                "pg_in": {
+                    "stream": "test_input1",
+                    "transport": {
+                        "name": "file_input",
+                        "config": {"path": input_path},
+                    },
+                    "format": {
+                        "name": "json",
+                        "config": {"update_format": "${secret:kubernetes:pg/uri}"},
+                    },
+                },
+            },
+            "outputs": {},
+        });
+        let config_file = json_config_file(&config_json);
+        let config = parse_config(config_file.path().display().to_string()).unwrap();
+        let builder = ControllerBuilder::new(&config, &engine.open_storage()).unwrap();
+        let state = WebData::new(ServerState::new(
+            PipelinePhase::Initializing(InitializationState::Starting),
+            String::default(),
+            RuntimeDesiredStatus::Paused,
+            BootstrapConfig::from(BootstrapPolicy::Allow),
+            Uuid::now_v7(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        {
+            let state = state.clone();
+            let factory = engine.circuit_factory(&identity(&[None]), None).unwrap();
+            thread::spawn(move || bootstrap(builder, factory, state))
+        }
+        .join()
+        .unwrap();
+
+        let PipelinePhase::InitializationError(_) = state.phase() else {
+            panic!("the invalid format did not fail the initialization");
+        };
+        let status = get_status(&state, false).expect_err("the status does not report the failure");
+        let body = serde_json::to_string(&status.error).unwrap();
+        assert!(body.contains("pg_in"), "{body}");
+        assert!(
+            body.contains("a configuration value is not supported"),
+            "not the format failure: {body}"
+        );
+        assert!(!body.contains(password), "{body}");
+    }
+
+    /// Format credential registration happens while the format config is still
+    /// JSON, so an invalid enum cannot bypass the visitor. The source error
+    /// remains useful, and a later diagnostic also masks the inline credential.
+    #[engine_test]
+    pub fn format_credentials_registered_before_parse_failure(engine: &dyn PipelineTestEngine) {
+        ensure_default_crypto_provider();
+        let tempdir = TempDir::new().unwrap();
+        let input = tempdir.path().join("input.avro");
+        std::fs::write(&input, []).unwrap();
+        let password = "avro-inline-registration-2136";
+        let config_json = json!({
+            "name":"test", "workers":2, "clock_resolution_usecs":null,
+            "inputs":{"avro_in":{"stream":"test_input1",
+                "transport":{"name":"file_input","config":{"path":input}},
+                "format":{"name":"avro","config":{"registry_password":password,"update_format":"invalid-format"}}
+            }}, "outputs":{}
+        });
+        let file = json_config_file(&config_json);
+        let config = parse_config(file.path().display().to_string()).unwrap();
+        let error = engine
+            .controller(&identity(&[None]), &config, Box::new(|_, _| {}))
+            .err()
+            .expect("invalid Avro config must fail");
+        let response = super::error::ErrorResponse::from_error_nolog(&error);
+        assert!(response.message.contains("avro_in"), "{}", response.message);
+        assert!(
+            response.message.contains("expected"),
+            "{}",
+            response.message
+        );
+        assert!(!serde_json::to_string(&response).unwrap().contains(password));
+        let later_error = anyhow::anyhow!("registry rejected {password}");
+        assert_eq!(
+            super::error::ErrorResponse::from_anyerror(&later_error).message,
+            "registry rejected [REDACTED]"
+        );
+        let parsed = config
+            .inputs
+            .get("avro_in")
+            .unwrap()
+            .connector_config
+            .format
+            .as_ref()
+            .unwrap();
+        assert_eq!(parsed.config["registry_password"], password);
     }
 
     /// Regression test for the fault-tolerant replay path, the analogue of

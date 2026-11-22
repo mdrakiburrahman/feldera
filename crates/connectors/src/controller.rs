@@ -993,20 +993,6 @@ impl Controller {
         init.init(None, circuit_factory, error_cb)
     }
 
-    /// Like [`Self::with_test_config`], but keeps the program diff, so that the parts of a
-    /// changed circuit bootstrap.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn with_test_config_keep_program_diff(
-        circuit_factory: CircuitFactory,
-        open_storage: &OpenStorageFn,
-        config: &PipelineConfig,
-        error_cb: Box<dyn Fn(Arc<ControllerError>, Option<String>) + Send + Sync>,
-    ) -> Result<Self, ControllerError> {
-        let builder = ControllerBuilder::new(config, open_storage)?;
-        let init = builder.open_latest_checkpoint()?;
-        init.init(None, circuit_factory, error_cb)
-    }
-
     fn build(
         controller_init: ControllerInit,
         state: Option<Arc<ServerState>>,
@@ -3360,6 +3346,8 @@ impl CircuitThread {
             host_urls,
             peer_root_certificate,
             view_integrals,
+            #[cfg(any(test, feature = "testing"))]
+            feed_replay_early,
         } = controller_init;
 
         let storage = circuit_params.storage.clone();
@@ -3622,6 +3610,11 @@ impl CircuitThread {
                 }
             }),
         )?;
+
+        #[cfg(any(test, feature = "testing"))]
+        controller
+            .feed_replay_early
+            .store(feed_replay_early, Ordering::Release);
 
         let bootstrapping = circuit.bootstrap_in_progress();
 
@@ -6539,6 +6532,10 @@ pub struct ControllerInit {
 
     /// See [ControllerBuilder::peer_root_certificate].
     peer_root_certificate: Option<reqwest::Certificate>,
+
+    /// See [ControllerInner::feed_replay_early].
+    #[cfg(any(test, feature = "testing"))]
+    feed_replay_early: bool,
 }
 
 impl ControllerInit {
@@ -6576,6 +6573,16 @@ impl ControllerInit {
         }
     }
 
+    /// Sets [ControllerInner::feed_replay_early] before the circuit thread
+    /// starts to replay.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn with_feed_replay_early(self, feed_replay_early: bool) -> Self {
+        Self {
+            feed_replay_early,
+            ..self
+        }
+    }
+
     fn without_checkpoint(
         layout: Option<Layout>,
         config: PipelineConfig,
@@ -6605,6 +6612,8 @@ impl ControllerInit {
             input_choices: BTreeMap::new(),
             host_urls: Vec::new(),
             peer_root_certificate: None,
+            #[cfg(any(test, feature = "testing"))]
+            feed_replay_early: false,
         })
     }
 
@@ -6873,6 +6882,8 @@ impl ControllerInit {
             input_choices: BTreeMap::new(),
             host_urls: Vec::new(),
             peer_root_certificate: None,
+            #[cfg(any(test, feature = "testing"))]
+            feed_replay_early: false,
         })
     }
 
@@ -8576,6 +8587,9 @@ pub struct ControllerInner {
 
     /// Makes replay hand each journaled step to the input endpoints as soon as
     /// the previous step is done, as it did before a bug fix.
+    ///
+    /// Set it through [ControllerInit::with_feed_replay_early], because replay
+    /// starts before [Controller::start].
     #[cfg(any(test, feature = "testing"))]
     feed_replay_early: AtomicBool,
 }
@@ -12583,5 +12597,56 @@ mod commit_transaction_id_tests {
             info.start_commit_transaction_from_api(Open),
             Err(ControllerError::NoTransactionInProgress)
         ));
+    }
+}
+
+#[cfg(all(test, feature = "with-kafka"))]
+mod credential_registration_tests {
+    use super::{input_transport_config_to_endpoint, resolve_connector_config};
+    use feldera_types::config::{ConnectorConfig, TransportConfig};
+    use serde_json::json;
+
+    #[test]
+    fn controller_and_transport_preserve_short_values_and_public_references() {
+        for password in ["on", "1"] {
+            let secrets = tempfile::tempdir().unwrap();
+            let directory = secrets.path().join("kubernetes/controller-registration");
+            std::fs::create_dir_all(&directory).unwrap();
+            let topic = format!("controller-public-topic-{password}-2136");
+            std::fs::write(directory.join(password), &topic).unwrap();
+            let reference = format!("${{secret:kubernetes:controller-registration/{password}}}");
+            let config: ConnectorConfig = serde_json::from_value(json!({
+                "transport":{"name":"kafka_input","config":{
+                    "topic":reference,"sasl.password":password,"bootstrap.servers":"127.0.0.1:1"
+                }},"format":{"name":"json","config":{}}
+            }))
+            .unwrap();
+            let original = config.clone();
+            let resolved =
+                resolve_connector_config(secrets.path(), "input", &config, false).unwrap();
+            // Kafka input construction validates/stores the config without I/O.
+            assert!(
+                input_transport_config_to_endpoint(
+                    &resolved.transport,
+                    "input",
+                    secrets.path(),
+                    None
+                )
+                .unwrap()
+                .is_some()
+            );
+            let TransportConfig::KafkaInput(kafka) = &resolved.transport else {
+                panic!("expected Kafka input");
+            };
+            assert_eq!(kafka.topic, topic);
+            assert_eq!(kafka.kafka_options["sasl.password"], password);
+            assert_eq!(config, original);
+            let error = anyhow::anyhow!("mode on slot 1 topic {topic}");
+            let response = crate::server::error::ErrorResponse::from_anyerror(&error);
+            assert_eq!(
+                response.message,
+                format!("mode on slot 1 topic {reference}")
+            );
+        }
     }
 }

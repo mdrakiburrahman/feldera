@@ -12,6 +12,30 @@ Source edition can be found on github.
 
 - Delta Lake sources support `ignore_deletes` to retain rows when source files expire.
 
+## v0.385.0
+
+- Security: pipeline diagnostics replace registered Secret values with their
+  references in the pipeline log, in `/status`, and in the connector errors of
+  `/stats`. Connector errors, debug log lines, and compile errors that printed
+  a whole configuration, URI, or option value now name the endpoint and the
+  option only. The API server removes connection credentials from stored
+  deployment errors, returned status details, pipeline events, and support
+  bundle collections, including those stored before this release. URL and
+  Postgres keyword passwords become `[REDACTED]`, including escaped and
+  multiline keyword values. Where the end of a credential cannot be
+  established, the diagnostic is cut off at the credential. Collections stored
+  before this release are sanitized at export. Bundle metadata failure reasons
+  are also sanitized. Format configuration errors no longer echo rejected
+  scalars, and their `details` no longer carry a `config` key, and JSON
+  logging redacts fields before encoding them. A stored collection item that
+  cannot be decoded is left out of the bundle with a reason. Restart running
+  pipelines so that they run on the fixed runtime. Warning: inline credentials
+  in SQL and connector configuration are still exported in the support
+  bundle's `pipeline_config.json`. See [secret
+  references](/connectors/secret-references#diagnostics).
+
+## v0.384.0
+
 - Incompatible change (REST API, fda): the endpoint
   `GET /v0/pipelines/{pipeline_name}/circuit_profile`, which returned the
   circuit profile as graphviz `.dot` files in a zip archive, is removed, and so
@@ -42,6 +66,17 @@ Source edition can be found on github.
   the same location as `bucket`, if `read_bucket` and `bucket` are in
   different object stores, or if the deprecated `standby` field is `true`. See
   [Configuration checks at start](/pipelines/checkpoint-sync#configuration-checks-at-start).
+- Delta Lake and Iceberg input connectors: the conversion of the data that
+  the connector reads to SQL records is faster. In a benchmark of this
+  conversion with rows of about 100 columns, it takes about 70% less time.
+  The conversion now runs on its own pool with one thread per CPU core, so it
+  no longer delays other work in the pipeline.
+- Delta Lake and Iceberg input connectors: when `num_parsers` is not set, it
+  is now the number of CPU cores available to the pipeline, at most 16.
+  Before, it was 4. All connectors of a pipeline together keep at most two
+  record batches per CPU core in the parsers, so many connectors, or a large
+  `num_parsers`, no longer add memory use for each connector. In the REST
+  API, `num_parsers` can now be `null`, which means that it is not set.
 
 ## v0.382.0
 

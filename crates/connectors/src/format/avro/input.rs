@@ -54,6 +54,8 @@ pub const fn avro_de_config() -> &'static SqlSerdeConfig {
         // other formats use byte array encoding. If we have to support those, this
         // will need to be made configurable.
         uuid_format: UuidFormat::String,
+        positional_fields: false,
+        absent_columns: None,
     }
 }
 
@@ -70,9 +72,8 @@ impl InputFormat for AvroInputFormat {
         input_handle: &InputCollectionHandle,
         config: &serde_json::Value,
     ) -> Result<Box<dyn Parser>, ControllerError> {
-        let config = AvroParserConfig::deserialize(config).map_err(|e| {
-            ControllerError::parser_config_parse_error(endpoint_name, &e, &config.to_string())
-        })?;
+        let config = serde_json_path_to_error::from_value::<AvroParserConfig>(config.clone())
+            .map_err(|e| ControllerError::parser_config_field_error(endpoint_name, &e))?;
 
         let parser = AvroParser::create(
             endpoint_name,
@@ -93,7 +94,7 @@ impl InputFormat for AvroInputFormat {
             AvroParserConfig::deserialize(UrlDeserializer::new(form_urlencoded::parse(
                 query.as_bytes(),
             )))
-            .map_err(|e| ControllerError::parser_config_parse_error(endpoint_name, &e, query))?,
+            .map_err(|e| ControllerError::parser_config_parse_error(endpoint_name, &e))?,
         ))
     }
 }

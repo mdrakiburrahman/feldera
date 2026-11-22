@@ -5,6 +5,7 @@ use crate::integrated::delta_table::deletion_vector::{
     MaskedFile, ReadMode, filtered_parquet_table, read_deletion_vector,
 };
 use crate::integrated::delta_table::field_id_adapter::FieldIdAdapterFactory;
+use crate::integrated::delta_table::table_error_text;
 use crate::integrated::delta_table::{
     ReadSchema, delta_input_serde_config, register_storage_handlers,
 };
@@ -61,6 +62,8 @@ use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, Path, datafusion
 use feldera_adapterlib::format::{ParseError, StagedInputBuffer};
 use feldera_adapterlib::metrics::{ConnectorMetrics, ValueType};
 use feldera_adapterlib::transport::{InputQueueEntry, Resume, Watermark, parse_resume_info};
+use feldera_adapterlib::utils::arrow_layout::order_columns;
+use feldera_adapterlib::utils::arrow_timestamps::{check_timestamp_columns, timestamps_to_micros};
 use feldera_adapterlib::utils::backoff::calculate_backoff_delay;
 use feldera_adapterlib::utils::datafusion::{
     ColumnNameSet, array_to_string, columns_referenced_by_expression,
@@ -989,7 +992,7 @@ impl DeltaTableInputReader {
 
         config.validate().map_err(|e| anyhow!("{e}"))?;
 
-        if config.num_parsers == 0 {
+        if config.num_parsers == Some(0) {
             bail!("invalid 'num_parsers' value: 'num_parsers' must be greater than 0");
         }
 
@@ -2795,6 +2798,11 @@ impl DeltaTableInputEndpointInner {
             return;
         }
 
+        if let Err(e) = self.validate_timestamp_columns() {
+            let _ = init_status_sender.send(Err(e)).await;
+            return;
+        }
+
         if let Err(e) = self.prepare_snapshot_query(&table).await {
             let _ = init_status_sender.send(Err(e)).await;
             return;
@@ -3074,14 +3082,15 @@ impl DeltaTableInputEndpointInner {
     async fn open_table(&self) -> Result<DeltaTable, ControllerError> {
         debug!(
             "delta_table {}: opening delta table '{}'",
-            &self.endpoint_name, &self.config.uri
+            &self.endpoint_name,
+            self.config.display_uri()
         );
 
         // DeltaTableBuilder::from_uri panics on error, so we use `from_valid_uri` instead.
         let url = ensure_table_uri(&self.config.uri).map_err(|e| {
             ControllerError::invalid_transport_configuration(
                 &self.endpoint_name,
-                &format!("invalid Delta table uri '{}': {e}", self.config.uri),
+                &table_error_text("invalid Delta table uri", &self.config.uri, &e.to_string()),
             )
         })?;
 
@@ -3166,15 +3175,24 @@ impl DeltaTableInputEndpointInner {
                             retry_count += 1;
                             let backoff_ms = min(1000 * (1 << (retry_count - 1)), 10_000);
                             warn!(
-                                "delta_table {}: error loading delta table '{}' after {retry_count} attempts (retrying in {backoff_ms} ms): {e:?}",
-                                &self.endpoint_name, &self.config.uri,
+                                "delta_table {}: {} after {retry_count} attempts (retrying in {backoff_ms} ms)",
+                                &self.endpoint_name,
+                                table_error_text(
+                                    "error loading delta table",
+                                    &self.config.uri,
+                                    &format!("{e:?}")
+                                ),
                             );
 
                             sleep(Duration::from_millis(backoff_ms)).await;
                         } else {
                             return Err(ControllerError::invalid_transport_configuration(
                                 &self.endpoint_name,
-                                &format!("error opening delta table '{}': {e:?}", self.config.uri),
+                                &table_error_text(
+                                    "error opening delta table",
+                                    &self.config.uri,
+                                    &format!("{e:?}"),
+                                ),
                             ));
                         }
                     }
@@ -3184,13 +3202,14 @@ impl DeltaTableInputEndpointInner {
                                 &self.endpoint_name,
                                 &format!(
                                     "timeout loading delta table '{}' after {retry_count} attempts",
-                                    self.config.uri,
+                                    self.config.display_uri(),
                                 ),
                             ));
                         } else {
                             warn!(
                                 "delta_table {}: timeout loading delta table '{}' after {retry_count} attempts, retrying",
-                                &self.endpoint_name, &self.config.uri,
+                                &self.endpoint_name,
+                                self.config.display_uri(),
                             );
                             retry_count += 1;
                             if operation_timeout < Duration::from_secs(240) {
@@ -3235,7 +3254,9 @@ impl DeltaTableInputEndpointInner {
 
         info!(
             "delta_table {}: opened delta table '{}' (current table version {})",
-            &self.endpoint_name, &self.config.uri, version
+            &self.endpoint_name,
+            self.config.display_uri(),
+            version
         );
 
         // TODO: Validate that table schema matches relation schema
@@ -3495,6 +3516,32 @@ impl DeltaTableInputEndpointInner {
     ///
     /// `change_feed = require` fails unless the table has `delta.enableChangeDataFeed` set.
     /// `auto` accepts either.
+    /// Rejects a TIMESTAMP column that the table stores as anything but an
+    /// Arrow timestamp, which `delta_input_serde_config` would read as
+    /// microseconds.
+    fn validate_timestamp_columns(&self) -> Result<(), ControllerError> {
+        let invalid = |message: String| {
+            ControllerError::invalid_transport_configuration(&self.endpoint_name, &message)
+        };
+        let schema = self.logical_schema().map_err(|e| invalid(e.to_string()))?;
+        self.check_used_timestamp_columns(&schema).map_err(invalid)
+    }
+
+    /// Checks the TIMESTAMP columns that the connector reads. It does not read
+    /// an unused column that `skip_unused_columns` skips, so the type of that
+    /// column in the table does not matter.
+    fn check_used_timestamp_columns(&self, schema: &ArrowSchema) -> Result<(), String> {
+        let used = self.used_sql_columns();
+        let fields: Vec<Field> = self
+            .schema
+            .fields
+            .iter()
+            .filter(|f| used.contains(&f.name.name()))
+            .cloned()
+            .collect();
+        check_timestamp_columns(&fields, schema)
+    }
+
     fn validate_change_data_feed(&self, table: &DeltaTable) -> Result<(), ControllerError> {
         if !self.config.reads_change_feed() {
             return Ok(());
@@ -3521,7 +3568,7 @@ impl DeltaTableInputEndpointInner {
                      the '{ENABLE_CHANGE_DATA_FEED}' property set to 'true', so it records no \
                      change data. Set the property on the table (changes committed before it is set \
                      are not recorded), or set 'change_feed' to 'auto'.",
-                    self.config.uri,
+                    self.config.display_uri(),
                 )))
             } else {
                 Ok(())
@@ -3537,7 +3584,7 @@ impl DeltaTableInputEndpointInner {
                  '{column}', which the feed reserves under the name \
                  '{CHANGE_TYPE_COLUMN}'; set 'change_feed' to 'off' to read this table from its \
                  file actions instead.",
-                self.config.uri,
+                self.config.display_uri(),
             )));
         }
 
@@ -3802,7 +3849,8 @@ impl DeltaTableInputEndpointInner {
 
         let queue = self.queue.clone();
 
-        let num_parsers = self.config.num_parsers as usize;
+        let num_parsers = self.config.num_parsers() as usize;
+        let fields = Arc::new(self.schema.fields.clone());
 
         // Create a job queue to efficiently parse record batches retrieved by the query.
         let job_queue = JobQueue::<
@@ -3812,24 +3860,17 @@ impl DeltaTableInputEndpointInner {
             num_parsers,
             move || {
                 let polarity = polarity.clone();
-                let input_stream = input_stream.fork();
+                let fields = fields.clone();
+                let mut input_stream = input_stream.fork();
 
                 Box::new(move |(batch, timestamp)| {
-                    Box::pin({
-                        let polarity = polarity.clone();
-                        let mut input_stream = input_stream.fork();
-
-                        async move {
-                            let (parsed_buffer, errors) =
-                                Self::parse_record_batch(batch, &polarity, input_stream.as_mut())
-                                    .await;
-                            let staged_buffer = parsed_buffer.map(|buffer| {
-                                let len = buffer.len();
-                                StagedInputBuffer::new(input_stream.stage(vec![buffer]), len)
-                            });
-                            (staged_buffer, errors, timestamp)
-                        }
-                    })
+                    let (parsed_buffer, errors) =
+                        Self::parse_record_batch(batch, &polarity, &fields, input_stream.as_mut());
+                    let staged_buffer = parsed_buffer.map(|buffer| {
+                        let len = buffer.len();
+                        StagedInputBuffer::new(input_stream.stage(vec![buffer]), len)
+                    });
+                    (staged_buffer, errors, timestamp)
                 })
             },
             move |(buffer, errors, timestamp)| {
@@ -3894,9 +3935,10 @@ impl DeltaTableInputEndpointInner {
         Ok(total_records)
     }
 
-    async fn parse_record_batch(
+    fn parse_record_batch(
         batch: RecordBatch,
         polarity: &Polarity,
+        fields: &[Field],
         input_stream: &mut dyn ArrowStream,
     ) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
         // `ChangeType` takes its polarities out of the batch, so resolve the
@@ -3922,6 +3964,23 @@ impl DeltaTableInputEndpointInner {
                 }
             },
         };
+
+        // `delta_input_serde_config` reads timestamps as microseconds. The startup
+        // check is not sufficient: the schema of the table can change later.
+        let batch = match check_timestamp_columns(fields, batch.schema_ref())
+            .map_err(|e| e.to_string())
+            .and_then(|()| timestamps_to_micros(batch, fields).map_err(|e| e.to_string()))
+        {
+            Ok(batch) => batch,
+            Err(e) => {
+                return (None, vec![ParseError::bin_envelope_error(e, &[], None)]);
+            }
+        };
+        // Columns in declaration order are read by position, which is faster.
+        let (batch, by_name) = order_columns(batch, fields);
+        if let Some(reason) = by_name {
+            debug!("reading the records of a batch by field name: {reason}");
+        }
 
         let result = match (polarity, &polarities) {
             (_, Some(polarities)) => input_stream.insert_with_polarities(&batch, polarities, &None),
@@ -4606,8 +4665,12 @@ impl DeltaTableInputEndpointInner {
         if self.schema_snapshot().version() == Some(version) {
             return Ok(());
         }
-        let url = ensure_table_uri(&self.config.uri)
-            .map_err(|e| anyhow!("invalid Delta table uri '{}': {e}", self.config.uri))?;
+        let url = ensure_table_uri(&self.config.uri).map_err(|e| {
+            anyhow!(
+                "{}",
+                table_error_text("invalid Delta table uri", &self.config.uri, &e.to_string())
+            )
+        })?;
         let table = self
             .retry(
                 &format!("error loading Delta table schema at version {version}"),
@@ -6920,6 +6983,52 @@ mod cdc_projection_tests {
         )
     }
 
+    /// A TIMESTAMP column stored as an integer stops the connector only when
+    /// the connector reads the column.
+    #[test]
+    fn timestamp_check_skips_unread_columns() {
+        let endpoint = |skip_unused_columns: bool| {
+            let config: DeltaTableReaderConfig = serde_json::from_value(json!({
+                "uri": "/tmp/does-not-exist",
+                "mode": "snapshot",
+                "skip_unused_columns": skip_unused_columns,
+            }))
+            .unwrap();
+            let fields = vec![
+                field("s", false),
+                Field::new(SqlIdentifier::new("ts", false), ColumnType::timestamp(true))
+                    .with_unused(true),
+            ];
+            DeltaTableInputEndpointInner::new(
+                "test_endpoint",
+                config,
+                SessionContext::new(),
+                Box::new(MockInputConsumer::new()),
+                Relation::new(
+                    SqlIdentifier::new("test_table", false),
+                    fields,
+                    false,
+                    BTreeMap::new(),
+                ),
+                None,
+                None,
+            )
+        };
+        let table_schema = ArrowSchema::new(vec![
+            ArrowField::new("s", ArrowDataType::Utf8, true),
+            ArrowField::new("ts", ArrowDataType::Int64, true),
+        ]);
+
+        let read = endpoint(false).check_used_timestamp_columns(&table_schema);
+        assert!(
+            read.unwrap_err()
+                .starts_with("column ts has SQL type TIMESTAMP")
+        );
+        endpoint(true)
+            .check_used_timestamp_columns(&table_schema)
+            .unwrap();
+    }
+
     /// A frame shaped like one CDC read side: the declared columns, the columns
     /// the connector's expressions name, and `junk`, which nothing names.
     async fn cdc_side_frame() -> DataFrame {
@@ -7918,5 +8027,136 @@ mod timestamp_bounds_tests {
                 Some(None)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod positional_path_tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use feldera_adapterlib::ConnectorMetadata;
+    use feldera_adapterlib::catalog::StagedBuffers;
+    use feldera_adapterlib::format::BufferSize;
+    use feldera_adapterlib::utils::arrow_layout::has_positional_fields;
+    use feldera_types::program_schema::{ColumnType, SqlIdentifier};
+    use std::sync::{Arc, Mutex};
+
+    /// Records, for each batch that it receives, whether the batch is marked
+    /// for a read by position.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<bool>>>);
+
+    impl Recorder {
+        fn record(&self, batch: &RecordBatch) -> AnyResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(has_positional_fields(batch.schema_ref()));
+            Ok(())
+        }
+    }
+
+    impl InputBuffer for Recorder {
+        fn flush(&mut self) -> AnyResult<()> {
+            Ok(())
+        }
+        fn len(&self) -> BufferSize {
+            BufferSize::empty()
+        }
+        fn hash(&self, _hasher: &mut dyn std::hash::Hasher) {}
+        fn take_some(&mut self, _n: usize) -> Option<Box<dyn InputBuffer>> {
+            None
+        }
+    }
+
+    impl ArrowStream for Recorder {
+        fn insert(&mut self, data: &RecordBatch, _: &Option<ConnectorMetadata>) -> AnyResult<()> {
+            self.record(data)
+        }
+        fn delete(&mut self, data: &RecordBatch, _: &Option<ConnectorMetadata>) -> AnyResult<()> {
+            self.record(data)
+        }
+        fn insert_with_polarities(
+            &mut self,
+            data: &RecordBatch,
+            _polarities: &[bool],
+            _: &Option<ConnectorMetadata>,
+        ) -> AnyResult<()> {
+            self.record(data)
+        }
+        fn fork(&self) -> Box<dyn ArrowStream> {
+            Box::new(self.clone())
+        }
+        fn stage(&self, _buffers: Vec<Box<dyn InputBuffer>>) -> Box<dyn StagedBuffers> {
+            unreachable!()
+        }
+    }
+
+    fn fields() -> Vec<Field> {
+        vec![
+            Field::new(SqlIdentifier::new("id", false), ColumnType::bigint(false)),
+            Field::new(SqlIdentifier::new("name", false), ColumnType::varchar(true)),
+        ]
+    }
+
+    fn batch(columns: Vec<(&str, ArrayRef)>) -> RecordBatch {
+        RecordBatch::try_from_iter(columns).unwrap()
+    }
+
+    fn ids() -> ArrayRef {
+        Arc::new(Int64Array::from(vec![1, 2]))
+    }
+
+    fn strings(values: [&str; 2]) -> ArrayRef {
+        Arc::new(StringArray::from(values.to_vec()))
+    }
+
+    /// Whether `parse_record_batch` gives `batch` to the stream for a read by
+    /// position.
+    fn read_by_position(batch: RecordBatch, polarity: Polarity) -> bool {
+        let mut recorder = Recorder::default();
+        let (_, errors) = DeltaTableInputEndpointInner::parse_record_batch(
+            batch,
+            &polarity,
+            &fields(),
+            &mut recorder,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let recorded = recorder.0.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        recorded[0]
+    }
+
+    /// The connector reads a batch by position when the batch has all the
+    /// columns of the table: for inserts and deletes, with the columns in
+    /// another order and an extra column, and for a change data batch.
+    #[test]
+    fn complete_batches_are_read_by_position() {
+        let complete = || {
+            batch(vec![
+                ("extra", ids()),
+                ("name", strings(["a", "b"])),
+                ("ID", ids()),
+            ])
+        };
+        assert!(read_by_position(complete(), Polarity::Fixed(true)));
+        assert!(read_by_position(complete(), Polarity::Fixed(false)));
+
+        let change_data = batch(vec![
+            ("id", ids()),
+            ("name", strings(["a", "b"])),
+            (CHANGE_TYPE_COLUMN, strings(["insert", "delete"])),
+        ]);
+        assert!(read_by_position(change_data, Polarity::ChangeType));
+    }
+
+    /// A batch without a column of the table, which `skip_unused_columns`
+    /// produces, is read by position.
+    #[test]
+    fn a_batch_without_a_column_is_read_by_position() {
+        assert!(read_by_position(
+            batch(vec![("id", ids())]),
+            Polarity::Fixed(true)
+        ));
     }
 }

@@ -1,9 +1,11 @@
 use crate::storage::buffer_cache::CacheStats;
 use crate::storage::file::{
-    FilterKind, FilterStats, TouchedWindowCount, TouchedWindowCounter, collect_roaring_metadata,
+    FilterKind, FilterStats, RuntimeVersion, TouchedWindowCount, TouchedWindowCounter,
+    collect_roaring_metadata,
 };
 use crate::trace::cursor::Position;
 use crate::trace::ord::file::UnwrapStorage;
+use crate::trace::ord::retraction_counter::RetractionCounter;
 use crate::trace::{BatchLayout, BatchLocation};
 use crate::{
     DBData, DBWeight, NumEntries, Runtime, Timestamp,
@@ -385,6 +387,10 @@ where
     type Batcher = MergeBatcher<Self>;
     type Builder = FileValBuilder<K, V, T, R>;
 
+    fn runtime_version(&self) -> RuntimeVersion {
+        self.file.metadata().runtime_version.clone()
+    }
+
     fn file_reader(&self) -> Option<Arc<dyn FileReader>> {
         self.file.mark_for_checkpoint();
         Some(self.file.file_handle().clone())
@@ -411,6 +417,10 @@ where
 
     fn negative_weight_count(&self) -> Option<u64> {
         None
+    }
+
+    fn retraction_count(&self) -> u64 {
+        self.file.metadata().retraction_count
     }
 
     fn touched_window_count(&self) -> TouchedWindowCount {
@@ -721,6 +731,7 @@ where
     stats: BatchMetadata,
     #[size_of(skip)]
     touched_window_counter: Option<TouchedWindowCounter>,
+    retractions: RetractionCounter,
 }
 
 impl<K, V, T, R> Builder<FileValBatch<K, V, T, R>> for FileValBuilder<K, V, T, R>
@@ -752,6 +763,7 @@ where
             num_tuples: 0,
             stats: BatchMetadata::default(),
             touched_window_counter: collect_roaring_metadata().then(TouchedWindowCounter::default),
+            retractions: RetractionCounter::default(),
         }
     }
 
@@ -794,6 +806,7 @@ where
             num_tuples: 0,
             stats: BatchMetadata::default(),
             touched_window_counter: collect_roaring_metadata().then(TouchedWindowCounter::default),
+            retractions: RetractionCounter::default(),
         }
     }
 
@@ -802,6 +815,7 @@ where
             .touched_window_counter
             .map(TouchedWindowCounter::finish)
             .unwrap_or_default();
+        self.stats.retraction_count = self.retractions.pairs();
         let (file, filters) = self.writer.into_reader(self.stats).unwrap_storage();
         let file = Arc::new(file);
         FileValBatch::from_parts(self.factories, file, filters)
@@ -818,6 +832,7 @@ where
 
     fn push_time_diff(&mut self, time: &T, weight: &R) {
         debug_assert!(!weight.is_zero());
+        self.retractions.push(weight);
         self.time_diffs.push_refs((time, weight));
         self.num_tuples += 1;
     }
@@ -827,6 +842,7 @@ where
             .write1((val, &*self.time_diffs))
             .unwrap_storage();
         self.time_diffs.clear();
+        self.retractions.end_pair();
     }
 
     fn num_keys(&self) -> usize {

@@ -7,7 +7,7 @@
 #![allow(clippy::single_range_in_vec_init)]
 
 use crate::{
-    ControllerError, InputBuffer, InputConsumer, ParseError, Parser,
+    ControllerError, InputBuffer, InputConsumer, ParseError, Parser, TransactionToCommit,
     format::{Splitter, SpongeSplitter},
     test::{
         engine_test, input_pipeline,
@@ -37,7 +37,8 @@ use feldera_adapterlib::{
     catalog::StagedBuffers,
     format::{BufferSize, flatten_nested},
     test::{
-        Capability, ConnectorTestEngine, InputOptions, MockOutputCallbacks, Updates, wait_for_rows,
+        Capability, ConnectorTestEngine, InputOptions, MockOutputCallbacks, Updates,
+        default_timeout_ms, wait_for_rows,
     },
     transport::{OutputBatchType, Resume, Watermark},
 };
@@ -2224,7 +2225,7 @@ fn check_fault_tolerance(
     create_dir(&storage_dir).unwrap();
     let output_path = tempdir.path().join("output.csv");
 
-    let config: PipelineConfig = serde_json::from_value(json!({
+    let mut config: PipelineConfig = serde_json::from_value(json!({
         "name": "test",
         "workers": 4,
         "storage_config": { "path": storage_dir },
@@ -2255,6 +2256,21 @@ fn check_fault_tolerance(
         }
     }))
     .unwrap();
+    if rounds.iter().any(|round| round.add_partition_afterward) {
+        // Log how librdkafka fetches the partitions that a round adds.
+        let TransportConfig::KafkaInput(kafka) = &mut config
+            .inputs
+            .get_mut("test_input1")
+            .unwrap()
+            .connector_config
+            .transport
+        else {
+            unreachable!()
+        };
+        kafka
+            .kafka_options
+            .insert("debug".into(), "consumer,fetch".into());
+    }
     let circuit = TestCircuit::Identity {
         relation: relation(),
         persistent_output_ids: vec![Some("output".to_string())],
@@ -2311,7 +2327,23 @@ fn check_fault_tolerance(
             result.unwrap_err();
             return;
         }
-        result.unwrap();
+        if result.is_err() {
+            // Say whether the reader or the circuit held back the records, and which partitions
+            // hold them.
+            let status = controller.status();
+            let inputs = status.input_status();
+            let input = inputs
+                .values()
+                .find(|input| input.endpoint_name == "test_input1")
+                .unwrap();
+            panic!(
+                "round {round}: {} of {total_records} records transmitted within 10 s; the input endpoint received {} records and buffers {}; the (low, high) watermarks of the topic's partitions are {:?}",
+                transmitted(),
+                input.metrics.total_records.load(Ordering::Acquire),
+                input.metrics.buffered_records.load(Ordering::Acquire),
+                kafka_resources.watermarks(topic, n_partitions),
+            );
+        }
 
         // No more records arrive, but give a bug the time to send some.
         sleep(Duration::from_millis(100));
@@ -3137,6 +3169,103 @@ fn is_transient(error: &ControllerError) -> bool {
         ControllerError::InputTransportError { fatal: false, .. }
             | ControllerError::OutputTransportError { fatal: false, .. }
     )
+}
+
+/// Returns the `end` of each partition's offsets in `metadata`, the metadata of
+/// a Kafka connector's frontier, in partition order, or nothing if there is no
+/// frontier.  `end` is the next offset to read in the partition.
+fn frontier_ends(metadata: Option<JsonValue>) -> Vec<i64> {
+    metadata.map_or_else(Vec::new, |metadata| {
+        metadata["offsets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|offsets| offsets["end"].as_i64().unwrap())
+            .collect()
+    })
+}
+
+/// In a transaction, the circuit input frontier of a Kafka connector follows
+/// each round of messages to the end of every partition, while the completed
+/// frontier waits for the commit.
+#[engine_test(services(Kafka))]
+pub fn circuit_input_frontier_moves_in_a_transaction(engine: &dyn PipelineTestEngine) {
+    init_test_logger();
+    let topic = "circuit_input_frontier_test_topic";
+    let partitions = 2;
+    let rounds = 2;
+    let messages = 10;
+    let _kafka_resources = KafkaResources::create_topics(&[(topic, partitions)]);
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "kafka_input",
+                    "config": {
+                        "auto.offset.reset": "earliest",
+                        "topics": [topic],
+                    }
+                },
+                "format": { "name": "csv" }
+            }
+        }
+    }))
+    .unwrap();
+    let controller = engine
+        .controller(
+            &TestCircuit::identity(relation()),
+            &config,
+            Box::new(|error, _| {
+                if is_transient(&error) {
+                    info!("circuit_input_frontier_moves_in_a_transaction: ignored error: {error}")
+                } else {
+                    panic!("circuit_input_frontier_moves_in_a_transaction: {error}")
+                }
+            }),
+        )
+        .unwrap();
+    let status = || controller.input_endpoint_status("test_input1").unwrap();
+    controller.start();
+    controller.start_transaction().unwrap();
+
+    // Each round sends `messages` messages to each partition.  The second round
+    // starts after the circuit has taken in the first, so the transaction
+    // takes its input in more than one step.
+    let producer = TestProducer::new();
+    let ends_after = |rounds: usize| vec![(rounds * messages) as i64; partitions as usize];
+    for round in 0..rounds {
+        for partition in 0..partitions {
+            let first = (round * partitions as usize + partition as usize) * messages;
+            let batch = for_ids(first..first + messages);
+            producer.send_to_topic_partition(&csv(&singletons(&[batch])), topic, partition);
+        }
+        let ends = ends_after(round + 1);
+        wait(
+            || frontier_ends(status().circuit_input_frontier.map(|f| f.metadata)) == ends,
+            default_timeout_ms(),
+        )
+        .unwrap_or_else(|()| panic!("the circuit input frontier did not reach {ends:?}"));
+        let completed = frontier_ends(status().completed_frontier.map(|f| f.metadata));
+        assert!(
+            completed.iter().all(|&end| end == 0),
+            "the completed frontier moved in the transaction: {completed:?}"
+        );
+    }
+
+    controller
+        .start_commit_transaction(TransactionToCommit::Open)
+        .unwrap();
+    let ends = ends_after(rounds);
+    wait(
+        || frontier_ends(status().completed_frontier.map(|f| f.metadata)) == ends,
+        default_timeout_ms(),
+    )
+    .expect("the completed frontier did not reach the end of the partitions after the commit");
+    controller.stop().unwrap();
 }
 
 /// Checks a pipeline that reads CSV `data` from an input topic and writes it in `format`

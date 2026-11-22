@@ -408,6 +408,29 @@ export type Chunk = {
 }
 
 /**
+ * A watermark that the circuit has taken in.
+ *
+ * The outputs computed from the input may not be complete yet: in a
+ * transaction, they wait for the commit.
+ */
+export type CircuitInputWatermark = {
+  /**
+   * Timestamp when the data was ingested from the wire.
+   */
+  ingested_at: string
+  /**
+   * Metadata that describes the position in the input stream (e.g., Kafka partition/offset pairs).
+   */
+  metadata: {
+    [key: string]: unknown
+  }
+  /**
+   * Timestamp when the circuit finished the step that took the data in.
+   */
+  processed_at: string
+}
+
+/**
  * Client-generated data stored alongside a pipeline.
  *
  * The fields are stored together as a single JSON object in the
@@ -1447,11 +1470,13 @@ export type DeltaTableReaderConfig = {
   max_retries?: number | null
   mode: DeltaTableIngestMode
   /**
-   * The number of parallel parsing tasks the connector uses to process data read from the
-   * table. Increasing this value can enhance performance by allowing more concurrent processing.
-   * Recommended range: 1–10. The default is 4.
+   * The number of record batches the connector parses at the same time. Parsing runs on a
+   * pool with one thread per CPU core, which all connectors share, so a larger value only
+   * helps while the pool has idle threads. Each batch in flight holds memory.
+   * All connectors together keep at most two batches per CPU core in flight.
+   * The default is the number of CPU cores available to the pipeline, at most 16.
    */
-  num_parsers?: number
+  num_parsers?: number | null
   /**
    * Number of data files the connector decodes concurrently.
    *
@@ -1584,6 +1609,7 @@ export type DeltaTableReaderConfig = {
     | null
     | DeltaTableIngestMode
     | number
+    | null
     | number
     | null
     | string
@@ -1591,6 +1617,7 @@ export type DeltaTableReaderConfig = {
     | string
     | null
     | DeltaTableTransactionMode
+    | number
     | number
     | null
     | undefined
@@ -3097,11 +3124,16 @@ export type IcebergReaderConfig = GlueCatalogConfig &
     metadata_location?: string | null
     mode: IcebergIngestMode
     /**
-     * The number of parallel parsing tasks the connector uses to process data read from the
-     * table. Increasing this value can enhance performance by allowing more concurrent processing.
-     * Recommended range: 1-10. The default is 4.
+     * The number of record batches the connector parses at the same time. Parsing runs on a
+     * pool with one thread per CPU core, which all connectors share, so a larger value only
+     * helps while the pool has idle threads. Each batch in flight holds memory.
+     * All connectors together keep at most two batches per CPU core in flight.
+     * The default is the number of CPU cores available to the pipeline, at most 16.
+     *
+     * When set, this is also the number of files the connector reads at the same time,
+     * which is 4 otherwise.
      */
-    num_parsers?: number
+    num_parsers?: number | null
     /**
      * Optional row filter.
      *
@@ -3176,6 +3208,7 @@ export type IcebergReaderConfig = GlueCatalogConfig &
       | null
       | IcebergIngestMode
       | number
+      | null
       | string
       | null
       | number
@@ -3303,6 +3336,7 @@ export type InputEndpointStatus = {
    * Endpoint is currently a barrier to checkpointing and suspend.
    */
   barrier: boolean
+  circuit_input_frontier?: CircuitInputWatermark | null
   completed_frontier?: CompletedWatermark | null
   config: ShortEndpointConfig
   /**

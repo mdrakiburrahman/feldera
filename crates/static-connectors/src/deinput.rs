@@ -29,11 +29,13 @@ use feldera_adapterlib::ConnectorMetadata;
 use feldera_adapterlib::catalog::AvroSchemaRefs;
 use feldera_adapterlib::catalog::StagedBuffers;
 use feldera_adapterlib::format::{BufferSize, flatten_nested};
+use feldera_adapterlib::utils::arrow_layout::absent_columns;
 use feldera_sqllib::SqlVariant;
 use feldera_types::format::csv::CsvFormatConfig;
 use feldera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
 use serde_arrow::Deserializer as ArrowDeserializer;
 use serde_json::de::SliceRead;
+use std::borrow::Cow;
 use std::hash::Hasher;
 use std::iter::zip;
 use std::{collections::VecDeque, marker::PhantomData, ops::Neg};
@@ -674,29 +676,53 @@ where
     }
 }
 
-pub struct ArrowZSetStream<K, D, C> {
+/// The configuration of an Arrow stream, for the two ways to read a record.
+#[derive(Clone)]
+pub struct ArrowSerdeConfig {
+    by_name: SqlSerdeConfig,
+    positional: SqlSerdeConfig,
+}
+
+impl ArrowSerdeConfig {
+    pub fn new(config: SqlSerdeConfig) -> Self {
+        Self {
+            positional: config.clone().with_positional_fields(true),
+            by_name: config,
+        }
+    }
+
+    /// A batch with its columns in declaration order is read by position,
+    /// without the columns of the table that it does not have.
+    pub fn for_batch(&self, batch: &RecordBatch) -> Cow<'_, SqlSerdeConfig> {
+        match absent_columns(batch.schema_ref()) {
+            Some(absent) => Cow::Owned(self.positional.clone().with_absent_columns(absent)),
+            None => Cow::Borrowed(&self.by_name),
+        }
+    }
+}
+
+pub struct ArrowZSetStream<K, D> {
     buffer: DeZSetStreamBuffer<K>,
-    config: C,
+    config: ArrowSerdeConfig,
     metadata: MetadataVariant,
     phantom: PhantomData<D>,
 }
 
-impl<K, D, C> ArrowZSetStream<K, D, C> {
-    pub fn new(handle: ZSetHandle<K>, config: C) -> Self {
+impl<K, D> ArrowZSetStream<K, D> {
+    pub fn new(handle: ZSetHandle<K>, config: SqlSerdeConfig) -> Self {
         Self {
             buffer: DeZSetStreamBuffer::new(handle),
-            config,
+            config: ArrowSerdeConfig::new(config),
             metadata: MetadataVariant::default(),
             phantom: PhantomData,
         }
     }
 }
 
-impl<K, D, C> ArrowStream for ArrowZSetStream<K, D, C>
+impl<K, D> ArrowStream for ArrowZSetStream<K, D>
 where
     K: DBData + From<D>,
-    D: for<'de> DeserializeWithContext<'de, C, SqlVariant> + Send + Sync + 'static,
-    C: Clone + Send + Sync + 'static,
+    D: for<'de> DeserializeWithContext<'de, SqlSerdeConfig, SqlVariant> + Send + Sync + 'static,
 {
     fn insert(
         &mut self,
@@ -707,7 +733,7 @@ where
 
         let records = Vec::<D>::deserialize_with_context_aux(
             deserializer,
-            &self.config,
+            &self.config.for_batch(data),
             self.metadata.get(metadata),
         )?;
         self.buffer
@@ -727,7 +753,7 @@ where
 
         let records = Vec::<D>::deserialize_with_context_aux(
             deserializer,
-            &self.config,
+            &self.config.for_batch(data),
             self.metadata.get(metadata),
         )?;
         self.buffer
@@ -758,7 +784,7 @@ where
 
         let records = Vec::<D>::deserialize_with_context_aux(
             deserializer,
-            &self.config,
+            &self.config.for_batch(data),
             self.metadata.get(metadata),
         )?;
 
@@ -772,7 +798,10 @@ where
     }
 
     fn fork(&self) -> Box<dyn ArrowStream> {
-        Box::new(Self::new(self.buffer.handle.clone(), self.config.clone()))
+        Box::new(Self::new(
+            self.buffer.handle.clone(),
+            self.config.by_name.clone(),
+        ))
     }
 
     fn stage(&self, buffers: Vec<Box<dyn InputBuffer>>) -> Box<dyn StagedBuffers> {
@@ -786,11 +815,10 @@ where
     }
 }
 
-impl<K, D, C> InputBuffer for ArrowZSetStream<K, D, C>
+impl<K, D> InputBuffer for ArrowZSetStream<K, D>
 where
     K: DBData + From<D>,
-    D: for<'de> DeserializeWithContext<'de, C, SqlVariant> + Send + 'static,
-    C: Clone + Send + 'static,
+    D: for<'de> DeserializeWithContext<'de, SqlSerdeConfig, SqlVariant> + Send + 'static,
 {
     fn flush(&mut self) -> AnyResult<()> {
         self.buffer.flush()
@@ -1223,7 +1251,7 @@ where
         &self,
         config: SqlSerdeConfig,
     ) -> Result<Box<dyn ArrowStream>, ControllerError> {
-        Ok(Box::new(ArrowMapStream::<K, KD, V, VD, V, VF, _, _>::new(
+        Ok(Box::new(ArrowMapStream::<K, KD, V, VD, V, VF, _>::new(
             self.handle.clone(),
             self.value_key_func.clone(),
             config,
@@ -1624,7 +1652,7 @@ where
     }
 }
 
-pub struct ArrowMapStream<K, KD, V, VD, U, VF, C, H>
+pub struct ArrowMapStream<K, KD, V, VD, U, VF, H>
 where
     K: DBData,
     V: DBData,
@@ -1633,37 +1661,35 @@ where
 {
     buffer: DeMapStreamBuffer<K, V, U, H>,
     value_key_func: VF,
-    config: C,
+    config: ArrowSerdeConfig,
     metadata: MetadataVariant,
     phantom: PhantomData<fn(KD, VD)>,
 }
 
-impl<K, KD, V, VD, U, VF, C, H> ArrowMapStream<K, KD, V, VD, U, VF, C, H>
+impl<K, KD, V, VD, U, VF, H> ArrowMapStream<K, KD, V, VD, U, VF, H>
 where
     K: DBData,
     V: DBData,
     U: DBData,
     H: MapInput<K, V, U>,
-    C: Clone,
 {
-    pub fn new(handle: H, value_key_func: VF, config: C) -> Self {
+    pub fn new(handle: H, value_key_func: VF, config: SqlSerdeConfig) -> Self {
         Self {
             buffer: DeMapStreamBuffer::new(handle),
             value_key_func,
-            config,
+            config: ArrowSerdeConfig::new(config),
             metadata: MetadataVariant::default(),
             phantom: PhantomData,
         }
     }
 }
 
-impl<K, KD, V, VD, U, VF, C, H> ArrowStream for ArrowMapStream<K, KD, V, VD, U, VF, C, H>
+impl<K, KD, V, VD, U, VF, H> ArrowStream for ArrowMapStream<K, KD, V, VD, U, VF, H>
 where
-    C: Clone + Send + Sync + 'static,
     K: DBData + From<KD>,
-    KD: for<'de> DeserializeWithContext<'de, C, SqlVariant> + Send + Sync + 'static,
+    KD: for<'de> DeserializeWithContext<'de, SqlSerdeConfig, SqlVariant> + Send + Sync + 'static,
     V: DBData + From<VD>,
-    VD: for<'de> DeserializeWithContext<'de, C, SqlVariant> + Send + Sync + 'static,
+    VD: for<'de> DeserializeWithContext<'de, SqlSerdeConfig, SqlVariant> + Send + Sync + 'static,
     U: DBData,
     H: MapInput<K, V, U>,
     VF: Fn(&V) -> K + Clone + Send + Sync + 'static,
@@ -1677,7 +1703,7 @@ where
 
         let records = Vec::<VD>::deserialize_with_context_aux(
             deserializer,
-            &self.config,
+            &self.config.for_batch(data),
             self.metadata.get(metadata),
         )?;
         self.buffer.updates.extend(records.into_iter().map(|r| {
@@ -1698,7 +1724,7 @@ where
 
         let records = Vec::<VD>::deserialize_with_context_aux(
             deserializer,
-            &self.config,
+            &self.config.for_batch(data),
             self.metadata.get(metadata),
         )?;
         self.buffer.updates.extend(records.into_iter().map(|r| {
@@ -1714,7 +1740,7 @@ where
         Box::new(Self::new(
             self.buffer.handle.clone(),
             self.value_key_func.clone(),
-            self.config.clone(),
+            self.config.by_name.clone(),
         ))
     }
 
@@ -1738,7 +1764,7 @@ where
 
         let records = Vec::<VD>::deserialize_with_context_aux(
             deserializer,
-            &self.config,
+            &self.config.for_batch(data),
             self.metadata.get(metadata),
         )?;
         self.buffer
@@ -1764,13 +1790,12 @@ where
     }
 }
 
-impl<K, KD, V, VD, U, VF, C, H> InputBuffer for ArrowMapStream<K, KD, V, VD, U, VF, C, H>
+impl<K, KD, V, VD, U, VF, H> InputBuffer for ArrowMapStream<K, KD, V, VD, U, VF, H>
 where
-    C: Clone + Send + Sync + 'static,
     K: DBData + From<KD>,
-    KD: for<'de> DeserializeWithContext<'de, C, SqlVariant> + Send + Sync + 'static,
+    KD: for<'de> DeserializeWithContext<'de, SqlSerdeConfig, SqlVariant> + Send + Sync + 'static,
     V: DBData + From<VD>,
-    VD: for<'de> DeserializeWithContext<'de, C, SqlVariant> + Send + Sync + 'static,
+    VD: for<'de> DeserializeWithContext<'de, SqlSerdeConfig, SqlVariant> + Send + Sync + 'static,
     U: DBData,
     H: MapInput<K, V, U>,
     VF: Fn(&V) -> K + Clone + Send + Sync + 'static,

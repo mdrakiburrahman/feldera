@@ -32,6 +32,10 @@ use feldera_storage::{DirEntry, StorageBackend, StorageFileType, StoragePath};
 use uuid::Uuid;
 
 use super::RuntimeError;
+use super::runtime::LocalStoreMarker;
+use crate::circuit::Runtime;
+use crate::trace::Batch;
+use typedmap::TypedMapKey;
 
 /// A "checkpointer" is responsible for the creation, and removal of
 /// checkpoints for a circuit.
@@ -759,6 +763,51 @@ pub(crate) fn checkpoint_invalid_data_error(operation: &'static str, detail: Str
         operation,
         path: Some(detail),
     })
+}
+
+/// The number of batches that a restore read from a checkpoint, indexed by the
+/// runtime version that wrote them.  `None` is an unknown version.
+pub type RestoredBatchVersions = BTreeMap<Option<String>, usize>;
+
+/// Key in a [`Runtime`]'s local store for [`RestoredBatchVersions`].
+#[derive(Hash, PartialEq, Eq)]
+struct RestoredBatchVersionsId;
+
+impl TypedMapKey<LocalStoreMarker> for RestoredBatchVersionsId {
+    type Value = RestoredBatchVersions;
+}
+
+/// Adds `batch` to the [`RestoredBatchVersions`] of the current [`Runtime`].
+///
+/// Each worker's spines call this for each batch that they restore.  The
+/// workers of a runtime share one count.
+pub(crate) fn record_restored_batch_version<B: Batch>(batch: &B) {
+    let Some(runtime) = Runtime::runtime() else {
+        return;
+    };
+    let version = batch
+        .runtime_version()
+        .get()
+        .map(|version| version.into_owned());
+    *runtime
+        .local_store()
+        .entry(RestoredBatchVersionsId)
+        .or_default()
+        .entry(version)
+        .or_default() += 1;
+}
+
+/// Returns the batches that [`record_restored_batch_version`] counted in
+/// `runtime`, and resets the count to zero.
+///
+/// [`DBSPHandle`](crate::DBSPHandle) calls this before a restore, to discard an
+/// earlier count, and after the restore, to read the new count.
+pub(crate) fn take_restored_batch_versions(runtime: &Runtime) -> RestoredBatchVersions {
+    runtime
+        .local_store()
+        .remove(&RestoredBatchVersionsId)
+        .map(|entry| entry.1)
+        .unwrap_or_default()
 }
 
 /// Trait for types that can be check-pointed and restored.
