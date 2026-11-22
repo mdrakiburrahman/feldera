@@ -82,11 +82,13 @@ All commands below should be run from the root directory of the repository.
 
 Use the source-build prerequisites in the root README. From a clean checkout,
 build the SQL compiler and pipeline manager for the target architecture, then
-place their artifacts in `build/` for the runtime Dockerfile:
+place their artifacts in `build/` for the runtime Dockerfile. The suffix makes
+`platform_version` name the source commit:
 
 ```bash
-(cd sql-to-dbsp-compiler && bash build.sh -pl SQL-compiler)
-cargo build --locked --release --bin pipeline-manager
+(cd sql-to-dbsp-compiler && CALCITE_BUILD_DIR=./calcite bash build.sh -pl SQL-compiler)
+export FELDERA_PLATFORM_VERSION_SUFFIX=$(git rev-parse HEAD) FELDERA_BUILD_ORIGIN=source
+cargo build --locked --release --bin pipeline-manager --features pipeline-manager/fips
 mkdir -p build
 cp target/release/pipeline-manager build/
 cp sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp*.jar build/
