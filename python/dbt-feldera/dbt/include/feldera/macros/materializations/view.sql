@@ -19,7 +19,10 @@
 {% materialization view, adapter='feldera' %}
     {%- set pipeline_name = config.get('pipeline_name', model.schema) -%}
     {%- set view_name = model.name -%}
-    {%- set connectors = config.get('connectors', []) -%}
+    {%- set connectors = config.get('connectors', none) -%}
+    {%- if connectors is none -%}
+        {%- set connectors = adapter.dispatch('default_view_connectors', 'dbt')(model.name, model.schema) -%}
+    {%- endif -%}
     {%- set stored = config.get('stored', false) -%}
     {%- set full_refresh = flags.FULL_REFRESH -%}
 
