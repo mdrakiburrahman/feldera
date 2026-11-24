@@ -10520,6 +10520,11 @@
             ],
             "nullable": true
           },
+          "data_file_budget_fence": {
+            "type": "string",
+            "description": "Absolute path of a durable, exclusive-create admission marker. Requires\n`max_data_file_bytes` and a shared persistent filesystem across restarts.",
+            "nullable": true
+          },
           "datetime": {
             "type": "string",
             "description": "Optional timestamp for the snapshot in the ISO-8601/RFC-3339 format, e.g.,\n\"2024-12-09T16:09:53+00:00\".\n\nWhen this option is set, the connector finds and opens the version of the table as of the\nspecified point in time (based on the server time recorded in the transaction log, not the\nevent time encoded in the data).  In the snapshot-taking modes it retrieves the snapshot\nof this version of the table.  In the log-following modes (`follow`,\n`snapshot_and_follow`, `cdc`) it follows transaction log records **after** this version.\n\nNote: at most one of `version` and `datetime` options can be specified.\nWhen neither of the two options is specified, the latest committed version of the table\nis used.",
