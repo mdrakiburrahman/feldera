@@ -7,7 +7,7 @@ import sqlglot
 from sqlglot import exp
 
 from dbt.adapters.contracts.connection import AdapterResponse
-from dbt.adapters.feldera.pipeline_manager import PipelineStateManager, _admit_start
+from dbt.adapters.feldera.pipeline_manager import PipelineStateManager, _admit_start, _start_admitted
 from feldera.enums import CompilationProfile, PipelineStatus, ProgramStatus
 from feldera.pipeline import Pipeline
 from feldera.pipeline_builder import PipelineBuilder
@@ -117,10 +117,10 @@ def run_unit_test(client, sql, expected_rows, expected_sql, render_expected, udf
         previous = getattr(_admission_context, "pipeline", None)
         _admission_context.pipeline = pipeline
         try:
-            _admit_start(pipeline)
+            admitted = _admit_start(pipeline)
         finally:
             _admission_context.pipeline = previous
-        pipeline.start()
+        _start_admitted(pipeline, admitted)
         pipeline.wait_for_idle(timeout_s=timeout)
         columns = [field["name"] for field in selected]
         projection = ", ".join(quoted[name.lower()] for name in columns)

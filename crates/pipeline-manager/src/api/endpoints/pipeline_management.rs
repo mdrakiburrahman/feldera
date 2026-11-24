@@ -789,6 +789,10 @@ pub struct PostStartPipelineParameters {
     concurrent_bootstrap: bool,
     #[serde(default = "default_pipeline_start_dismiss_error")]
     dismiss_error: bool,
+    /// Pipeline identity observed during admission; must be paired with `expected_version`.
+    expected_pipeline_id: Option<Uuid>,
+    /// Core pipeline version observed during admission.
+    expected_version: Option<i64>,
 }
 
 /// Default for the `force` query parameter when POST a pipeline stop.
@@ -1924,6 +1928,39 @@ pub(crate) async fn post_pipeline_start(
     path: web::Path<String>,
     query: web::Query<PostStartPipelineParameters>,
 ) -> Result<HttpResponse, ManagerError> {
+    post_pipeline_start_inner(state, tenant_id, path, query, false).await
+}
+
+/// Start a pipeline only if its admitted identity and version still match.
+#[utoipa::path(
+    context_path = "/v0",
+    security(("JSON web token (JWT) or API key" = [])),
+    params(("pipeline_name" = String, Path, description = "Unique pipeline name"), PostStartPipelineParameters),
+    responses(
+        (status = ACCEPTED, description = "Conditional start accepted"),
+        (status = CONFLICT, body = ErrorResponse),
+        (status = BAD_REQUEST, body = ErrorResponse),
+        (status = NOT_FOUND, body = ErrorResponse),
+    ),
+    tag = "Pipeline Lifecycle"
+)]
+#[post("/pipelines/{pipeline_name}/start-if-current")]
+pub(crate) async fn post_pipeline_start_if_current(
+    state: WebData<ServerState>,
+    tenant_id: ReqData<TenantId>,
+    path: web::Path<String>,
+    query: web::Query<PostStartPipelineParameters>,
+) -> Result<HttpResponse, ManagerError> {
+    post_pipeline_start_inner(state, tenant_id, path, query, true).await
+}
+
+async fn post_pipeline_start_inner(
+    state: WebData<ServerState>,
+    tenant_id: ReqData<TenantId>,
+    path: web::Path<String>,
+    query: web::Query<PostStartPipelineParameters>,
+    require_precondition: bool,
+) -> Result<HttpResponse, ManagerError> {
     let pipeline_name = path.into_inner();
     let PostStartPipelineParameters {
         initial,
@@ -1931,6 +1968,8 @@ pub(crate) async fn post_pipeline_start(
         silent_bootstrap,
         concurrent_bootstrap,
         dismiss_error,
+        expected_pipeline_id,
+        expected_version,
     } = query.into_inner();
 
     let bootstrap_config = BootstrapConfig {
@@ -1942,53 +1981,47 @@ pub(crate) async fn post_pipeline_start(
         .validate()
         .map_err(|reason| ApiError::InvalidBootstrapConfig { reason })?;
 
-    let pipeline_id = match initial.as_str() {
-        "standby" => {
-            state
-                .db
-                .lock()
-                .await
-                .set_deployment_resources_desired_status_provisioned(
-                    *tenant_id,
-                    &pipeline_name,
-                    RuntimeDesiredStatus::Standby,
-                    bootstrap_config,
-                    dismiss_error,
-                )
-                .await?
-        }
-        "paused" => {
-            state
-                .db
-                .lock()
-                .await
-                .set_deployment_resources_desired_status_provisioned(
-                    *tenant_id,
-                    &pipeline_name,
-                    RuntimeDesiredStatus::Paused,
-                    bootstrap_config,
-                    dismiss_error,
-                )
-                .await?
-        }
-        "running" => {
-            state
-                .db
-                .lock()
-                .await
-                .set_deployment_resources_desired_status_provisioned(
-                    *tenant_id,
-                    &pipeline_name,
-                    RuntimeDesiredStatus::Running,
-                    bootstrap_config,
-                    dismiss_error,
-                )
-                .await?
-        }
+    let initial_status = match initial.as_str() {
+        "standby" => RuntimeDesiredStatus::Standby,
+        "paused" => RuntimeDesiredStatus::Paused,
+        "running" => RuntimeDesiredStatus::Running,
         _ => Err(ManagerError::from(ApiError::UnsupportedPipelineAction {
             action: format!("/start?initial={initial}"),
             reason: format!("unknown initial runtime desired status: {initial}"),
         }))?,
+    };
+    let db = state.db.lock().await;
+    let pipeline_id = match (expected_pipeline_id, expected_version) {
+        (None, None) if !require_precondition => {
+            db.set_deployment_resources_desired_status_provisioned(
+                *tenant_id,
+                &pipeline_name,
+                initial_status,
+                bootstrap_config,
+                dismiss_error,
+            )
+            .await?
+        }
+        (Some(id), Some(version)) => {
+            db.set_deployment_resources_desired_status_provisioned_if_current(
+                *tenant_id,
+                &pipeline_name,
+                initial_status,
+                bootstrap_config,
+                dismiss_error,
+                PipelineId(id),
+                Version(version),
+                &state.common_config.platform_version,
+            )
+            .await?
+        }
+        _ => {
+            return Err(DBError::PreconditionViolation {
+                precondition: "expected_pipeline_id and expected_version must be provided together"
+                    .to_string(),
+            }
+            .into());
+        }
     };
 
     info!(

@@ -1153,6 +1153,55 @@ impl Storage for StoragePostgres {
         Ok(pipeline_id)
     }
 
+    async fn set_deployment_resources_desired_status_provisioned_if_current(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+        initial: RuntimeDesiredStatus,
+        bootstrap_config: BootstrapConfig,
+        dismiss_error: bool,
+        expected_id: PipelineId,
+        expected_version: Version,
+        platform_version: &str,
+    ) -> Result<PipelineId, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let current =
+            operations::pipeline::get_pipeline(&txn, tenant_id, pipeline_name, true).await?;
+        if current.id != expected_id {
+            return Err(DBError::PreconditionViolation {
+                precondition: "pipeline identity changed since admission".to_string(),
+            });
+        }
+        if current.version != expected_version {
+            return Err(DBError::OutdatedPipelineVersion {
+                outdated_version: expected_version,
+                latest_version: current.version,
+            });
+        }
+        if current.program_status != ProgramStatus::Success
+            || current.program_info.is_none()
+            || current.platform_version != platform_version
+        {
+            return Err(DBError::PreconditionViolation {
+                precondition: "admitted pipeline must be compiled for the current platform"
+                    .to_string(),
+            });
+        }
+        let pipeline_id = operations::pipeline::set_deployment_resources_desired_status(
+            &txn,
+            tenant_id,
+            pipeline_name,
+            ResourcesDesiredStatus::Provisioned,
+            Some(initial),
+            Some(bootstrap_config),
+            dismiss_error,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(pipeline_id)
+    }
+
     async fn set_deployment_resources_desired_status_stopped(
         &self,
         tenant_id: TenantId,

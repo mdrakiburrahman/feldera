@@ -828,6 +828,8 @@ metrics"""
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
         reloadable_tables: Optional[List[str]] = None,
+        expected_pipeline_id: Optional[str] = None,
+        expected_version: Optional[int] = None,
     ):
         """
         .. _start:
@@ -858,6 +860,9 @@ metrics"""
             `CREATE TABLE T1` and `MyTable` for `CREATE TABLE "MyTable"`.
             None by default: ALLOW bootstraps without a check. If no tables are
             acceptable to reload, set `reloadable_tables=[]`.
+        :param expected_pipeline_id: Identity admitted for conditional start.
+        :param expected_version: Core version admitted for conditional start.
+            Both values must be supplied together.
         :raises RuntimeError: If the pipeline is not in STOPPED state.
         :raises TableReloadNotAllowedError: If a modified table is not in
             `reloadable_tables`, or the pipeline cannot compute the program
@@ -876,6 +881,8 @@ metrics"""
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
             reloadable_tables=reloadable_tables,
+            expected_pipeline_id=expected_pipeline_id,
+            expected_version=expected_version,
         )
 
     def start_paused(

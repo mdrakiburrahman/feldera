@@ -562,6 +562,33 @@ pub(crate) trait Storage {
         dismiss_error: bool,
     ) -> Result<PipelineId, DBError>;
 
+    /// Starts only the compiled pipeline identified by the admitted core version.
+    async fn set_deployment_resources_desired_status_provisioned_if_current(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+        initial: RuntimeDesiredStatus,
+        bootstrap_config: BootstrapConfig,
+        dismiss_error: bool,
+        expected_id: PipelineId,
+        expected_version: Version,
+        platform_version: &str,
+    ) -> Result<PipelineId, DBError> {
+        let _ = (
+            tenant_id,
+            pipeline_name,
+            initial,
+            bootstrap_config,
+            dismiss_error,
+            expected_id,
+            expected_version,
+            platform_version,
+        );
+        Err(DBError::PreconditionViolation {
+            precondition: "conditional pipeline start is not supported by this storage".to_string(),
+        })
+    }
+
     /// Sets deployment desired status to `Stopped` if it is not in currently `Provisioned`.
     /// Returns `true` for the boolean if it was set to stopped.
     #[allow(dead_code)] // Only used by non-forceful stop in Enterprise edition

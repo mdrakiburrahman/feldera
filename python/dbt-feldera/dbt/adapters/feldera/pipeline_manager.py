@@ -23,13 +23,37 @@ def set_pre_start_hook(callback: Optional[Callable[[Pipeline], None]], *, requir
     _pre_start_hook = (callback, required)
 
 
-def _admit_start(pipeline: Pipeline) -> None:
+def _admit_start(pipeline: Pipeline) -> Optional[tuple[str, int]]:
     callback, required = _pre_start_hook
     if callback is None:
         if required:
             raise RuntimeError("A pre-start admission hook is required")
-    else:
+        return None
+    if not required:
         callback(pipeline)
+        return None
+
+    def identity():
+        descriptor = pipeline.client.http.get(f"/pipelines/{pipeline.name}")
+        if descriptor.get("program_status") != "Success" or descriptor.get("program_info") is None:
+            raise RuntimeError("Admitted pipeline must be compiled")
+        pipeline_id, version = descriptor.get("id"), descriptor.get("version")
+        if not isinstance(pipeline_id, str) or not isinstance(version, int):
+            raise RuntimeError("Admitted pipeline identity or version is missing")
+        return pipeline_id, version, descriptor.get("program_version"), descriptor.get("platform_version")
+
+    before = identity()
+    callback(pipeline)
+    if identity() != before:
+        raise RuntimeError("Pipeline changed during admission")
+    return before[0], before[1]
+
+
+def _start_admitted(pipeline: Pipeline, admitted: Optional[tuple[str, int]]) -> None:
+    if admitted is None:
+        pipeline.start()
+    else:
+        pipeline.start(expected_pipeline_id=admitted[0], expected_version=admitted[1])
 
 
 _RUNTIME_DEFAULTS = {
@@ -360,8 +384,7 @@ class PipelineStateManager:
             p = builder.create_or_replace(wait=True)
             logger.info("Pipeline '%s' compiled successfully, starting...", pipeline)
 
-            _admit_start(p)
-            p.start()
+            _start_admitted(p, _admit_start(p))
             p.wait_for_status(PipelineStatus.RUNNING, timeout=timeout)
             logger.info("Pipeline '%s' is running", pipeline)
 
@@ -499,8 +522,7 @@ class PipelineStateManager:
 
             logger.info("Pipeline '%s' recompiled with views, starting...", pipeline)
 
-            _admit_start(p)
-            p.start()
+            _start_admitted(p, _admit_start(p))
             p.wait_for_status(PipelineStatus.RUNNING, timeout=timeout)
             logger.info("Pipeline '%s' is running with views", pipeline)
 

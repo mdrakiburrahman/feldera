@@ -5027,6 +5027,154 @@ async fn stop_request_keeps_bootstrap_config_of_started_deployment() {
 }
 
 #[tokio::test]
+async fn pipeline_conditional_start_guard() {
+    let handle = test_setup().await;
+    let db = &handle.db;
+    let tenant = TenantRecord::default().id;
+    let desc = PipelineDescr {
+        name: "guarded".to_string(),
+        description: String::new(),
+        tags: vec![],
+        runtime_config: json!({}),
+        program_code: "select 1".to_string(),
+        udf_rust: String::new(),
+        udf_toml: String::new(),
+        program_config: json!({}),
+    };
+    let pipeline = db
+        .new_pipeline(tenant, Uuid::now_v7(), "v0", desc.clone())
+        .await
+        .unwrap();
+    let start = |id, version, platform| {
+        db.set_deployment_resources_desired_status_provisioned_if_current(
+            tenant,
+            "guarded",
+            RuntimeDesiredStatus::Running,
+            BootstrapConfig::default(),
+            true,
+            id,
+            version,
+            platform,
+        )
+    };
+    assert!(matches!(
+        start(pipeline.id, Version(1), "v0").await,
+        Err(DBError::PreconditionViolation { .. })
+    ));
+    db.transit_program_status_to_compiling_sql(tenant, pipeline.id, Version(1))
+        .await
+        .unwrap();
+    db.transit_program_status_to_sql_compiled(
+        tenant,
+        pipeline.id,
+        Version(1),
+        &SqlCompilationInfo {
+            exit_code: 0,
+            messages: vec![],
+        },
+        &serde_json::to_value(ProgramInfo {
+            schema: serde_json::to_value(ProgramSchema {
+                inputs: vec![],
+                outputs: vec![],
+            })
+            .unwrap(),
+            main_rust: String::new(),
+            udf_stubs: String::new(),
+            input_connectors: BTreeMap::new(),
+            output_connectors: BTreeMap::new(),
+            circuit_ir: None,
+            dataflow: None,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    db.transit_program_status_to_compiling_rust(tenant, pipeline.id, Version(1))
+        .await
+        .unwrap();
+    db.transit_program_status_to_success(
+        tenant,
+        pipeline.id,
+        Version(1),
+        &RustCompilationInfo::from_process_output_streams(0, String::new(), String::new()),
+        "def",
+        "123",
+        "456",
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        start(PipelineId(Uuid::now_v7()), Version(1), "v0").await,
+        Err(DBError::PreconditionViolation { .. })
+    ));
+    assert!(matches!(
+        start(pipeline.id, Version(1), "v1").await,
+        Err(DBError::PreconditionViolation { .. })
+    ));
+    assert_eq!(
+        db.get_pipeline(tenant, "guarded")
+            .await
+            .unwrap()
+            .deployment_resources_desired_status,
+        ResourcesDesiredStatus::Stopped
+    );
+    start(pipeline.id, Version(1), "v0").await.unwrap();
+    assert_eq!(
+        db.get_pipeline(tenant, "guarded")
+            .await
+            .unwrap()
+            .deployment_resources_desired_status,
+        ResourcesDesiredStatus::Provisioned
+    );
+    db.set_deployment_resources_desired_status_stopped(tenant, "guarded")
+        .await
+        .unwrap();
+    db.update_pipeline(
+        tenant,
+        "guarded",
+        &None,
+        &PatchClientMetadata::default(),
+        "v0",
+        false,
+        &Some(json!({"workers": 2})),
+        &Some("select 2".to_string()),
+        &None,
+        &None,
+        &None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        start(pipeline.id, Version(1), "v0").await,
+        Err(DBError::OutdatedPipelineVersion { .. })
+    ));
+    assert_eq!(
+        db.get_pipeline(tenant, "guarded")
+            .await
+            .unwrap()
+            .deployment_resources_desired_status,
+        ResourcesDesiredStatus::Stopped
+    );
+    db.delete_pipeline(tenant, "guarded").await.unwrap();
+    let replacement = db
+        .new_pipeline(tenant, Uuid::now_v7(), "v0", desc)
+        .await
+        .unwrap();
+    assert_ne!(replacement.id, pipeline.id);
+    assert!(matches!(
+        start(pipeline.id, Version(1), "v0").await,
+        Err(DBError::PreconditionViolation { .. })
+    ));
+    assert_eq!(
+        db.get_pipeline(tenant, "guarded")
+            .await
+            .unwrap()
+            .deployment_resources_desired_status,
+        ResourcesDesiredStatus::Stopped
+    );
+}
+
+#[tokio::test]
 async fn pipeline_provision_version_guard() {
     let handle = test_setup().await;
     let tenant_id = TenantRecord::default().id;
