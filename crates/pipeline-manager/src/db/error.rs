@@ -294,6 +294,9 @@ pub enum DBError {
     PreconditionViolation {
         precondition: String,
     },
+    ConditionalStartPrecondition {
+        reason: String,
+    },
     CannotStartWithUndismissedError,
     CannotStartWhileClearingStorage,
     CannotStartWithCompilationError,
@@ -979,6 +982,9 @@ impl Display for DBError {
             DBError::PreconditionViolation { precondition } => {
                 write!(f, "Operation precondition not met: '{precondition}'")
             }
+            DBError::ConditionalStartPrecondition { reason } => {
+                write!(f, "Conditional start precondition not met: {reason}")
+            }
             DBError::TlsConnection { hint, .. } => {
                 write!(f, "Unable to setup TLS connection to the database: {hint}")
             }
@@ -1202,6 +1208,7 @@ impl DetailedError for DBError {
             Self::InvalidBootstrap { .. } => Cow::from("InvalidBootstrap"),
             Self::NoRuntimeStatusWhileProvisioned => Cow::from("NoRuntimeStatusWhileProvisioned"),
             Self::PreconditionViolation { .. } => Cow::from("PreconditionViolation"),
+            Self::ConditionalStartPrecondition { .. } => Cow::from("ConditionalStartPrecondition"),
             Self::ResumeWhileNotProvisioned => Cow::from("ResumeWhileNotProvisioned"),
             Self::CannotStartWithUndismissedError => Cow::from("CannotStartWithUndismissedError"),
             Self::CannotStartWhileClearingStorage => Cow::from("CannotStartWhileClearingStorage"),
@@ -1315,6 +1322,7 @@ impl ResponseError for DBError {
             Self::InvalidBootstrap { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NoRuntimeStatusWhileProvisioned => StatusCode::INTERNAL_SERVER_ERROR,
             Self::PreconditionViolation { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ConditionalStartPrecondition { .. } => StatusCode::CONFLICT,
             Self::CannotStartWithUndismissedError => StatusCode::BAD_REQUEST,
             Self::CannotStartWhileClearingStorage => StatusCode::BAD_REQUEST,
             Self::CannotStartWithCompilationError => StatusCode::BAD_REQUEST,

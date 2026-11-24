@@ -23,13 +23,17 @@ def set_pre_start_hook(callback: Optional[Callable[[Pipeline], None]], *, requir
     _pre_start_hook = (callback, required)
 
 
-def _admit_start(pipeline: Pipeline) -> Optional[tuple[str, int]]:
+def _admit_start(pipeline: Pipeline, validate: Optional[Callable[[], None]] = None) -> Optional[tuple[str, int]]:
     callback, required = _pre_start_hook
     if callback is None:
         if required:
             raise RuntimeError("A pre-start admission hook is required")
+        if validate is not None:
+            validate()
         return None
     if not required:
+        if validate is not None:
+            validate()
         callback(pipeline)
         return None
 
@@ -38,11 +42,21 @@ def _admit_start(pipeline: Pipeline) -> Optional[tuple[str, int]]:
         if descriptor.get("program_status") != "Success" or descriptor.get("program_info") is None:
             raise RuntimeError("Admitted pipeline must be compiled")
         pipeline_id, version = descriptor.get("id"), descriptor.get("version")
-        if not isinstance(pipeline_id, str) or not isinstance(version, int):
+        program_version, platform = descriptor.get("program_version"), descriptor.get("platform_version")
+        if (
+            not isinstance(pipeline_id, str)
+            or not pipeline_id
+            or type(version) is not int
+            or type(program_version) is not int
+            or not isinstance(platform, str)
+            or not platform
+        ):
             raise RuntimeError("Admitted pipeline identity or version is missing")
-        return pipeline_id, version, descriptor.get("program_version"), descriptor.get("platform_version")
+        return pipeline_id, version, program_version, platform, descriptor["program_info"]
 
     before = identity()
+    if validate is not None:
+        validate()
     callback(pipeline)
     if identity() != before:
         raise RuntimeError("Pipeline changed during admission")

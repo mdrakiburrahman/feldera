@@ -421,15 +421,16 @@ class TestPreStartAdmission(unittest.TestCase):
 
     def test_change_during_admission_refuses_start(self):
         for path in ("deploy", "update"):
-            with self.subTest(path=path):
-                self.pipeline.reset_mock()
-                before = self.pipeline.client.http.get.return_value
-                self.pipeline.client.http.get.side_effect = [before, {**before, "version": 5}]
-                set_pre_start_hook(lambda _: None, required=True)
-                with self.assertRaisesRegex(RuntimeError, "changed during admission"):
-                    self.run_start(path)
-                self.pipeline.start.assert_not_called()
-                self.pipeline.client.http.get.side_effect = None
+            for change in ({"version": 5}, {"program_info": {"input_connectors": {"unsafe": {}}}}):
+                with self.subTest(path=path, change=change):
+                    self.pipeline.reset_mock()
+                    before = self.pipeline.client.http.get.return_value
+                    self.pipeline.client.http.get.side_effect = [before, {**before, **change}]
+                    set_pre_start_hook(lambda _: None, required=True)
+                    with self.assertRaisesRegex(RuntimeError, "changed during admission"):
+                        self.run_start(path)
+                    self.pipeline.start.assert_not_called()
+                    self.pipeline.client.http.get.side_effect = None
 
 
 if __name__ == "__main__":

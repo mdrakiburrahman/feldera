@@ -358,6 +358,7 @@ class HttpRequests:
             (only GET is assumed idempotent). Callers whose endpoint is
             idempotent by API contract, such as a desired-state setter,
             pass True so a dropped connection retries.
+        :param retry: Set False to disable all retries, including authentication retries.
 
         Send an HTTP request, retrying transient failures per the client's
         `RetryConfig`.
@@ -459,7 +460,7 @@ class HttpRequests:
             # without forcing every caller to wrap calls in their own retry.
             # One retry is enforced by scope: this except runs at most once
             # per `send_request` call.
-            if err.status_code == 401 and callable(self.config.api_key):
+            if retry and err.status_code == 401 and callable(self.config.api_key):
                 headers = self._reauthenticated_headers(headers, request_path)
                 headers["Content-Type"] = content_type
                 return self._do_single_request(

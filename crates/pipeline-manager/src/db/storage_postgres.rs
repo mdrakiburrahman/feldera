@@ -1169,8 +1169,8 @@ impl Storage for StoragePostgres {
         let current =
             operations::pipeline::get_pipeline(&txn, tenant_id, pipeline_name, true).await?;
         if current.id != expected_id {
-            return Err(DBError::PreconditionViolation {
-                precondition: "pipeline identity changed since admission".to_string(),
+            return Err(DBError::ConditionalStartPrecondition {
+                reason: "pipeline identity changed since admission".to_string(),
             });
         }
         if current.version != expected_version {
@@ -1182,9 +1182,11 @@ impl Storage for StoragePostgres {
         if current.program_status != ProgramStatus::Success
             || current.program_info.is_none()
             || current.platform_version != platform_version
+            || current.deployment_resources_status != ResourcesStatus::Stopped
+            || current.deployment_resources_desired_status != ResourcesDesiredStatus::Stopped
         {
-            return Err(DBError::PreconditionViolation {
-                precondition: "admitted pipeline must be compiled for the current platform"
+            return Err(DBError::ConditionalStartPrecondition {
+                reason: "admitted pipeline must be stopped and compiled for the current platform"
                     .to_string(),
             });
         }

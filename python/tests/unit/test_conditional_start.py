@@ -31,15 +31,17 @@ def test_conditional_start_uses_dedicated_single_attempt_endpoint():
     client.http.post.assert_called_once()
 
 
-def test_guarded_transport_does_not_retry_even_not_applied_responses():
+@pytest.mark.parametrize("status", [401, 429])
+def test_guarded_transport_does_not_retry_even_not_applied_responses(status):
     client = HttpRequests(
         Config(
             url="http://example.test",
+            api_key=lambda: "test-token",
             retry_config=RetryConfig(max_retries=3, initial_backoff=0),
         )
     )
     response = requests.Response()
-    response.status_code = 429
+    response.status_code = status
     response._content = b"{}"
     response.headers["content-type"] = "application/json"
     response.request = requests.Request("POST", "http://example.test/v0/x").prepare()

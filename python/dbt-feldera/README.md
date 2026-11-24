@@ -328,6 +328,15 @@ finally:
 
 Calling `set_pre_start_hook(None, required=True)` requires registration before
 any subsequent start. A running pipeline reused without a start is not checked.
+Serialize dbt invocations while the process-global hook is installed. Required
+mode uses a conditional server start bound to the compiled pipeline ID and core
+version checked during admission. It requires a matching SDK and pipeline manager
+with conditional-start support; older managers reject the request rather than
+starting without the check. Optional callbacks retain the ordinary start behavior.
+For isolated unit tests, `is_isolated_unit_pipeline(pipeline)` from
+`dbt.adapters.feldera.isolated_unit` identifies only the exact scratch object
+during its callback. The callback should still inspect the compiled descriptor
+and apply its own connector and workload policy.
 
 ## License
 
