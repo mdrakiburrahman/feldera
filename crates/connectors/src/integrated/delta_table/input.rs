@@ -194,10 +194,15 @@ mod data_file_budget_tests {
         let b = data_file_budget("data-file-budget-test-b", Some(50))
             .unwrap()
             .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(20));
         let threads: Vec<_> = (0..20)
             .map(|_| {
                 let a = Arc::clone(&a);
-                std::thread::spawn(move || a.reserve(7).is_ok())
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    a.reserve(7).is_ok()
+                })
             })
             .collect();
         assert_eq!(
@@ -5242,9 +5247,7 @@ impl DeltaTableInputEndpointInner {
             .head(&location)
             .await
             .map_err(|e| anyhow!("cannot determine data-file size for '{path}': {e}"))?;
-        let size = u64::try_from(metadata.size)
-            .map_err(|_| anyhow!("invalid data-file size for '{path}'"))?;
-        budget.reserve(size)
+        budget.reserve(metadata.size)
     }
 
     /// Decode a deletion vector into its bitmap of row positions, or the empty
