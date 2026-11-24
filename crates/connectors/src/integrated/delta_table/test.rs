@@ -6201,7 +6201,7 @@ pub fn delta_data_file_budget_restart_fence_test(engine: &dyn PipelineTestEngine
                     "--nocapture",
                 ])
                 .env(ROOT_ENV, root)
-            .env_remove("FELDERA_ENGINE_TEST_CASE")
+                .env_remove("FELDERA_ENGINE_TEST_CASE")
                 .output()
                 .unwrap();
             assert!(
