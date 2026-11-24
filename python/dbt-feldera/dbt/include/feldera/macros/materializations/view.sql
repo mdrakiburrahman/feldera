@@ -18,10 +18,10 @@
 #}
 {% materialization view, adapter='feldera' %}
     {%- set pipeline_name = config.get('pipeline_name', model.schema) -%}
-    {%- set view_name = model.name -%}
+    {%- set view_name = this.identifier -%}
     {%- set connectors = config.get('connectors', none) -%}
     {%- if connectors is none -%}
-        {%- set connectors = adapter.dispatch('default_view_connectors', 'dbt')(model.name, model.schema) -%}
+        {%- set connectors = adapter.dispatch('default_view_connectors', 'dbt')(view_name, model.schema) -%}
     {%- endif -%}
     {%- set stored = config.get('stored', false) -%}
     {%- set full_refresh = flags.FULL_REFRESH -%}
@@ -32,7 +32,7 @@
     {%- endif -%}
 
     {%- set view_sql -%}
-        CREATE {{ 'MATERIALIZED ' if stored else '' }}VIEW {{ view_name }}
+        CREATE {{ 'MATERIALIZED ' if stored else '' }}VIEW {{ this }}
         {%- if connectors %}
         WITH ('connectors' = '{{ connectors | tojson }}')
         {%- endif %}
