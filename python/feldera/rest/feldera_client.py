@@ -712,6 +712,8 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
         reloadable_tables: Optional[List[str]] = None,
+        expected_pipeline_id: Optional[str] = None,
+        expected_version: Optional[int] = None,
     ) -> Optional[PipelineStatus]:
         """
 
@@ -726,6 +728,11 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         :param reloadable_tables: Tables that bootstrapping may reload, with
             `bootstrap_policy=BootstrapPolicy.ALLOW`. See `Pipeline.start`.
         """
+        if (expected_pipeline_id is None) != (expected_version is None):
+            raise ValueError(
+                "expected_pipeline_id and expected_version must be provided together"
+            )
+        guarded = expected_pipeline_id is not None
         if reloadable_tables is not None:
             if bootstrap_policy != BootstrapPolicy.ALLOW:
                 raise ValueError(
@@ -741,11 +748,14 @@ Reason: The pipeline is in a STOPPED state due to the following error:
 
         # Any error is dismissed separately in order to make sure we only dismiss any error
         # BEFORE it was started, not after it has been started by this call
-        if dismiss_error:
+        if dismiss_error and not guarded:
             self.http.post(
                 path=f"/pipelines/{pipeline_name}/dismiss_error", idempotent=True
             )
-        start_params["dismiss_error"] = "false"
+        start_params["dismiss_error"] = "true" if guarded and dismiss_error else "false"
+        if guarded:
+            start_params["expected_pipeline_id"] = expected_pipeline_id
+            start_params["expected_version"] = expected_version
 
         start_params["initial"] = initial
         if bootstrap_policy is not None:
@@ -760,11 +770,18 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         # Desired-state setters (start/pause/stop): repeating the request
         # yields the same desired state, so a dropped connection is safe to
         # retry.
-        self.http.post(
-            path=f"/pipelines/{pipeline_name}/start",
-            params=start_params,
-            idempotent=True,
-        )
+        if guarded:
+            self.http.post(
+                path=f"/pipelines/{pipeline_name}/start-if-current",
+                params=start_params,
+                retry=False,
+            )
+        else:
+            self.http.post(
+                path=f"/pipelines/{pipeline_name}/start",
+                params=start_params,
+                idempotent=True,
+            )
 
         if not wait:
             return None
@@ -804,6 +821,8 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
         reloadable_tables: Optional[List[str]] = None,
+        expected_pipeline_id: Optional[str] = None,
+        expected_version: Optional[int] = None,
     ) -> Optional[PipelineStatus]:
         """
 
@@ -828,6 +847,8 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             timeout_s,
             dismiss_error,
             reloadable_tables,
+            expected_pipeline_id,
+            expected_version,
         )
 
     def start_pipeline_as_paused(

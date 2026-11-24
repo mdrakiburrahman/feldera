@@ -80,6 +80,7 @@ static ROUTE_MIN_ROLE: &[(&str, &str, Role)] = &[
     ("GET", "/v0/pipelines/{pipeline_name}/samply_profile", Role::Read), // get_pipeline_samply_profile
     ("POST", "/v0/pipelines/{pipeline_name}/samply_profile", Role::Read), // start_samply_profile
     ("POST", "/v0/pipelines/{pipeline_name}/start", Role::Write), // post_pipeline_start
+    ("POST", "/v0/pipelines/{pipeline_name}/start-if-current", Role::Write),
     ("POST", "/v0/pipelines/{pipeline_name}/start_compaction", Role::Write), // post_pipeline_start_compaction
     ("POST", "/v0/pipelines/{pipeline_name}/start_transaction", Role::Write), // start_transaction
     ("GET", "/v0/pipelines/{pipeline_name}/stats", Role::Read), // get_pipeline_stats

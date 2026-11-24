@@ -26,6 +26,14 @@ def _info(outputs, inputs=None):
 def test_scratch_admission_is_identity_scoped_and_cleanup_is_guaranteed():
     pipeline = Mock()
     pipeline.status.return_value = PipelineStatus.STOPPED
+    pipeline.client.http.get.return_value = {
+        "id": "test-id",
+        "version": 4,
+        "program_version": 2,
+        "platform_version": "v1",
+        "program_status": "Success",
+        "program_info": {},
+    }
     pipeline.program_info.side_effect = [
         _info(["dbt_unit_actual"]),
         _info(["dbt_unit_actual", "dbt_unit_expected"]),
@@ -55,7 +63,7 @@ def test_scratch_admission_is_identity_scoped_and_cleanup_is_guaranteed():
         assert admitted == [pipeline]
         assert not is_isolated_unit_pipeline(pipeline)
         assert not is_isolated_unit_pipeline(None)
-        pipeline.start.assert_called_once()
+        pipeline.start.assert_called_once_with(expected_pipeline_id="test-id", expected_version=4)
         pipeline.delete.assert_called_once_with(clear_storage=True)
     finally:
         set_pre_start_hook(None)
@@ -65,6 +73,14 @@ def test_scratch_admission_is_identity_scoped_and_cleanup_is_guaranteed():
 def test_scratch_failure_never_starts_and_cleans_up(stage):
     pipeline = Mock()
     pipeline.status.return_value = PipelineStatus.STOPPED
+    pipeline.client.http.get.return_value = {
+        "id": "test-id",
+        "version": 4,
+        "program_version": 2,
+        "platform_version": "v1",
+        "program_status": "Success",
+        "program_info": {},
+    }
     pipeline.program_info.side_effect = [
         _info(["dbt_unit_actual"]),
         _info(["dbt_unit_actual", "dbt_unit_expected"], {"unsafe": {}} if stage == "connector" else None),
@@ -86,6 +102,8 @@ def test_scratch_failure_never_starts_and_cleans_up(stage):
         assert not is_isolated_unit_pipeline(pipeline)
         if stage == "connector":
             callback.assert_not_called()
+        if stage == "rejection":
+            callback.assert_called_once_with(pipeline)
     finally:
         set_pre_start_hook(None)
 

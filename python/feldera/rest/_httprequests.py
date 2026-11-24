@@ -344,6 +344,7 @@ class HttpRequests:
         stream: bool = False,
         serialize: bool = True,
         idempotent: Optional[bool] = None,
+        retry: bool = True,
     ) -> Any:
         """
         :param http_method: The HTTP method to use. Takes the equivalent `requests.*` module. (Example: `requests.get`)
@@ -415,9 +416,13 @@ class HttpRequests:
         # A wall-clock deadline (when configured) replaces the attempt cap:
         # transient outages last for a duration, not a number of requests.
         stop = (
-            stop_after_delay(cfg.deadline_seconds)
-            if cfg.deadline_seconds is not None
-            else stop_after_attempt(cfg.max_retries + 1)
+            stop_after_attempt(1)
+            if not retry
+            else (
+                stop_after_delay(cfg.deadline_seconds)
+                if cfg.deadline_seconds is not None
+                else stop_after_attempt(cfg.max_retries + 1)
+            )
         )
         retryer = Retrying(
             retry=retry_if_exception(
@@ -488,6 +493,7 @@ class HttpRequests:
         stream: bool = False,
         serialize: bool = True,
         idempotent: Optional[bool] = None,
+        retry: bool = True,
     ) -> Any:
         return self.send_request(
             requests.post,
@@ -498,6 +504,7 @@ class HttpRequests:
             stream=stream,
             serialize=serialize,
             idempotent=idempotent,
+            retry=retry,
         )
 
     def patch(

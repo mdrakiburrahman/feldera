@@ -198,6 +198,7 @@ It contains the following fields:
         endpoints::pipeline_management::post_validate_program,
         endpoints::pipeline_management::delete_pipeline,
         endpoints::pipeline_management::post_pipeline_start,
+        endpoints::pipeline_management::post_pipeline_start_if_current,
         endpoints::pipeline_management::post_pipeline_stop,
         endpoints::pipeline_management::post_pipeline_dismiss_error,
         endpoints::pipeline_management::post_pipeline_clear,
@@ -983,6 +984,7 @@ fn api_scope(base_path: &str) -> Scope {
         .service(endpoints::pipeline_management::post_validate_program)
         .service(endpoints::pipeline_management::delete_pipeline)
         .service(endpoints::pipeline_management::post_pipeline_start)
+        .service(endpoints::pipeline_management::post_pipeline_start_if_current)
         .service(endpoints::pipeline_management::post_pipeline_stop)
         .service(endpoints::pipeline_management::post_pipeline_dismiss_error)
         .service(endpoints::pipeline_management::post_pipeline_clear)

@@ -359,6 +359,14 @@ class TestPreStartAdmission(unittest.TestCase):
         self.pipeline.program_config.return_value = {"profile": "dev"}
         self.pipeline.runtime_config.return_value = RuntimeConfig.from_dict({"workers": 4})
         self.pipeline.status.return_value = PipelineStatus.STOPPED
+        self.pipeline.client.http.get.return_value = {
+            "id": "test-id",
+            "version": 4,
+            "program_version": 2,
+            "platform_version": "v1",
+            "program_status": "Success",
+            "program_info": {},
+        }
 
     def run_start(self, path):
         if path == "deploy":
@@ -406,8 +414,22 @@ class TestPreStartAdmission(unittest.TestCase):
                         callback.assert_called_once_with(self.pipeline)
                     if mode in ("rejected", "required"):
                         self.pipeline.start.assert_not_called()
+                    elif mode == "accepted":
+                        self.pipeline.start.assert_called_once_with(expected_pipeline_id="test-id", expected_version=4)
                     else:
                         self.pipeline.start.assert_called_once_with()
+
+    def test_change_during_admission_refuses_start(self):
+        for path in ("deploy", "update"):
+            with self.subTest(path=path):
+                self.pipeline.reset_mock()
+                before = self.pipeline.client.http.get.return_value
+                self.pipeline.client.http.get.side_effect = [before, {**before, "version": 5}]
+                set_pre_start_hook(lambda _: None, required=True)
+                with self.assertRaisesRegex(RuntimeError, "changed during admission"):
+                    self.run_start(path)
+                self.pipeline.start.assert_not_called()
+                self.pipeline.client.http.get.side_effect = None
 
 
 if __name__ == "__main__":
