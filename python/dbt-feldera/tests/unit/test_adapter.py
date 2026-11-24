@@ -2,9 +2,29 @@ import unittest
 from unittest.mock import Mock
 
 import agate
+import pyarrow as pa
 
 from dbt.adapters.feldera.connections import FelderaConnectionManager
 from dbt.adapters.feldera.impl import FelderaAdapter
+
+
+class TestSafeSeedReuse(unittest.TestCase):
+    def test_comparison_preserves_duplicate_multiplicity(self):
+        batch = pa.record_batch([pa.array(["a", "a", None])], names=["CODE"])
+        pipeline = Mock()
+        pipeline.query_arrow.return_value = iter([batch])
+        expected = [{"code": "a"}, {"code": None}, {"code": "a"}]
+        FelderaAdapter._verify_seed_rows(pipeline, 'seed"name', expected)
+        pipeline.query_arrow.assert_called_once_with('SELECT * FROM "seed""name"')
+        pipeline.query_arrow.return_value = iter([batch])
+        with self.assertRaisesRegex(RuntimeError, "cold rebuild"):
+            FelderaAdapter._verify_seed_rows(pipeline, "seed", expected[:-1])
+
+    def test_nonempty_expected_rejects_empty_query(self):
+        pipeline = Mock()
+        pipeline.query_arrow.return_value = iter([])
+        with self.assertRaisesRegex(RuntimeError, "cold rebuild"):
+            FelderaAdapter._verify_seed_rows(pipeline, "seed", [{"code": "a"}])
 
 
 class TestResultTable(unittest.TestCase):

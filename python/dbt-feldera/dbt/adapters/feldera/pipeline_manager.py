@@ -176,6 +176,14 @@ class PipelineStateManager:
             self._tables.setdefault(pipeline, {})[name] = ddl
             logger.debug("Registered table '%s' in pipeline '%s'", name, pipeline)
 
+    def reset(self) -> None:
+        with self._lock:
+            self._tables.clear()
+            self._views.clear()
+            self._deployed_sql.clear()
+            self._pipelines.clear()
+            self._pending_seeds.clear()
+
     def register_view(self, pipeline: str, name: str, ddl: str) -> None:
         """
         Register a CREATE VIEW statement for a pipeline.
@@ -333,6 +341,8 @@ class PipelineStateManager:
         udf_rust: str = "",
         udf_toml: str = "",
         replace: bool = False,
+        create_only: bool = False,
+        require_existing: bool = False,
     ) -> Pipeline:
         """
         Deploy the assembled pipeline to Feldera.
@@ -365,12 +375,14 @@ class PipelineStateManager:
             config = dict(runtime_config or {})
             config.setdefault("workers", workers)
 
-            if not replace:
+            if not replace and not create_only:
                 try:
                     existing = Pipeline.get(pipeline, client)
                 except FelderaAPIError as exc:
                     if exc.status_code != 404:
                         raise
+                    if require_existing:
+                        raise RuntimeError(f"Pipeline '{pipeline}' disappeared before seed verification") from exc
                 else:
                     if (
                         existing.status() == PipelineStatus.RUNNING
@@ -384,6 +396,11 @@ class PipelineStateManager:
                         self._deployed_sql[pipeline] = sql
                         self._pipelines[pipeline] = existing
                         return existing
+                    if require_existing:
+                        raise RuntimeError(
+                            f"Pipeline '{pipeline}' differs from the requested program or configuration; "
+                            "a cold rebuild is required"
+                        )
 
             builder = PipelineBuilder(
                 client,
@@ -395,7 +412,7 @@ class PipelineStateManager:
                 udf_toml=udf_toml,
             )
 
-            p = builder.create_or_replace(wait=True)
+            p = builder.create(wait=True) if create_only else builder.create_or_replace(wait=True)
             logger.info("Pipeline '%s' compiled successfully, starting...", pipeline)
 
             _start_admitted(p, _admit_start(p))

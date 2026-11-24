@@ -4,5 +4,8 @@ config-version: 2
 
 macro-paths: ["macros"]
 
+on-run-start:
+  - "{{ adapter.prepare_safe_seed_reuse() if execute and var('feldera_safe_seed_reuse', false) else '' }}"
+
 on-run-end:
   - "{{ feldera_finalize_run() if execute else '' }}"

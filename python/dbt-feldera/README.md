@@ -247,6 +247,25 @@ dbt seed                # push seed data
 dbt seed --full-refresh # stop, clear storage, redeploy, then push
 ```
 
+For unchanged reruns without replacing a running pipeline, opt in in
+`dbt_project.yml`:
+
+```yaml
+vars:
+  feldera_safe_seed_reuse: true
+```
+
+This materializes seed input tables and compares their full row multisets,
+including duplicates, with the selected CSVs before reuse. The running
+pipeline's SQL, UDFs, runtime configuration, and compilation profile must
+match. Changed or partially loaded seed data, a changed program, and
+`--full-refresh` fail with a cold-rebuild requirement; they are not updated
+in place. Enabling this mode for an existing pipeline also requires a cold
+rebuild because seed tables become materialized. Serialize builds and other
+writers to seed tables while checking.
+Use one dbt thread for deterministic SQL assembly. The normal admission hook
+does not check an already-running pipeline; the caller must admit reuse.
+
 ### Summary
 
 | Materialization                    | Feldera SQL                | Best for                                                                    |
@@ -308,7 +327,8 @@ outputs:
 
 The on-run-end hook reuses an already running pipeline when its assembled SQL,
 UDFs, runtime configuration, and compilation profile match. `--full-refresh`
-clears state. Seed runs still replace the pipeline and reload seed data.
+clears state. Seed runs replace the pipeline and reload seed data unless
+`feldera_safe_seed_reuse` is enabled.
 Tests in `dbt build` run before the on-run-end deployment; deploy models with
 `dbt run` before testing a new or changed pipeline.
 

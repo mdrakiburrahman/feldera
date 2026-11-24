@@ -1,4 +1,5 @@
 import logging
+from collections import Counter
 from pathlib import Path
 from typing import FrozenSet, List, Optional, Set, Tuple
 
@@ -549,12 +550,18 @@ class FelderaAdapter(BaseAdapter):
         return ""
 
     @available
+    def prepare_safe_seed_reuse(self) -> str:
+        _pipeline_state.reset()
+        return ""
+
+    @available
     def finalize_seeds(
         self,
         full_refresh: bool = False,
         udf_sql_path: str | None = None,
         udf_rust_path: str | None = None,
         udf_toml_path: str | None = None,
+        safe_seed_reuse: bool = False,
     ) -> str:
         """
         Deploy pipelines with pending seeds and push all stashed data,
@@ -587,7 +594,17 @@ class FelderaAdapter(BaseAdapter):
         for pipeline_name in seed_pipelines:
             logger.info("Finalizing seeds for pipeline '%s'", pipeline_name)
 
-            _pipeline_state.deploy(
+            if safe_seed_reuse and full_refresh:
+                raise RuntimeError("Safe seed reuse does not permit --full-refresh; use a cold rebuild")
+            existing = None
+            if safe_seed_reuse:
+                try:
+                    existing = Pipeline.get(pipeline_name, client)
+                except FelderaAPIError as exc:
+                    if exc.status_code != 404:
+                        raise
+            before = client.http.get(f"/pipelines/{pipeline_name}") if existing is not None else None
+            deployed = _pipeline_state.deploy(
                 client,
                 pipeline_name,
                 compilation_profile=creds.compilation_profile,
@@ -597,12 +614,24 @@ class FelderaAdapter(BaseAdapter):
                 udf_sql=udf_sql,
                 udf_rust=udf_rust,
                 udf_toml=udf_toml,
-                replace=True,
+                replace=not safe_seed_reuse,
+                create_only=safe_seed_reuse and existing is None,
+                require_existing=safe_seed_reuse and existing is not None,
             )
 
-            for table_name, agate_table, column_types in _pipeline_state.pop_pending_seeds(pipeline_name):
+            pending = _pipeline_state.pop_pending_seeds(pipeline_name)
+            if safe_seed_reuse:
+                before = before or client.http.get(f"/pipelines/{pipeline_name}")
+                if (
+                    not isinstance(before.get("id"), str)
+                    or type(before.get("version")) is not int
+                    or not before.get("deployment_id")
+                    or before.get("deployment_status") != "Running"
+                ):
+                    raise RuntimeError(f"Pipeline '{pipeline_name}' is not a running identified incarnation")
+            for table_name, agate_table, column_types in pending:
                 rows = self._convert_agate_rows(agate_table, column_types)
-                if rows:
+                if rows and (not safe_seed_reuse or existing is None):
                     self.push_seed_data(pipeline_name, table_name, rows)
                     logger.info(
                         "Loaded %d seed rows into '%s.%s'",
@@ -610,6 +639,13 @@ class FelderaAdapter(BaseAdapter):
                         pipeline_name,
                         table_name,
                     )
+                if safe_seed_reuse:
+                    self._verify_seed_rows(deployed, table_name, rows)
+            if before is not None:
+                after = client.http.get(f"/pipelines/{pipeline_name}")
+                keys = ("id", "version", "program_version", "deployment_id", "deployment_status")
+                if any(before.get(key) != after.get(key) for key in keys):
+                    raise RuntimeError(f"Pipeline '{pipeline_name}' changed during seed verification")
 
         view_pipelines = _pipeline_state.get_pipelines_with_views()
         for pipeline_name in view_pipelines:
@@ -632,6 +668,33 @@ class FelderaAdapter(BaseAdapter):
             )
 
         return ""
+
+    @staticmethod
+    def _verify_seed_rows(pipeline: Pipeline, table_name: str, expected_rows: list) -> None:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        quoted_table = '"' + table_name.replace('"', '""') + '"'
+        actual = Counter()
+        expected = None
+        for batch in pipeline.query_arrow(f"SELECT * FROM {quoted_table}"):
+            if expected is None:
+                names = {name.casefold(): name for name in (expected_rows[0] if expected_rows else ())}
+                if len(names) != len(expected_rows[0] if expected_rows else ()):
+                    raise RuntimeError(f"Ambiguous seed column names in '{table_name}'")
+                if expected_rows and set(names) != {field.name.casefold() for field in batch.schema}:
+                    raise RuntimeError(f"Seed schema differs for '{table_name}'; a cold rebuild is required")
+                expected = Counter()
+                for row in expected_rows:
+                    values = tuple(
+                        pc.cast(pa.scalar(row[names[field.name.casefold()]]), field.type, safe=True).as_py()
+                        for field in batch.schema
+                    )
+                    expected[values] += 1
+            for row in batch.to_pylist():
+                actual[tuple(row[field.name] for field in batch.schema)] += 1
+        if (expected_rows and expected is None) or actual != (expected or Counter()):
+            raise RuntimeError(f"Seed data differs for '{table_name}'; a cold rebuild is required")
 
     @available
     def run_isolated_unit_test(
