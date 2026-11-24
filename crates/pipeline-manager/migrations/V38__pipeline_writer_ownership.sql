@@ -30,6 +30,7 @@ BEGIN
         RAISE EXCEPTION 'protected pipeline cannot be deleted';
     END IF;
     IF NEW.name IS DISTINCT FROM OLD.name
+        OR NEW.client_metadata IS DISTINCT FROM OLD.client_metadata
         OR NEW.runtime_config IS DISTINCT FROM OLD.runtime_config
         OR NEW.program_code IS DISTINCT FROM OLD.program_code
         OR NEW.program_config IS DISTINCT FROM OLD.program_config

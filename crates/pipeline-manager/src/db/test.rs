@@ -2163,6 +2163,7 @@ async fn protected_pipeline_rechecks_delayed_database_mutations() {
         &[&tenant.0, &pipeline.id.0, &Uuid::now_v7()],
     ).await.unwrap();
     for sql in [
+        "UPDATE pipeline SET client_metadata='changed' WHERE id=$1",
         "UPDATE pipeline SET program_code='different' WHERE id=$1",
         "UPDATE pipeline SET deployment_resources_desired_status='provisioned' WHERE id=$1",
         "UPDATE pipeline SET storage_status='clearing' WHERE id=$1",
