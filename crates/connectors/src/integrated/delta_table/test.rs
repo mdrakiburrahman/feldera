@@ -8845,6 +8845,7 @@ pub(super) fn z85_encode(bytes: &[u8]) -> String {
 
 fn write_id_mapped_log(
     table_dir: &Path,
+    mode: &str,
     schema_string: &str,
     partition_columns: &[&str],
     change_data_feed: bool,
@@ -8879,7 +8880,7 @@ fn write_id_mapped_log(
                 "schemaString": schema_string,
                 "partitionColumns": partition_columns,
                 "configuration": {
-                    "delta.columnMapping.mode": "id",
+                    "delta.columnMapping.mode": mode,
                     "delta.columnMapping.maxColumnId": max_column_id.to_string(),
                     "delta.enableChangeDataFeed": change_data_feed.to_string(),
                 },
@@ -9093,7 +9094,7 @@ fn write_id_mapped_table_with_deletion_vector(
     let (table_schema, schema_string) = id_mapped_schema(relation, true);
     let stored: Vec<usize> = (0..table_schema.fields().len()).collect();
 
-    write_id_mapped_log(table_dir, &schema_string, &[], false, 1, |version| {
+    write_id_mapped_log(table_dir, "id", &schema_string, &[], false, 1, |version| {
         files
             .iter()
             .enumerate()
@@ -9147,6 +9148,7 @@ fn write_id_mapped_table_with(
 
     write_id_mapped_log(
         table_dir,
+        "id",
         &schema_string,
         partition_column.as_slice(),
         false,
@@ -9186,6 +9188,92 @@ fn write_id_mapped_table_with(
     );
 }
 
+/// `batch` with its columns' field ids renumbered from `first` in file order, the
+/// way a writer that ignores the log's column mapping ids stamps them. A column
+/// the file leaves out, such as a partition column, then shifts every later one
+/// onto the id the log gives its neighbour. Only top-level columns are
+/// renumbered, so `batch` must be flat.
+fn renumber_field_ids(batch: &RecordBatch, first: i64) -> RecordBatch {
+    let fields: Vec<arrow::datatypes::Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(first..)
+        .map(|(field, id)| {
+            assert!(!field.data_type().is_nested());
+            let mut metadata = field.metadata().clone();
+            metadata.insert("PARQUET:field_id".to_string(), id.to_string());
+            field.as_ref().clone().with_metadata(metadata)
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), batch.columns().to_vec()).unwrap()
+}
+
+/// A `columnMapping.mode = 'name'` table partitioned on `partition`, one file
+/// per commit, every file naming its columns physically as Delta does.
+///
+/// The first commit's file is stamped with the log's column mapping ids, as
+/// Spark writes them. Every later one is renumbered by [`renumber_field_ids`],
+/// as another writer leaves them, and the last of them carries a deletion vector
+/// masking its rows at the indexes `deleted` gives.
+fn write_name_mapped_mixed_writers_table(
+    table_dir: &Path,
+    relation: &Relation,
+    partition: (&str, &[&str]),
+    commits: &[&[Value]],
+    deleted: &[u32],
+) {
+    let (table_schema, schema_string) = id_mapped_schema(relation, false);
+    let (partition_column, partition_values) = partition;
+    let stored: Vec<usize> = table_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name() != partition_column)
+        .map(|(index, _)| index)
+        .collect();
+    let partition_key = format!(
+        "col-{}",
+        table_schema
+            .field_with_name(partition_column)
+            .unwrap()
+            .metadata()["PARQUET:field_id"]
+    );
+
+    write_id_mapped_log(
+        table_dir,
+        "name",
+        &schema_string,
+        &[partition_column],
+        false,
+        commits.len(),
+        |version| {
+            let index = version as usize - 1;
+            let batch = to_physical_batch(
+                &id_mapped_batch(relation, &table_schema, commits[index])
+                    .project(&stored)
+                    .unwrap(),
+            );
+            let batch = match version {
+                1 => batch,
+                _ => renumber_field_ids(&batch, 100),
+            };
+            let name = format!("part-{version:05}-0.parquet");
+            write_parquet(table_dir, &name, &batch);
+            let key = &partition_key;
+            vec![IdMappedFile {
+                path: name,
+                partition_values: json!({key: partition_values[index]}),
+                change_data: false,
+                deleted_rows: match index == commits.len() - 1 {
+                    true => deleted.to_vec(),
+                    false => Vec::new(),
+                },
+            }]
+        },
+    );
+}
+
 /// A `mode = 'id'` table with the Change Data Feed on: commit 1 adds `rows`,
 /// commit 2 records `changes` in a `cdc` action with their `_change_type`.
 ///
@@ -9209,6 +9297,7 @@ fn write_id_mapped_change_data_table(
 
     write_id_mapped_log(
         table_dir,
+        "id",
         &schema_string,
         &[],
         true,
@@ -9687,6 +9776,71 @@ pub fn follow_id_mapped_partitioned_test(engine: &dyn PipelineTestEngine) {
             rows_zset(&uniform_relation(), &expected),
             "the partition column must come back from the log, not as NULL"
         );
+    })
+}
+
+/// A `mode = 'name'` table resolves its columns by physical name, whatever
+/// field ids its data files carry.
+///
+/// Spark stamps a column with its column mapping id, so the partition column
+/// `b`, which no data file stores, leaves a gap between `id` and `i`. The second
+/// commit's writer numbered the stored columns contiguously instead, putting
+/// the log's id for `i` on `s`. Matching by field id read `s` into `i` there,
+/// which fails as text cast to BIGINT. That file's deletion vector also sends
+/// a follow read through the masked reader rather than the listing.
+#[engine_test]
+pub fn name_mapped_mixed_field_ids_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        let table_dir = TempDir::new().unwrap();
+        let spark = [
+            json!({"id": 1, "b": true, "i": 10, "s": "/logs/1.xel"}),
+            json!({"id": 2, "b": true, "i": null, "s": "/logs/2.xel"}),
+        ];
+        let renumbered = [
+            json!({"id": 3, "b": false, "i": 30, "s": "/logs/3.xel"}),
+            json!({"id": 4, "b": false, "i": null, "s": "/logs/4.xel"}),
+            json!({"id": 5, "b": false, "i": 50, "s": "/logs/5.xel"}),
+        ];
+        write_name_mapped_mixed_writers_table(
+            table_dir.path(),
+            &basic_relation(),
+            ("b", &["true", "false"]),
+            &[&spark, &renumbered],
+            &[2],
+        );
+        let table_uri = table_dir.path().display().to_string();
+        let expected = rows_zset(
+            &basic_relation(),
+            &[spark.to_vec(), renumbered[..2].to_vec()].concat(),
+        );
+
+        let uri = table_uri.clone();
+        let snapshot = off_runtime(move || {
+            let output_file = NamedTempFile::new().unwrap();
+            let pipeline = delta_table_input_pipeline(
+                engine,
+                &uri,
+                &basic_relation(),
+                &HashMap::from([("mode".to_string(), json!("snapshot"))]),
+                &output_file.path().display().to_string(),
+            );
+            pipeline.start();
+            wait(|| pipeline.pipeline_complete(), 60_000).expect("timeout ingesting the table");
+            pipeline.stop().unwrap();
+            file_zset(&basic_relation(), &output_file)
+        });
+        assert_zset_eq(&snapshot, &expected, "snapshot");
+
+        let follow = off_runtime(move || {
+            read_id_mapped_table(
+                engine,
+                &table_uri,
+                &basic_relation(),
+                2,
+                &[("mode", json!("follow"))],
+            )
+        });
+        assert_zset_eq(&follow, &expected, "follow");
     })
 }
 

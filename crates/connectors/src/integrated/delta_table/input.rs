@@ -2,9 +2,9 @@ use crate::catalog::{ArrowStream, InputCollectionHandle};
 use crate::format::InputBuffer;
 use crate::integrated::DistributedInput;
 use crate::integrated::delta_table::deletion_vector::{
-    MaskedFile, ReadMode, filtered_parquet_table, read_deletion_vector,
+    ColumnMatch, MaskedFile, ReadMode, filtered_parquet_table, read_deletion_vector,
 };
-use crate::integrated::delta_table::field_id_adapter::FieldIdAdapterFactory;
+use crate::integrated::delta_table::field_id_adapter::{FieldIdAdapterFactory, NameMappedSnapshot};
 use crate::integrated::delta_table::table_error_text;
 use crate::integrated::delta_table::{
     ReadSchema, add_identity_endpoint, delta_input_serde_config, register_storage_handlers,
@@ -3617,7 +3617,26 @@ impl DeltaTableInputEndpointInner {
                 .map_err(|e| {
                     ControllerError::input_transport_error(&self.endpoint_name, true, e)
                 })?,
-            None => provider,
+            None => {
+                let mode = table
+                    .snapshot()
+                    .map_err(|e| {
+                        ControllerError::input_transport_error(
+                            &self.endpoint_name,
+                            true,
+                            anyhow!("error accessing Delta snapshot: {e}"),
+                        )
+                    })?
+                    .snapshot()
+                    .table_properties()
+                    .column_mapping_mode;
+                match mode {
+                    Some(ColumnMappingMode::Name) => {
+                        Arc::new(NameMappedSnapshot::new(provider)) as Arc<dyn TableProvider>
+                    }
+                    _ => provider,
+                }
+            }
         };
         self.datafusion
             .register_table("snapshot", provider)
@@ -5386,10 +5405,15 @@ impl DeltaTableInputEndpointInner {
             })
             .collect::<AnyResult<Vec<_>>>()?;
 
+        let matching = match self.column_mapping_mode()? {
+            Some(ColumnMappingMode::Name) => ColumnMatch::Name,
+            _ => ColumnMatch::FieldId,
+        };
         filtered_parquet_table(
             table.log_store().object_store(),
             files,
             read_schema,
+            matching,
             mode,
             self.datafusion.copied_config().target_partitions(),
         )
