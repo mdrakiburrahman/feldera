@@ -5941,6 +5941,15 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
                 "excluded object was opened"
             );
         }
+        let unsupported_or = r#"("s" ~ '^[A-Za-z]{2}[0-9]+$' OR "id" = 3)"#;
+        assert!(
+            deltalake::delta_datafusion::expr::parse_sql_predicate_to_kernel(
+                unsupported_or,
+                table.snapshot().unwrap().schema().as_ref(),
+                &datafusion::prelude::SessionContext::new().state(),
+            )
+            .is_err()
+        );
         let storage = TempDir::new().unwrap();
         let config: PipelineConfig = serde_json::from_value(json!({
             "name": "test", "workers": 4,
@@ -5948,7 +5957,7 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
             "inputs": { "budget_unknown_or": { "stream": "test_input1", "transport": {
                 "name": "delta_table_input", "config": {
                     "uri": uri, "mode": "snapshot_and_follow", "change_feed": "off",
-                    "filter": r#"("s" ~ '^not-a-date$' OR "id" = 3)"#,
+                    "filter": unsupported_or,
                     "max_data_file_bytes": first_size + second_size + null_size
                 }
             }}}
@@ -5956,27 +5965,21 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
         .unwrap();
         let errors = Arc::new(Mutex::new(Vec::new()));
         let errors_copy = Arc::clone(&errors);
-        let pipeline = off_runtime(move || {
+        let result = off_runtime(move || {
             engine.controller(
                 &identity(&relation, &[Some("output")]),
                 &config,
                 Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
             )
-        })
-        .unwrap();
-        pipeline.start();
-        wait(
-            || {
-                errors
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|e| e.contains("max_data_file_bytes exceeded"))
-            },
-            60_000,
-        )
-        .expect("an unsupported OR must retain the unproven files");
-        pipeline.stop().unwrap();
+        });
+        let error = match result {
+            Err(error) => format!("{error:?}"),
+            Ok(pipeline) => {
+                pipeline.stop().unwrap();
+                panic!("an unsupported OR must retain the unproven files");
+            }
+        };
+        assert!(error.contains("max_data_file_bytes exceeded"), "{error}");
         let mut buffer = [0u8; 4096];
         let count = unsafe {
             libc::read(
