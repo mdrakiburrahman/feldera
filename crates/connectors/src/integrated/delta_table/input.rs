@@ -153,8 +153,8 @@ impl DataFileBudget {
 }
 
 // Keep reservations across reader reopens while isolating different pipelines.
-static DATA_FILE_BUDGETS: OnceLock<Mutex<HashMap<(String, String), Arc<DataFileBudget>>>> =
-    OnceLock::new();
+type DataFileBudgetRegistry = Mutex<HashMap<(String, String), Arc<DataFileBudget>>>;
+static DATA_FILE_BUDGETS: OnceLock<DataFileBudgetRegistry> = OnceLock::new();
 static DATA_FILE_BUDGET_EPOCH: OnceLock<Duration> = OnceLock::new();
 
 fn data_file_budget(
@@ -972,8 +972,7 @@ impl IntegratedInputEndpoint for DeltaTableInputEndpoint {
         resume_info: Option<JsonValue>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(DeltaTableInputReader::new(
-            self.endpoint_name,
-            self.pipeline_name,
+            (self.endpoint_name, self.pipeline_name),
             self.config,
             self.datafusion,
             self.consumer,
@@ -1056,8 +1055,7 @@ fn validate_distributed(config: &DeltaTableReaderConfig) -> AnyResult<()> {
 
 impl DeltaTableInputReader {
     fn new(
-        endpoint_name: String,
-        pipeline_name: Option<String>,
+        (endpoint_name, pipeline_name): (String, Option<String>),
         mut config: DeltaTableReaderConfig,
         datafusion: SessionContext,
         consumer: Box<dyn InputConsumer>,
