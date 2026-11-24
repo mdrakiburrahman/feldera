@@ -6086,6 +6086,133 @@ pub fn delta_data_file_budget_encoded_partition_test(engine: &dyn PipelineTestEn
     })
 }
 
+#[cfg(target_os = "linux")]
+#[engine_test(requires(Storage))]
+pub fn delta_data_file_budget_restart_fence_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        const ROOT_ENV: &str = "FELDERA_DELTA_FENCE_TEST_ROOT";
+        let parent_root = TempDir::new().unwrap();
+        let child_root = std::env::var_os(ROOT_ENV);
+        let root = child_root
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| parent_root.path().to_path_buf());
+        let table_path = root.join("table");
+        let uri = table_path.to_str().unwrap();
+        let fence = root.join("admission");
+        let relation = basic_relation();
+        let row = json!({ "id": 1, "b": false, "i": 1, "s": "local" });
+
+        let watcher = if child_root.is_some() {
+            let file = std::fs::read_dir(&table_path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+                .unwrap();
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(fd >= 0);
+            let watcher = unsafe { OwnedFd::from_raw_fd(fd) };
+            let file = CString::new(file.as_os_str().as_bytes()).unwrap();
+            assert!(
+                unsafe {
+                    libc::inotify_add_watch(watcher.as_raw_fd(), file.as_ptr(), libc::IN_OPEN)
+                } >= 0
+            );
+            Some(watcher)
+        } else {
+            let table = create_table_from_arrow(uri, &arrow_schema_of(&relation.fields), &[]).await;
+            write_data_to_table(table, &relation, std::slice::from_ref(&row)).await;
+            None
+        };
+        let storage = TempDir::new().unwrap();
+        let config: PipelineConfig = serde_json::from_value(json!({
+            "name": "restart_test", "workers": 4,
+            "storage_config": { "path": storage.path() },
+            "inputs": { "budget_restart": { "stream": "test_input1", "transport": {
+                "name": "delta_table_input", "config": {
+                    "uri": uri, "mode": "snapshot_and_follow", "change_feed": "off",
+                    "max_data_file_bytes": 1000000, "data_file_budget_fence": fence
+                }
+            }}}
+        }))
+        .unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors_copy = Arc::clone(&errors);
+        let rel = relation.clone();
+        let result = off_runtime(move || {
+            engine.controller(
+                &identity(&rel, &[Some("output")]),
+                &config,
+                Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
+            )
+        });
+        if let Some(watcher) = watcher {
+            let error = match result {
+                Err(error) => format!("{error:?}"),
+                Ok(pipeline) => {
+                    pipeline.stop().unwrap();
+                    panic!("replacement process reused the admission");
+                }
+            };
+            assert!(
+                error.contains("cannot claim data-file budget fence"),
+                "{error}"
+            );
+            let mut buffer = [0u8; 1024];
+            let count = unsafe {
+                libc::read(
+                    watcher.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            assert_eq!(count, -1, "replacement opened the data file");
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        } else {
+            let pipeline = result.unwrap();
+            pipeline.start();
+            wait_or_connector_error(
+                &pipeline,
+                &SqlIdentifier::from("test_output1"),
+                &relation,
+                &[row],
+                &errors,
+            )
+            .await;
+            assert!(
+                delta_endpoint_gauge(
+                    &pipeline,
+                    "budget_restart",
+                    "input_connector_delta_data_file_bytes_reserved"
+                ) > 0.0
+            );
+            pipeline.stop().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "integrated::delta_table::test::delta_data_file_budget_restart_fence_test",
+                    "--nocapture",
+                ])
+                .env(ROOT_ENV, root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "replacement failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    })
+}
+
 #[engine_test(requires(Storage))]
 pub fn delta_data_file_budget_mapped_deletion_vector_test(engine: &dyn PipelineTestEngine) {
     run_async_on(2, async {

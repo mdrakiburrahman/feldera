@@ -1318,13 +1318,13 @@ impl DeltaTableReaderConfig {
     /// Reject settings the connector cannot act on, so a misconfigured pipeline
     /// fails at startup naming the setting rather than at the first read.
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(path) = &self.data_file_budget_fence {
-            if self.max_data_file_bytes.is_none() || !std::path::Path::new(path).is_absolute() {
-                return Err(
-                    "'data_file_budget_fence' requires 'max_data_file_bytes' and an absolute path"
-                        .to_string(),
-                );
-            }
+        if let Some(path) = &self.data_file_budget_fence
+            && (self.max_data_file_bytes.is_none() || !std::path::Path::new(path).is_absolute())
+        {
+            return Err(
+                "'data_file_budget_fence' requires 'max_data_file_bytes' and an absolute path"
+                    .to_string(),
+            );
         }
         if self.max_data_file_bytes.is_some()
             && (!matches!(self.mode, DeltaTableIngestMode::SnapshotAndFollow)
