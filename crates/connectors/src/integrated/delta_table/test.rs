@@ -5757,6 +5757,102 @@ fn change_feed_row(id: u32, s: &str) -> Value {
 }
 
 #[engine_test(requires(Storage))]
+pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        let table_dir = TempDir::new().unwrap();
+        let uri = table_dir.path().to_str().unwrap();
+        let relation = basic_relation();
+        let first = change_feed_row(1, "20260102");
+        let second = change_feed_row(2, "20260103");
+        let excluded = change_feed_row(3, "20250101");
+        let table = create_table_from_arrow(uri, &change_feed_arrow_schema(), &["s"]).await;
+        let table =
+            write_data_to_table(table, &relation, &[first.clone(), second.clone(), excluded]).await;
+        #[allow(deprecated)]
+        let adds: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .log_data()
+            .iter()
+            .map(|file| file.add_action())
+            .collect();
+        assert_eq!(adds.len(), 3);
+        let file_for = |value: &str| {
+            adds.iter()
+                .find(|add| add.partition_values.get("s").and_then(|v| v.as_deref()) == Some(value))
+                .unwrap()
+        };
+        let size_for = |value| {
+            std::fs::metadata(table_dir.path().join(&file_for(value).path))
+                .unwrap()
+                .len()
+        };
+        let first_size = size_for("20260102");
+        let second_size = size_for("20260103");
+        let excluded_path = table_dir.path().join(&file_for("20250101").path);
+        let excluded_size = std::fs::metadata(&excluded_path).unwrap().len();
+        std::fs::write(excluded_path, vec![0; excluded_size as usize]).unwrap();
+
+        for (alias, filter, size, expected) in [
+            (
+                "budget_selected_between",
+                r#"(("s" BETWEEN '20260101' AND '20260131') AND "s" ~ '^[0-9]{8}$') AND "s" IN ('20260102') AND ("id" = 1 OR "s" = '20250101')"#,
+                first_size,
+                vec![first.clone()],
+            ),
+            (
+                "budget_selected_or",
+                r#"("s" = '20260102' OR "s" = '20260103') AND "id" > 0"#,
+                first_size + second_size,
+                vec![first.clone(), second.clone()],
+            ),
+        ] {
+            let storage = TempDir::new().unwrap();
+            let config: PipelineConfig = serde_json::from_value(json!({
+                "name": "test", "workers": 4,
+                "storage_config": { "path": storage.path() },
+                "inputs": { (alias): { "stream": "test_input1", "transport": {
+                    "name": "delta_table_input", "config": {
+                        "uri": uri, "mode": "snapshot_and_follow", "change_feed": "off",
+                        "filter": filter, "snapshot_filter": filter, "max_data_file_bytes": size
+                    }
+                }}}
+            }))
+            .unwrap();
+            let errors = Arc::new(Mutex::new(Vec::new()));
+            let errors_copy = Arc::clone(&errors);
+            let rel = relation.clone();
+            let pipeline = off_runtime(move || {
+                engine.controller(
+                    &identity(&rel, &[Some("output")]),
+                    &config,
+                    Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
+                )
+            })
+            .unwrap();
+            pipeline.start();
+            wait_or_connector_error(
+                &pipeline,
+                &SqlIdentifier::from("test_output1"),
+                &relation,
+                &expected,
+                &errors,
+            )
+            .await;
+            assert_eq!(
+                delta_endpoint_gauge(
+                    &pipeline,
+                    alias,
+                    "input_connector_delta_data_file_bytes_reserved"
+                ) as u64,
+                size
+            );
+            pipeline.stop().unwrap();
+        }
+    })
+}
+
+#[engine_test(requires(Storage))]
 pub fn delta_data_file_budget_test(engine: &dyn PipelineTestEngine) {
     run_async_on(2, async {
         let table_dir = TempDir::new().unwrap();

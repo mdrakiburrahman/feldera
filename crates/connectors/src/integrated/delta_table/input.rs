@@ -49,6 +49,7 @@ use deltalake::datafusion::dataframe::DataFrame;
 use deltalake::datafusion::execution::context::SQLOptions;
 use deltalake::datafusion::logical_expr::{ExprSchemable, SortExpr};
 use deltalake::datafusion::prelude::{Expr, SessionConfig, SessionContext, cast, ident, lit};
+use deltalake::datafusion::sql::sqlparser::ast::{BinaryOperator, Expr as SqlExpr};
 use deltalake::datafusion::sql::sqlparser::dialect::GenericDialect;
 use deltalake::datafusion::sql::sqlparser::parser::Parser;
 use deltalake::datafusion::sql::sqlparser::tokenizer::Token;
@@ -82,7 +83,7 @@ use feldera_types::program_schema::{Field, Relation};
 use feldera_types::transport::delta_table::{
     DeltaTableIngestMode, DeltaTableReaderConfig, DeltaTableTransactionMode,
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -852,6 +853,21 @@ pub(super) fn parse_cdc_order_by(df: &DataFrame, order_by: &str) -> AnyResult<Ve
             Ok(key.sort(asc, nulls_first))
         })
         .collect()
+}
+
+fn collect_snapshot_conjuncts<'a>(expr: &'a SqlExpr, terms: &mut Vec<&'a SqlExpr>) {
+    match expr {
+        SqlExpr::Nested(inner) => collect_snapshot_conjuncts(inner, terms),
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_snapshot_conjuncts(left, terms);
+            collect_snapshot_conjuncts(right, terms);
+        }
+        _ => terms.push(expr),
+    }
 }
 
 /// Integrated input connector that reads from a delta table.
@@ -3422,7 +3438,7 @@ impl DeltaTableInputEndpointInner {
             &self.endpoint_name,
         );
 
-        if self.metrics.data_file_budget.get().is_some() {
+        let selected_paths = if self.metrics.data_file_budget.get().is_some() {
             let snapshot = table.snapshot().map_err(|e| {
                 ControllerError::input_transport_error(
                     &self.endpoint_name,
@@ -3430,19 +3446,88 @@ impl DeltaTableInputEndpointInner {
                     anyhow!("error accessing Delta snapshot: {e}"),
                 )
             })?;
-            #[allow(deprecated)]
-            let paths: Vec<String> = snapshot
-                .log_data()
-                .iter()
-                .map(|file| file.add_action().path)
+            let schema = snapshot.schema();
+            let mut terms = Vec::new();
+            if let Some(filter) = self.effective_snapshot_filter() {
+                let mut parser =
+                    Parser::new(&GenericDialect)
+                        .try_with_sql(&filter)
+                        .map_err(|e| {
+                            ControllerError::input_transport_error(
+                                &self.endpoint_name,
+                                true,
+                                anyhow!("error parsing snapshot filter: {e}"),
+                            )
+                        })?;
+                let expression = parser.parse_expr().map_err(|e| {
+                    ControllerError::input_transport_error(
+                        &self.endpoint_name,
+                        true,
+                        anyhow!("error parsing snapshot filter: {e}"),
+                    )
+                })?;
+                collect_snapshot_conjuncts(&expression, &mut terms);
+            }
+            let session = self.datafusion.state();
+            let supported: Vec<String> = terms
+                .into_iter()
+                .map(|term| term.to_string())
+                .filter(|term| {
+                    deltalake::delta_datafusion::expr::parse_sql_predicate_to_kernel(
+                        term,
+                        schema.as_ref(),
+                        &session,
+                    )
+                    .is_ok()
+                })
+                .map(|term| format!("({term})"))
                 .collect();
-            for path in paths {
-                self.reserve_data_file(table, &path).await.map_err(|e| {
+            let predicate = if supported.is_empty() {
+                None
+            } else {
+                Some(Arc::new(
+                    deltalake::delta_datafusion::expr::parse_sql_predicate_to_kernel(
+                        supported.join(" AND "),
+                        schema.as_ref(),
+                        &session,
+                    )
+                    .map_err(|e| {
+                        ControllerError::input_transport_error(
+                            &self.endpoint_name,
+                            true,
+                            anyhow!("error building snapshot file predicate: {e}"),
+                        )
+                    })?,
+                ))
+            };
+            let store = table.log_store();
+            let paths: Vec<String> = snapshot
+                .snapshot()
+                .file_views(store.as_ref(), predicate)
+                .map_ok(|file| file.to_add().path)
+                .try_collect()
+                .await
+                .map_err(|e| {
+                    ControllerError::input_transport_error(
+                        &self.endpoint_name,
+                        true,
+                        anyhow!("error selecting snapshot files: {e}"),
+                    )
+                })?;
+            for path in &paths {
+                self.reserve_data_file(table, path).await.map_err(|e| {
                     ControllerError::input_transport_error(&self.endpoint_name, true, e)
                 })?;
             }
+            Some(paths)
+        } else {
+            None
+        };
+        let mut builder = table.table_provider();
+        if let Some(paths) = selected_paths {
+            builder = builder.with_file_paths(paths);
         }
-        let provider = table.table_provider().await.map_err(|e| {
+        let provider = builder.await.map_err(|e| {
             ControllerError::input_transport_error(
                 &self.endpoint_name,
                 true,
