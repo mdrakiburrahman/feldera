@@ -3576,10 +3576,10 @@ impl DeltaTableInputEndpointInner {
                 ))
             };
             let store = table.log_store();
-            let paths: Vec<String> = snapshot
+            let files: Vec<(String, i64)> = snapshot
                 .snapshot()
                 .file_views(store.as_ref(), predicate)
-                .map_ok(|file| file.path().to_string())
+                .map_ok(|file| (file.path().to_string(), file.size()))
                 .try_collect()
                 .await
                 .map_err(|e| {
@@ -3589,12 +3589,12 @@ impl DeltaTableInputEndpointInner {
                         anyhow!("error selecting snapshot files: {e}"),
                     )
                 })?;
-            for path in &paths {
-                self.reserve_data_file(table, path).await.map_err(|e| {
+            for (path, size) in &files {
+                self.reserve_data_file(path, Some(*size)).map_err(|e| {
                     ControllerError::input_transport_error(&self.endpoint_name, true, e)
                 })?;
             }
-            Some(paths)
+            Some(files.into_iter().map(|(path, _)| path))
         } else {
             None
         };
@@ -5397,19 +5397,18 @@ impl DeltaTableInputEndpointInner {
         .await
     }
 
-    async fn reserve_data_file(&self, table: &DeltaTable, path: &str) -> AnyResult<()> {
+    /// Charge the size the Delta log records, since probing the object store
+    /// for it would open the file before the budget admits it.
+    fn reserve_data_file(&self, path: &str, size: Option<i64>) -> AnyResult<()> {
         let Some(budget) = self.metrics.data_file_budget.get() else {
             return Ok(());
         };
-        let location =
-            Path::parse(path).map_err(|e| anyhow!("invalid data-file path '{path}': {e}"))?;
-        let metadata = table
-            .log_store()
-            .object_store()
-            .head(&location)
-            .await
-            .map_err(|e| anyhow!("cannot determine data-file size for '{path}': {e}"))?;
-        budget.reserve(metadata.size)
+        let size = size
+            .and_then(|size| u64::try_from(size).ok())
+            .ok_or_else(|| {
+                anyhow!("max_data_file_bytes requires the Delta log to record the size of '{path}'")
+            })?;
+        budget.reserve(size)
     }
 
     /// Decode a deletion vector into its bitmap of row positions, or the empty
@@ -5567,6 +5566,7 @@ impl DeltaTableInputEndpointInner {
             Action::Add(add) if add.data_change => {
                 self.add_with_polarity(
                     &add.path,
+                    Some(add.size),
                     true,
                     add.deletion_vector.as_ref(),
                     Some(&add.partition_values),
@@ -5585,6 +5585,7 @@ impl DeltaTableInputEndpointInner {
             {
                 self.add_with_polarity(
                     &remove.path,
+                    remove.size,
                     false,
                     remove.deletion_vector.as_ref(),
                     remove.partition_values.as_ref(),
@@ -5615,6 +5616,7 @@ impl DeltaTableInputEndpointInner {
     async fn add_with_polarity(
         &self,
         path: &str,
+        size: Option<i64>,
         polarity: bool,
         deletion_vector: Option<&DeletionVectorDescriptor>,
         partition_values: Option<&HashMap<String, Option<String>>>,
@@ -5626,7 +5628,7 @@ impl DeltaTableInputEndpointInner {
         receiver: &mut Receiver<PipelineState>,
         start_transaction: Option<Option<String>>,
     ) -> AnyResult<()> {
-        self.reserve_data_file(table, path).await?;
+        self.reserve_data_file(path, size)?;
         let description = format!("file '{path}'");
         let read_schema = self.physical_read_schema(|name| self.needs_column(name))?;
 
@@ -5687,7 +5689,12 @@ impl DeltaTableInputEndpointInner {
             // empty delta means the rewrite left this side unchanged, so there
             // is nothing to emit.
             Some(positions) if !positions.is_empty() => {
-                self.reserve_data_file(table, path).await?;
+                let size = match action {
+                    Action::Add(add) => Some(add.size),
+                    Action::Remove(remove) => remove.size,
+                    _ => None,
+                };
+                self.reserve_data_file(path, size)?;
                 let description = format!("file '{path}'");
                 let provider = self
                     .file_provider(

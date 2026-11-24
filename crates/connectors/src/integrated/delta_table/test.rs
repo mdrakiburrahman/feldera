@@ -5950,7 +5950,6 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
             )
             .is_err()
         );
-        // Local object-store HEAD opens files for metadata; IN_ACCESS witnesses data reads.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         assert!(
             fd >= 0,
@@ -5966,7 +5965,11 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
         ] {
             let path = CString::new(path.as_os_str().as_bytes()).unwrap();
             let wd = unsafe {
-                libc::inotify_add_watch(access_watcher.as_raw_fd(), path.as_ptr(), libc::IN_ACCESS)
+                libc::inotify_add_watch(
+                    access_watcher.as_raw_fd(),
+                    path.as_ptr(),
+                    libc::IN_OPEN | libc::IN_ACCESS,
+                )
             };
             assert!(
                 wd >= 0,
@@ -6012,7 +6015,7 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
                 buffer.len(),
             )
         };
-        assert_eq!(count, -1, "over-budget snapshot read a data file");
+        assert_eq!(count, -1, "over-budget snapshot opened or read a data file");
         assert_eq!(
             std::io::Error::last_os_error().kind(),
             std::io::ErrorKind::WouldBlock
