@@ -1445,6 +1445,11 @@ pub struct RuntimeConfig {
     #[schema(value_type = Option<String>)]
     pub provisioning_timeout: Option<ConfigDuration>,
 
+    /// Durable, create-once marker for a single writer process incarnation.
+    /// The absolute path must be on the same retained filesystem on every
+    /// replacement, and its admission-specific parent must already exist.
+    pub writer_incarnation_fence: Option<String>,
+
     /// The maximum number of connectors initialized in parallel during pipeline
     /// startup.
     ///
@@ -1703,6 +1708,7 @@ impl Default for RuntimeConfig {
             clock_timezone_offset: None,
             pin_cpus: Vec::new(),
             provisioning_timeout: None,
+            writer_incarnation_fence: None,
             max_parallel_connector_init: None,
             init_containers: None,
             checkpoint_during_suspend: true,

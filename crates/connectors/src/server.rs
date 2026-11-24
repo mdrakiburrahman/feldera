@@ -872,6 +872,24 @@ impl LineRedactor for SecretLineRedactor {
     }
 }
 
+fn claim_writer_incarnation_fence(path: &Path) -> std::io::Result<()> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "writer incarnation fence path must be absolute",
+        ));
+    }
+    let marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    marker.sync_all()?;
+    std::fs::File::open(path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "fence has no parent")
+    })?)?
+    .sync_all()
+}
+
 // We pass the engine as trait objects to make sure that this function
 // doesn't have any generics and gets generated, along with the entire web server
 // as part of this crate. This reduces the size of the generated code for
@@ -901,6 +919,12 @@ pub fn run_server(
 
     let config = parse_config_with_deferred_logging(&args.config_file, &mut deferred_logging)
         .inspect_err(|e| deferred_logging.push(Level::ERROR, e.to_string()))?;
+
+    if let Some(path) = &config.global.writer_incarnation_fence {
+        claim_writer_incarnation_fence(Path::new(path)).map_err(|e| {
+            ControllerError::io_error(format!("claiming writer incarnation fence '{path}'"), e)
+        })?;
+    }
 
     // Initialize the logger by setting its filter and template.
     let pipeline_label = config
