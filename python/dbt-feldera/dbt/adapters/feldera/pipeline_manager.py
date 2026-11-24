@@ -419,7 +419,7 @@ class PipelineStateManager:
             # existing pipeline
             local_tables = self._tables.get(pipeline, {})
             if local_tables:
-                local_names = {name.lower() for name in local_tables}
+                local_names = self._extract_table_names(list(local_tables.values()))
                 table_parts = [
                     ddl for ddl in table_parts if not self._extract_table_names([ddl]).intersection(local_names)
                 ]

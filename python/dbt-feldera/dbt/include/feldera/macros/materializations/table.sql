@@ -7,11 +7,11 @@
 #}
 {% materialization table, adapter='feldera' %}
     {%- set pipeline_name = config.get('pipeline_name', model.schema) -%}
-    {%- set table_name = model.name -%}
+    {%- set table_name = this.identifier -%}
     {%- set connectors = config.get('connectors', []) -%}
 
     {%- set table_sql -%}
-        CREATE TABLE {{ table_name }} (
+        CREATE TABLE {{ this }} (
             {{ sql }}
         )
         {%- if connectors %}

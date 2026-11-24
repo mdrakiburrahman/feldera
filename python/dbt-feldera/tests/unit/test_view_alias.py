@@ -30,9 +30,14 @@ def test_versioned_view_alias_matches_refs_and_tests(tmp_path, monkeypatch, quot
     )
     (tmp_path / "models" / "versioned_v1.sql").write_text("{{ config(alias='AliasView', stored=true) }} select 1 as id")
     (tmp_path / "models" / "plain.sql").write_text("{{ config(stored=true, connectors=[]) }} select 1 as id")
+    (tmp_path / "models" / "input.sql").write_text(
+        "{{ config(materialized='table', alias='InputAlias', "
+        "connectors=[{'transport': {'name': 'input_connector'}}]) }} id BIGINT"
+    )
     (tmp_path / "models" / "dependent.sql").write_text(
         "{{ config(connectors=[{'transport': {'name': 'explicit'}}]) }} "
-        "select id from {{ ref('versioned', version=1) }}"
+        "select a.id from {{ ref('versioned', version=1) }} a "
+        "join {{ ref('input') }} b on a.id = b.id"
     )
     (tmp_path / "models" / "schema.yml").write_text(
         "version: 2\nmodels:\n  - name: versioned\n    latest_version: 1\n"
@@ -63,17 +68,24 @@ def test_versioned_view_alias_matches_refs_and_tests(tmp_path, monkeypatch, quot
         patch.object(FelderaConnectionManager, "execute", execute),
     ):
         for _ in range(2):
+            state.remove_table_if_exists("example", "InputAlias")
             queries.clear()
             result = dbtRunner().invoke(["build", "--profiles-dir", str(tmp_path), "--no-partial-parse"])
             assert result.success, str(result.exception)
             views = state.get_views("example")
             alias = '"AliasView"' if quoted else "AliasView"
             plain = '"plain"' if quoted else "plain"
+            input_name = '"InputAlias"' if quoted else "InputAlias"
             assert set(views) == {"AliasView", "plain", "dependent"}
             assert f"VIEW {alias}" in views["AliasView"]
             assert "example_AliasView" in views["AliasView"]
             assert f"from {alias}" in views["dependent"]
+            assert f"join {input_name}" in views["dependent"]
             assert "explicit" in views["dependent"]
             assert "connectors" not in views["plain"]
+            table = state.get_tables("example")["InputAlias"]
+            assert f"CREATE TABLE {input_name}" in table
+            assert "input_connector" in table
+            assert "example_InputAlias" not in table
             assert any(f"from {alias}" in sql for sql in queries)
             assert any(f"from {plain}" in sql for sql in queries)

@@ -324,6 +324,19 @@ class TestPipelineReuse(unittest.TestCase):
         self.assertIn("id INT", self.pipeline.modify.call_args.kwargs["sql"])
         self.assertNotIn("id BIGINT", self.pipeline.modify.call_args.kwargs["sql"])
 
+    def test_quoted_table_alias_matches_existing_table_on_refire(self):
+        manager = PipelineStateManager()
+        manager.register_table("pipe", "InputAlias", 'CREATE TABLE "InputAlias" (id INT)')
+        manager.register_view("pipe", "result", 'CREATE VIEW result AS SELECT * FROM "InputAlias"')
+        self.pipeline.program_code.return_value = manager.assemble_program("pipe")
+        with patch("dbt.adapters.feldera.pipeline_manager.Pipeline.get", return_value=self.pipeline):
+            result = manager.update_with_views(
+                Mock(), "pipe", runtime_config=self.config, udf_rust="rust", udf_toml="toml"
+            )
+        self.assertIs(result, self.pipeline)
+        self.pipeline.modify.assert_not_called()
+        self.pipeline.start.assert_not_called()
+
     def test_removed_setting_and_server_drift_redeploy(self):
         self.update(runtime_config={"workers": 2, "storage": True})
         self.pipeline.modify.assert_called_once()
