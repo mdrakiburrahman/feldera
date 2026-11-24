@@ -2,12 +2,13 @@ import json
 import subprocess
 import sys
 from decimal import Decimal
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pyarrow as pa
 import pytest
 
 from dbt.adapters.feldera import seed_evidence
+from dbt.adapters.feldera.impl import FelderaAdapter
 
 
 def test_v1_digest_matches_independent_process_and_binds_multiplicity():
@@ -128,3 +129,42 @@ def test_snapshot_rejects_input_errors_and_missing_incarnation(failure):
     client.get_pipeline_stats.return_value = stats
     with pytest.raises(RuntimeError):
         seed_evidence.snapshot(client, "pipeline", {"seed"})
+
+
+@pytest.mark.parametrize("failure", ["changed_incarnation", "partial", "ambiguous_ingress"])
+def test_finalizer_does_not_deliver_failed_evidence(failure):
+    identity = {"id": "p", "version": 1, "program_version": 1, "deployment_id": "d", "incarnation_uuid": "i"}
+    descriptor = {**identity, "deployment_status": "Running"}
+    client = Mock()
+    client.http.get.return_value = descriptor
+    adapter = Mock()
+    adapter._get_client.return_value = client
+    adapter._read_udfs.return_value = (None, None, None)
+    adapter._convert_agate_rows.return_value = [{"x": 1}]
+    adapter._push_seed_data.return_value = "token"
+    hook = Mock()
+    initial = (identity, {}, descriptor)
+    if failure == "changed_incarnation":
+        after = ({**identity, "incarnation_uuid": "changed"}, {}, descriptor)
+        snapshots = [initial, after]
+    elif failure == "ambiguous_ingress":
+        endpoints = {key: {"stream": "seed", "metrics": {"total_records": 1}} for key in ("one", "two")}
+        snapshots = [initial, initial, (identity, endpoints, descriptor)]
+    else:
+        snapshots = [initial]
+    verified = Mock(side_effect=RuntimeError("partial seed")) if failure == "partial" else Mock(
+        return_value={"expected": {}, "observed": {"row_count": 1}}
+    )
+    existing = None if failure == "ambiguous_ingress" else Mock()
+    with (
+        patch("dbt.adapters.feldera.impl.Pipeline.get", return_value=existing),
+        patch("dbt.adapters.feldera.impl._pipeline_state.get_pending_seed_pipelines", return_value=["p"]),
+        patch("dbt.adapters.feldera.impl._pipeline_state.pop_pending_seeds", return_value=[("seed", None, None)]),
+        patch("dbt.adapters.feldera.impl._pipeline_state.deploy"),
+        patch.object(seed_evidence, "get_seed_verification_hook", return_value=hook),
+        patch.object(seed_evidence, "snapshot", side_effect=snapshots),
+        patch.object(seed_evidence, "verify_and_digest", verified),
+        pytest.raises(RuntimeError),
+    ):
+        FelderaAdapter.finalize_seeds(adapter, safe_seed_reuse=True)
+    hook.assert_not_called()
