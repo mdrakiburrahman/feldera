@@ -568,9 +568,10 @@ pub struct DeltaTableReaderConfig {
     pub ignore_deletes: bool,
 
     /// Optional per-endpoint limit on logical data-file bytes reserved in this process.
-    /// The complete snapshot is charged before reading, even when filters prune files;
-    /// each followed file read, including retractions, is charged again. Metadata,
-    /// transfer ranges, and retries are not measured. Counters reset on process restart.
+    /// Snapshot files not excluded by conservative metadata pruning are charged
+    /// before reading. Each followed file read, including retractions, is charged
+    /// again. Metadata, transfer ranges, and retries are not measured. Counters reset
+    /// on process restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_data_file_bytes: Option<u64>,
 

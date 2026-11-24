@@ -855,7 +855,7 @@ pub(super) fn parse_cdc_order_by(df: &DataFrame, order_by: &str) -> AnyResult<Ve
         .collect()
 }
 
-fn collect_snapshot_conjuncts<'a>(expr: &'a SqlExpr, terms: &mut Vec<&'a SqlExpr>) {
+fn collect_snapshot_conjuncts(expr: &SqlExpr, terms: &mut Vec<String>) {
     match expr {
         SqlExpr::Nested(inner) => collect_snapshot_conjuncts(inner, terms),
         SqlExpr::BinaryOp {
@@ -866,7 +866,7 @@ fn collect_snapshot_conjuncts<'a>(expr: &'a SqlExpr, terms: &mut Vec<&'a SqlExpr
             collect_snapshot_conjuncts(left, terms);
             collect_snapshot_conjuncts(right, terms);
         }
-        _ => terms.push(expr),
+        _ => terms.push(expr.to_string()),
     }
 }
 
@@ -3471,7 +3471,6 @@ impl DeltaTableInputEndpointInner {
             let session = self.datafusion.state();
             let supported: Vec<String> = terms
                 .into_iter()
-                .map(|term| term.to_string())
                 .filter(|term| {
                     deltalake::delta_datafusion::expr::parse_sql_predicate_to_kernel(
                         term,
@@ -3504,7 +3503,7 @@ impl DeltaTableInputEndpointInner {
             let paths: Vec<String> = snapshot
                 .snapshot()
                 .file_views(store.as_ref(), predicate)
-                .map_ok(|file| file.to_add().path)
+                .map_ok(|file| Path::from(file.path().as_ref()).to_string())
                 .try_collect()
                 .await
                 .map_err(|e| {

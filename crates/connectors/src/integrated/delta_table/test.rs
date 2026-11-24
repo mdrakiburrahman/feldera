@@ -5756,9 +5756,14 @@ fn change_feed_row(id: u32, s: &str) -> Value {
     json!({ "id": id, "b": false, "i": null, "s": s })
 }
 
+#[cfg(target_os = "linux")]
 #[engine_test(requires(Storage))]
 pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEngine) {
     run_async_on(2, async {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
         let table_dir = TempDir::new().unwrap();
         let uri = table_dir.path().to_str().unwrap();
         let relation = basic_relation();
@@ -5791,7 +5796,30 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
         let second_size = size_for("20260103");
         let excluded_path = table_dir.path().join(&file_for("20250101").path);
         let excluded_size = std::fs::metadata(&excluded_path).unwrap().len();
-        std::fs::write(excluded_path, vec![0; excluded_size as usize]).unwrap();
+        std::fs::write(&excluded_path, vec![0; excluded_size as usize]).unwrap();
+        // Watch opens after fixture setup, including any opens during provider planning.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        );
+        let watcher = unsafe { OwnedFd::from_raw_fd(fd) };
+        let watch = |path: &std::path::Path| {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let wd = unsafe {
+                libc::inotify_add_watch(watcher.as_raw_fd(), path.as_ptr(), libc::IN_OPEN)
+            };
+            assert!(
+                wd >= 0,
+                "inotify_add_watch: {}",
+                std::io::Error::last_os_error()
+            );
+            wd
+        };
+        let first_watch = watch(&table_dir.path().join(&file_for("20260102").path));
+        let second_watch = watch(&table_dir.path().join(&file_for("20260103").path));
+        let excluded_watch = watch(&excluded_path);
 
         for (alias, filter, size, expected) in [
             (
@@ -5848,6 +5876,52 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
                 size
             );
             pipeline.stop().unwrap();
+            let mut opened = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let count = unsafe {
+                    libc::read(
+                        watcher.as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                if count < 0 {
+                    let error = std::io::Error::last_os_error();
+                    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                    break;
+                }
+                assert!(count > 0);
+                let mut offset = 0;
+                while offset < count as usize {
+                    let event = unsafe {
+                        std::ptr::read_unaligned(
+                            buffer.as_ptr().add(offset).cast::<libc::inotify_event>(),
+                        )
+                    };
+                    opened.push(event.wd);
+                    offset += std::mem::size_of::<libc::inotify_event>() + event.len as usize;
+                }
+            }
+            assert!(
+                opened.contains(&first_watch),
+                "selected object was not observed opening"
+            );
+            if expected.len() == 2 {
+                assert!(
+                    opened.contains(&second_watch),
+                    "second selected object was not observed opening"
+                );
+            } else {
+                assert!(
+                    !opened.contains(&second_watch),
+                    "unselected object was opened"
+                );
+            }
+            assert!(
+                !opened.contains(&excluded_watch),
+                "excluded object was opened"
+            );
         }
     })
 }
