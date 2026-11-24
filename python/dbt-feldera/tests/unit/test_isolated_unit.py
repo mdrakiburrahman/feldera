@@ -11,7 +11,6 @@ from dbt.adapters.feldera.pipeline_manager import set_pre_start_hook
 from dbt.cli.main import dbtRunner
 
 
-
 def test_char_output_type_preserves_width():
     assert _sql_type({"columntype": {"type": "CHAR", "precision": 5}}) == "CHAR(5)"
 
