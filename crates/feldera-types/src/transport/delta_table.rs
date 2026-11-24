@@ -567,6 +567,14 @@ pub struct DeltaTableReaderConfig {
     #[serde(default, skip_serializing_if = "is_default")]
     pub ignore_deletes: bool,
 
+    /// Optional per-endpoint limit on logical data-file bytes reserved in this process.
+    /// Snapshot files not excluded by conservative metadata pruning are charged
+    /// before reading. Each followed file read, including retractions, is charged
+    /// again. Metadata, transfer ranges, and retries are not measured. Counters reset
+    /// on process restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_data_file_bytes: Option<u64>,
+
     /// Transaction mode.
     ///
     /// Determines how the connector breaks up its input into transactions.
@@ -983,6 +991,31 @@ fn test_delta_ignore_policies_require_file_following() {
 
 #[cfg(test)]
 #[test]
+fn test_delta_data_file_budget_config() {
+    let config: DeltaTableReaderConfig = serde_json::from_str(
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"off","max_data_file_bytes":42}"#,
+    ).unwrap();
+    assert_eq!(config.max_data_file_bytes, Some(42));
+    assert!(config.object_store_config.is_empty());
+    assert!(config.validate().is_ok());
+
+    for raw in [
+        r#"{"uri":"memory://","mode":"snapshot","max_data_file_bytes":42}"#,
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"auto","max_data_file_bytes":42}"#,
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"off","timestamp_column":"ts","max_data_file_bytes":42}"#,
+    ] {
+        let config: DeltaTableReaderConfig = serde_json::from_str(raw).unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("max_data_file_bytes")
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn test_delta_transaction_mode_catchup_serde() {
     let config: DeltaTableReaderConfig = serde_json::from_str(
         r#"{"uri":"s3://bucket/t","mode":"follow","transaction_mode":"catchup"}"#,
@@ -1267,6 +1300,13 @@ impl DeltaTableReaderConfig {
     /// Reject settings the connector cannot act on, so a misconfigured pipeline
     /// fails at startup naming the setting rather than at the first read.
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_data_file_bytes.is_some()
+            && (!matches!(self.mode, DeltaTableIngestMode::SnapshotAndFollow)
+                || self.reads_change_feed()
+                || self.timestamp_column.is_some())
+        {
+            return Err("'max_data_file_bytes' requires 'snapshot_and_follow', change feed off, and no timestamp_column".to_string());
+        }
         if self.ignore_changes || self.ignore_deletes {
             let option = if self.ignore_changes {
                 "ignore_changes"
