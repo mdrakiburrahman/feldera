@@ -5842,7 +5842,7 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
         for (alias, filter, size, expected) in [
             (
                 "budget_selected_between",
-                r#"(("s" BETWEEN '20260101' AND '20260131') AND "s" ~ '^[0-9]{8}$') AND "s" IN ('20260102') AND ("id" = 1 OR "s" = '20250101')"#,
+                r#"(("s" BETWEEN '20260101' AND '20260131') AND "s" ~ '^[0-9]{8}(\r\n|[\n\r\x{85}\x{2028}\x{2029}])?$') AND "s" IN ('20260102') AND ("id" = 1 OR "s" = '20250101')"#,
                 first_size,
                 vec![first.clone()],
             ),
@@ -5946,6 +5946,63 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
                 "excluded object was opened"
             );
         }
+    })
+}
+
+#[engine_test(requires(Storage))]
+pub fn delta_data_file_budget_mapped_deletion_vector_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        let table_dir = TempDir::new().unwrap();
+        let first = [uniform_row(1, "alpha", "Coffee", "settled")];
+        let second = [
+            uniform_row(2, "beta", "Shop", "settled"),
+            uniform_row(3, "gamma", "Shop", "deleted"),
+        ];
+        let relation = uniform_relation();
+        write_id_mapped_table_with_deletion_vector(
+            table_dir.path(),
+            &relation,
+            &[&first, &second],
+            &[1],
+        );
+        let size: u64 = std::fs::read_dir(table_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .sum();
+        assert!(size > 0);
+        let storage = TempDir::new().unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = delta_input_controller(
+            engine,
+            table_dir.path().to_str().unwrap(),
+            json!({"mode": "snapshot_and_follow", "change_feed": "off",
+                "filter": "id > 0", "max_data_file_bytes": size}),
+            &relation,
+            storage.path(),
+            &errors,
+        )
+        .await
+        .unwrap();
+        pipeline.start();
+        wait_or_connector_error(
+            &pipeline,
+            &SqlIdentifier::from("test_output1"),
+            &relation,
+            &[first[0].clone(), second[0].clone()],
+            &errors,
+        )
+        .await;
+        assert_eq!(
+            delta_endpoint_gauge(
+                &pipeline,
+                "test_input1",
+                "input_connector_delta_data_file_bytes_reserved"
+            ) as u64,
+            size
+        );
+        pipeline.stop().unwrap();
     })
 }
 
