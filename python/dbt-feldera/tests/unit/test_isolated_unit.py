@@ -6,10 +6,20 @@ from feldera.enums import PipelineStatus
 
 from dbt.adapters.contracts.connection import AdapterResponse
 from dbt.adapters.feldera.impl import FelderaAdapter
-from dbt.adapters.feldera.isolated_unit import is_isolated_unit_pipeline, run_unit_test
+from dbt.adapters.feldera.isolated_unit import _sql_type, is_isolated_unit_pipeline, run_unit_test
 from dbt.adapters.feldera.pipeline_manager import set_pre_start_hook
 from dbt.cli.main import dbtRunner
 
+
+
+def test_char_output_type_preserves_width():
+    assert _sql_type({"columntype": {"type": "CHAR", "precision": 5}}) == "CHAR(5)"
+
+
+@pytest.mark.parametrize("precision", [None, -1, 0, "5", True])
+def test_char_output_type_rejects_unknown_width(precision):
+    with pytest.raises(ValueError, match="CHAR column has unknown or invalid width"):
+        _sql_type({"columntype": {"type": "CHAR", "precision": precision}})
 
 def _info(outputs, inputs=None):
     return {

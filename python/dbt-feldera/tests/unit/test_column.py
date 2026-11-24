@@ -50,6 +50,17 @@ class TestFelderaColumn(unittest.TestCase):
             with self.subTest(sql_type=sql_type):
                 self.assertEqual(FelderaColumn.translate_type(sql_type), expected)
 
+    def test_char_fixture_data_type_preserves_width(self):
+        col = FelderaColumn.from_feldera_field(
+            {"name": "word", "columntype": {"type": "CHAR", "precision": 5}}
+        )
+        self.assertEqual(col.data_type, "CHAR(5)")
+
+    def test_char_fixture_data_type_rejects_unknown_width(self):
+        col = FelderaColumn.from_feldera_field({"name": "word", "columntype": {"type": "CHAR"}})
+        with self.assertRaisesRegex(ValueError, "CHAR column has unknown or invalid width"):
+            _ = col.data_type
+
     # ── Classification predicates ───────────────────────────────────
 
     def test_predicates_all_known_types(self):

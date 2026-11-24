@@ -1,6 +1,12 @@
 from dbt.adapters.base.column import Column
 
 
+def _char_sql_type(precision):
+    if type(precision) is not int or precision <= 0:
+        raise ValueError("CHAR column has unknown or invalid width")
+    return f"CHAR({precision})"
+
+
 class FelderaColumn(Column):
     """
     Represents a column in a Feldera table or view.
@@ -91,7 +97,14 @@ class FelderaColumn(Column):
         name = field.get("name", "")
         column_type = field.get("columntype", {})
         dtype = column_type.get("type", "VARCHAR") if isinstance(column_type, dict) else str(column_type)
-        return cls(column=name, dtype=dtype)
+        char_size = column_type.get("precision") if isinstance(column_type, dict) and dtype == "CHAR" else None
+        return cls(column=name, dtype=dtype, char_size=char_size)
+
+    @property
+    def data_type(self) -> str:
+        if self.dtype.upper() == "CHAR":
+            return _char_sql_type(self.char_size)
+        return super().data_type
 
     def is_string(self) -> bool:
         """Return True if this column is a string/text type."""
