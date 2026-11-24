@@ -10536,14 +10536,25 @@
             "description": "Optional row filter.\n\nWhen specified, only rows that satisfy the filter condition are read from the delta table.\nThe condition must be a valid SQL Boolean expression that can be used in\nthe `where` clause of the `select * from my_table where ...` query.",
             "nullable": true
           },
+          "ignore_changes": {
+            "type": "boolean",
+            "description": "While following, skip file removals and insert all live rows from each data-changing Add.\nRewrites can re-emit rows that were already ingested. Takes precedence over `ignore_deletes`.\nOnly valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled."
+          },
           "ignore_deletes": {
             "type": "boolean",
-            "description": "While following, skip commits that only remove files. Reject commits that both add and\nremove data.\nOnly valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled."
+            "description": "While following, skip commits that only remove files. Reject commits that both add and\nremove data unless `ignore_changes` is also enabled.\nOnly valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled."
           },
           "max_concurrent_readers": {
             "type": "integer",
             "format": "int32",
             "description": "Maximum number of concurrent object store reads performed by all Delta Lake connectors.\n\nThis setting is used to limit the number of concurrent reads of the object store in a\npipeline with a large number of Delta Lake connectors. When multiple connectors are simultaneously\nreading from the object store, this can lead to transport timeouts.\n\nWhen enabled, this setting limits the number of concurrent reads across all connectors.\nThis is a global setting that affects all Delta Lake connectors, and not just the connector\nwhere it is specified. It should therefore be used at most once in a pipeline.  If multiple\nconnectors specify this setting, they must all use the same value.\n\nThe default value is 6.",
+            "nullable": true,
+            "minimum": 0
+          },
+          "max_data_file_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Optional per-endpoint limit on logical data-file bytes reserved in this process.\nSnapshot files not excluded by conservative metadata pruning are charged\nbefore reading. Each followed file read, including retractions, is charged\nagain. Metadata, transfer ranges, and retries are not measured. Counters reset\non process restart.",
             "nullable": true,
             "minimum": 0
           },

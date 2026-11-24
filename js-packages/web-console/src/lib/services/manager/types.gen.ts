@@ -1434,8 +1434,14 @@ export type DeltaTableReaderConfig = {
    */
   filter?: string | null
   /**
+   * While following, skip file removals and insert all live rows from each data-changing Add.
+   * Rewrites can re-emit rows that were already ingested. Takes precedence over `ignore_deletes`.
+   * Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
+   */
+  ignore_changes?: boolean
+  /**
    * While following, skip commits that only remove files. Reject commits that both add and
-   * remove data.
+   * remove data unless `ignore_changes` is also enabled.
    * Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
    */
   ignore_deletes?: boolean
@@ -1454,6 +1460,14 @@ export type DeltaTableReaderConfig = {
    * The default value is 6.
    */
   max_concurrent_readers?: number | null
+  /**
+   * Optional per-endpoint limit on logical data-file bytes reserved in this process.
+   * Snapshot files not excluded by conservative metadata pruning are charged
+   * before reading. Each followed file read, including retractions, is charged
+   * again. Metadata, transfer ranges, and retries are not measured. Counters reset
+   * on process restart.
+   */
+  max_data_file_bytes?: number | null
   /**
    * Maximum number of retries for failed object store operations.
    *
@@ -1603,6 +1617,8 @@ export type DeltaTableReaderConfig = {
     | string
     | null
     | boolean
+    | number
+    | null
     | number
     | null
     | number
