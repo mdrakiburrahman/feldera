@@ -152,16 +152,28 @@ impl DataFileBudget {
     }
 }
 
-// Pipeline members run in separate processes. Keep reservations across reader reopens.
-static DATA_FILE_BUDGETS: OnceLock<Mutex<HashMap<String, Arc<DataFileBudget>>>> = OnceLock::new();
+// Keep reservations across reader reopens while isolating different pipelines.
+static DATA_FILE_BUDGETS: OnceLock<Mutex<HashMap<(String, String), Arc<DataFileBudget>>>> =
+    OnceLock::new();
 static DATA_FILE_BUDGET_EPOCH: OnceLock<Duration> = OnceLock::new();
 
-fn data_file_budget(endpoint: &str, limit: Option<u64>) -> AnyResult<Option<Arc<DataFileBudget>>> {
+fn data_file_budget(
+    pipeline: Option<&str>,
+    endpoint: &str,
+    limit: Option<u64>,
+) -> AnyResult<Option<Arc<DataFileBudget>>> {
+    let Some(pipeline) = pipeline.filter(|name| !name.is_empty()) else {
+        if limit.is_some() {
+            bail!("max_data_file_bytes requires a pipeline identity");
+        }
+        return Ok(None);
+    };
+    let key = (pipeline.to_string(), endpoint.to_string());
     let mut budgets = DATA_FILE_BUDGETS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|_| anyhow!("data-file budget registry lock poisoned"))?;
-    if let Some(budget) = budgets.get(endpoint) {
+    if let Some(budget) = budgets.get(&key) {
         if limit != Some(budget.limit) {
             bail!("max_data_file_bytes changed or removed for endpoint '{endpoint}'");
         }
@@ -179,7 +191,7 @@ fn data_file_budget(endpoint: &str, limit: Option<u64>) -> AnyResult<Option<Arc<
         limit,
         reserved: AtomicU64::new(0),
     });
-    budgets.insert(endpoint.to_string(), Arc::clone(&budget));
+    budgets.insert(key, Arc::clone(&budget));
     Ok(Some(budget))
 }
 
@@ -189,10 +201,10 @@ mod data_file_budget_tests {
 
     #[test]
     fn concurrent_reservations_and_reopen() {
-        let a = data_file_budget("data-file-budget-test-a", Some(50))
+        let a = data_file_budget(Some("pipeline-a"), "data-file-budget-test-a", Some(50))
             .unwrap()
             .unwrap();
-        let b = data_file_budget("data-file-budget-test-b", Some(50))
+        let b = data_file_budget(Some("pipeline-a"), "data-file-budget-test-b", Some(50))
             .unwrap()
             .unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(20));
@@ -217,12 +229,17 @@ mod data_file_budget_tests {
         assert!(a.reserve(1).is_ok());
         assert!(a.reserve(1).is_err());
         assert!(b.reserve(50).is_ok());
-        let reopened = data_file_budget("data-file-budget-test-a", Some(50))
+        let reopened = data_file_budget(Some("pipeline-a"), "data-file-budget-test-a", Some(50))
             .unwrap()
             .unwrap();
         assert_eq!(reopened.reserved.load(Ordering::Acquire), 50);
-        assert!(data_file_budget("data-file-budget-test-a", None).is_err());
-        assert!(data_file_budget("data-file-budget-test-a", Some(51)).is_err());
+        assert!(data_file_budget(Some("pipeline-a"), "data-file-budget-test-a", None).is_err());
+        assert!(data_file_budget(Some("pipeline-a"), "data-file-budget-test-a", Some(51)).is_err());
+        let other = data_file_budget(Some("pipeline-b"), "data-file-budget-test-a", Some(50))
+            .unwrap()
+            .unwrap();
+        assert!(other.reserve(50).is_ok());
+        assert!(data_file_budget(None, "data-file-budget-test-a", Some(50)).is_err());
     }
 }
 
@@ -873,6 +890,7 @@ fn collect_snapshot_conjuncts(expr: &SqlExpr, terms: &mut Vec<String>) {
 /// Integrated input connector that reads from a delta table.
 pub struct DeltaTableInputEndpoint {
     endpoint_name: String,
+    pipeline_name: Option<String>,
     config: DeltaTableReaderConfig,
     datafusion: SessionContext,
     consumer: Box<dyn InputConsumer>,
@@ -933,6 +951,7 @@ impl DeltaTableInputEndpoint {
 
         Self {
             endpoint_name: endpoint_name.to_string(),
+            pipeline_name: pipeline_config.name.clone(),
             config: config.clone(),
             datafusion,
             consumer,
@@ -954,6 +973,7 @@ impl IntegratedInputEndpoint for DeltaTableInputEndpoint {
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(DeltaTableInputReader::new(
             self.endpoint_name,
+            self.pipeline_name,
             self.config,
             self.datafusion,
             self.consumer,
@@ -1037,6 +1057,7 @@ fn validate_distributed(config: &DeltaTableReaderConfig) -> AnyResult<()> {
 impl DeltaTableInputReader {
     fn new(
         endpoint_name: String,
+        pipeline_name: Option<String>,
         mut config: DeltaTableReaderConfig,
         datafusion: SessionContext,
         consumer: Box<dyn InputConsumer>,
@@ -1112,7 +1133,11 @@ impl DeltaTableInputReader {
             }
             validate_distributed(&config)?;
         }
-        let data_file_budget = data_file_budget(&endpoint_name, config.max_data_file_bytes)?;
+        let data_file_budget = data_file_budget(
+            pipeline_name.as_deref(),
+            &endpoint_name,
+            config.max_data_file_bytes,
+        )?;
 
         if config.end_version.is_some() && !config.follow() {
             bail!(
