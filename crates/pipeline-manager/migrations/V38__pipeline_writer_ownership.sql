@@ -58,6 +58,9 @@ BEGIN
     THEN
         RAISE EXCEPTION 'protected deployment configuration cannot change';
     END IF;
+    IF NEW.storage_status = 'clearing' AND OLD.storage_status IS DISTINCT FROM 'clearing' THEN
+        RAISE EXCEPTION 'protected storage cannot be cleared';
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;

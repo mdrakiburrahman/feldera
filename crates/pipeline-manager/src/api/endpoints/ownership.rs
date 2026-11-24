@@ -186,7 +186,7 @@ pub(crate) async fn prepare(
     let tx = client.transaction().await.map_err(actix_web::error::ErrorServiceUnavailable)?;
     let row = tx.query_opt(
         "SELECT id, version, runtime_config, program_status, deployment_resources_status, \
-         deployment_resources_desired_status, deployment_config FROM pipeline \
+         deployment_resources_desired_status, deployment_config, storage_status FROM pipeline \
          WHERE tenant_id=$1 AND name=$2 FOR UPDATE", &[&tenant.0, &name],
     ).await.map_err(actix_web::error::ErrorServiceUnavailable)?;
     let Some(row) = row else { return Ok(conflict("pipeline not found")); };
@@ -197,11 +197,13 @@ pub(crate) async fn prepare(
     let status: String = row.get(4);
     let desired: String = row.get(5);
     let prior_deployment: Option<String> = row.get(6);
+    let storage_status: String = row.get(7);
     let config: Value = serde_json::from_str(&config).map_err(actix_web::error::ErrorInternalServerError)?;
     let fence = config.get("writer_incarnation_fence").and_then(Value::as_str);
     let valid_fence = fence.is_some_and(|s| std::path::Path::new(s).is_absolute());
     if id != b.pipeline_id || version != b.pipeline_version || program != "success"
-        || status != "stopped" || desired != "stopped" || prior_deployment.is_some()
+        || status != "stopped" || desired != "stopped" || storage_status != "cleared"
+        || prior_deployment.is_some()
         || !valid_fence || config.get("hosts").and_then(Value::as_u64).unwrap_or(1) != 1
     {
         return Ok(conflict("pipeline is not a fresh stopped compiled single-host guarded pipeline"));
@@ -287,7 +289,7 @@ async fn transition(
     }
     let pipeline = tx.query_opt(
         "SELECT id,version,program_version,deployment_id,deployment_resources_status,\
-         deployment_runtime_status FROM pipeline WHERE tenant_id=$1 AND name=$2 FOR SHARE",
+         deployment_runtime_status,program_code FROM pipeline WHERE tenant_id=$1 AND name=$2",
         &[&tenant.0, &name],
     ).await.map_err(actix_web::error::ErrorServiceUnavailable)?;
     let Some(p) = pipeline else { return Ok(conflict("pipeline missing")); };
@@ -297,6 +299,8 @@ async fn transition(
         || deployment.is_none() || (is_advance && deployment != old_deployment)
         || p.get::<_,String>(4) != "provisioned"
         || p.get::<_,Option<String>>(5).as_deref() != Some("running")
+        || b.identity["program_sha256"].as_str()
+            != Some(hex::encode(Sha256::digest(p.get::<_, String>(6).as_bytes())).as_str())
     {
         return Ok(conflict("pipeline deployment is not the bound running deployment"));
     }
@@ -313,6 +317,16 @@ async fn transition(
         != b.identity["incarnation"].as_str()
     {
         return Ok(conflict("runtime incarnation mismatch"));
+    }
+    let unchanged = tx.query_opt(
+        "SELECT id FROM pipeline WHERE tenant_id=$1 AND name=$2 AND id=$3 AND version=$4 \
+         AND program_version=$5 AND deployment_id=$6 AND deployment_resources_status='provisioned' \
+         AND deployment_runtime_status='running'",
+        &[&tenant.0, &name, &pipeline_id, &pipeline_version,
+          &b.identity["program_version"].as_i64().unwrap(), &deployment],
+    ).await.map_err(actix_web::error::ErrorServiceUnavailable)?;
+    if unchanged.is_none() {
+        return Ok(conflict("pipeline changed while attesting incarnation"));
     }
     let (generation, nonce) = if is_advance {
         let Some(generation) = b.next_generation else { return Ok(conflict("missing next generation")); };

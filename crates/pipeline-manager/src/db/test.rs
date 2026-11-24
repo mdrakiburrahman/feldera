@@ -2131,6 +2131,54 @@ async fn preprovision_member_survives_first_login() {
     assert_eq!(role, Role::Write);
 }
 
+#[tokio::test]
+async fn protected_pipeline_rechecks_delayed_database_mutations() {
+    let handle = test_setup().await;
+    let tenant = TenantRecord::default().id;
+    let pipeline = handle.db.new_pipeline(
+        tenant, Uuid::now_v7(), "v0", PipelineDescr {
+            name: "protected-race".to_string(),
+            description: "".to_string(),
+            tags: vec![],
+            runtime_config: json!({}),
+            program_code: "".to_string(),
+            udf_rust: "".to_string(),
+            udf_toml: "".to_string(),
+            program_config: json!({}),
+        },
+    ).await.unwrap();
+    let mut stale = handle.db.writer_owner_pool.get().await.unwrap();
+    let stale_tx = stale.transaction().await.unwrap();
+    let pid: i32 = stale_tx.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+    stale_tx.query_one("SELECT pg_advisory_xact_lock(12345)", &[]).await.unwrap();
+    assert!(stale_tx.query_opt(
+        "SELECT 1 FROM pipeline_writer_owner WHERE pipeline_id=$1", &[&pipeline.id.0]
+    ).await.unwrap().is_none());
+    let db = handle.db.pool.get().await.unwrap();
+    db.query_one("SELECT pg_terminate_backend($1)", &[&pid]).await.unwrap();
+    db.execute(
+        "INSERT INTO pipeline_writer_owner (tenant_id,pipeline_name,pipeline_id,pipeline_version,\
+         claim_uid,scope_sha256,reservation_id,generation,nonce,phase,fence_id) \
+         VALUES ($1,'protected-race',$2,1,'claim','scope','reservation',1,'nonce','prepared',$3)",
+        &[&tenant.0, &pipeline.id.0, &Uuid::now_v7()],
+    ).await.unwrap();
+    for sql in [
+        "UPDATE pipeline SET program_code='different' WHERE id=$1",
+        "UPDATE pipeline SET deployment_resources_desired_status='provisioned' WHERE id=$1",
+        "UPDATE pipeline SET storage_status='clearing' WHERE id=$1",
+        "DELETE FROM pipeline WHERE id=$1",
+    ] {
+        assert!(db.execute(sql, &[&pipeline.id.0]).await.is_err(), "{sql}");
+    }
+    let row = db.query_one(
+        "SELECT program_code,deployment_resources_desired_status,storage_status FROM pipeline WHERE id=$1",
+        &[&pipeline.id.0],
+    ).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "");
+    assert_eq!(row.get::<_, String>(1), "stopped");
+    assert_eq!(row.get::<_, String>(2), "cleared");
+}
+
 /// Creation of pipelines.
 #[tokio::test]
 async fn pipeline_creation() {
