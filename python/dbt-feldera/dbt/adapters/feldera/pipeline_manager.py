@@ -1,7 +1,7 @@
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import agate
 
@@ -13,6 +13,24 @@ from feldera.rest.feldera_client import FelderaClient
 from feldera.runtime_config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
+
+_pre_start_hook: tuple[Optional[Callable[[Pipeline], None]], bool] = (None, False)
+
+
+def set_pre_start_hook(callback: Optional[Callable[[Pipeline], None]], *, required: bool = False) -> None:
+    """Set a process-local admission callback, or require one before starting."""
+    global _pre_start_hook
+    _pre_start_hook = (callback, required)
+
+
+def _admit_start(pipeline: Pipeline) -> None:
+    callback, required = _pre_start_hook
+    if callback is None:
+        if required:
+            raise RuntimeError("A pre-start admission hook is required")
+    else:
+        callback(pipeline)
+
 
 _RUNTIME_DEFAULTS = {
     "hosts": 1,
@@ -342,6 +360,7 @@ class PipelineStateManager:
             p = builder.create_or_replace(wait=True)
             logger.info("Pipeline '%s' compiled successfully, starting...", pipeline)
 
+            _admit_start(p)
             p.start()
             p.wait_for_status(PipelineStatus.RUNNING, timeout=timeout)
             logger.info("Pipeline '%s' is running", pipeline)
@@ -480,6 +499,7 @@ class PipelineStateManager:
 
             logger.info("Pipeline '%s' recompiled with views, starting...", pipeline)
 
+            _admit_start(p)
             p.start()
             p.wait_for_status(PipelineStatus.RUNNING, timeout=timeout)
             logger.info("Pipeline '%s' is running with views", pipeline)
