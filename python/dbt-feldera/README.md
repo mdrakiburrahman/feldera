@@ -150,7 +150,9 @@ For project-wide view output connectors, override the dispatched
 {% endmacro %}
 ```
 
-The default returns an empty list. Explicit model `connectors` overrides the
+`model_name` is the unquoted relation identifier, including any dbt alias or
+version suffix; use it for sink paths to match the created view. The default
+returns an empty list. Explicit model `connectors` overrides the
 hook, including an empty list to disable output. Table models do not use it.
 dbt's `dispatch` configuration for the `dbt` namespace can control
 package search order.
