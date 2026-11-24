@@ -105,8 +105,7 @@ class TestConvertAgateRows(unittest.TestCase):
     agate Table → Python types (Decimal, datetime, bool, str) →
     JSON-safe dicts → Feldera HTTP ingress.
 
-    The SQL type system (DECIMAL vs DOUBLE) is a separate concern
-    handled by column_types overrides.
+    Inferred and overridden SQL types determine the JSON representation.
     """
 
     def _make_table(self, rows, column_names, column_types=None):
@@ -159,30 +158,46 @@ class TestConvertAgateRows(unittest.TestCase):
         self.assertEqual(result[0]["value"], 42)
         self.assertIsInstance(result[0]["value"], int)
 
-    def test_normal_decimal_float_becomes_string(self):
+    def test_inferred_double_uses_json_numbers_and_preserves_nulls(self):
         from decimal import Decimal
 
-        table = self._make_table([(Decimal("3.14"),)], ["value"])
+        table = self._make_table([(Decimal("3.14"),), (Decimal("42"),), (None,)], ["value"])
         result = FelderaAdapter._convert_agate_rows(table)
-        # Fractional decimals are preserved as strings for exact representation
-        self.assertEqual(result[0]["value"], "3.14")
-        self.assertIsInstance(result[0]["value"], str)
+        self.assertEqual(result, [{"value": 3.14}, {"value": 42.0}, {"value": None}])
+        self.assertIsInstance(result[0]["value"], float)
 
-    def test_nan_with_double_caster_becomes_string(self):
-        """DOUBLE column_types override uses str(), so NaN becomes "NaN"."""
+    def test_nan_with_double_caster_becomes_none(self):
         from decimal import Decimal
 
         table = self._make_table([(Decimal("NaN"),)], ["value"])
         result = FelderaAdapter._convert_agate_rows(table, column_types={"value": "DOUBLE"})
-        self.assertEqual(result[0]["value"], "NaN")
+        self.assertIsNone(result[0]["value"])
 
-    def test_infinity_with_real_caster_becomes_string(self):
-        """REAL column_types override uses str(), so Infinity becomes "Infinity"."""
+    def test_infinity_with_real_caster_becomes_none(self):
         from decimal import Decimal
 
         table = self._make_table([(Decimal("Infinity"),)], ["value"])
         result = FelderaAdapter._convert_agate_rows(table, column_types={"value": "REAL"})
-        self.assertEqual(result[0]["value"], "Infinity")
+        self.assertIsNone(result[0]["value"])
+
+    def test_explicit_types_choose_correct_json_values(self):
+        from decimal import Decimal
+
+        table = self._make_table(
+            [(Decimal("0.1"), Decimal("0.1"), Decimal("3"), Decimal("0.1"))],
+            ["fixed", "floating", "integer", "text"],
+        )
+        result = FelderaAdapter._convert_agate_rows(
+            table, {"fixed": "DECIMAL(20, 6)", "floating": "REAL", "integer": "BIGINT", "text": "VARCHAR"}
+        )
+        self.assertEqual(result, [{"fixed": "0.1", "floating": 0.1, "integer": 3, "text": "0.1"}])
+
+    def test_unrepresentable_double_is_rejected(self):
+        from decimal import Decimal
+
+        table = self._make_table([(Decimal("1e1000"),)], ["value"])
+        with self.assertRaisesRegex(ValueError, "Non-finite floating point"):
+            FelderaAdapter._convert_agate_rows(table, {"value": "DOUBLE"})
 
     def test_decimal_type_preserves_exact_value(self):
         """DECIMAL column_types override uses string for exact representation."""
