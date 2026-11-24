@@ -113,11 +113,10 @@ def run_unit_test(client, sql, expected_rows, expected_sql, render_expected, udf
         )
         pipeline.modify(sql=actual_sql + "\n\n" + expected)
         PipelineStateManager._wait_for_compilation(pipeline, timeout)
-        _inspect(pipeline, {"dbt_unit_actual", "dbt_unit_expected"})
         previous = getattr(_admission_context, "pipeline", None)
         _admission_context.pipeline = pipeline
         try:
-            admitted = _admit_start(pipeline)
+            admitted = _admit_start(pipeline, lambda: _inspect(pipeline, {"dbt_unit_actual", "dbt_unit_expected"}))
         finally:
             _admission_context.pipeline = previous
         _start_admitted(pipeline, admitted)

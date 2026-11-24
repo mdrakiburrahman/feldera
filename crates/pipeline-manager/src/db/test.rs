@@ -5059,7 +5059,7 @@ async fn pipeline_conditional_start_guard() {
     };
     assert!(matches!(
         start(pipeline.id, Version(1), "v0").await,
-        Err(DBError::PreconditionViolation { .. })
+        Err(DBError::ConditionalStartPrecondition { .. })
     ));
     db.transit_program_status_to_compiling_sql(tenant, pipeline.id, Version(1))
         .await
@@ -5105,11 +5105,11 @@ async fn pipeline_conditional_start_guard() {
     .unwrap();
     assert!(matches!(
         start(PipelineId(Uuid::now_v7()), Version(1), "v0").await,
-        Err(DBError::PreconditionViolation { .. })
+        Err(DBError::ConditionalStartPrecondition { .. })
     ));
     assert!(matches!(
         start(pipeline.id, Version(1), "v1").await,
-        Err(DBError::PreconditionViolation { .. })
+        Err(DBError::ConditionalStartPrecondition { .. })
     ));
     assert_eq!(
         db.get_pipeline(tenant, "guarded")
@@ -5126,6 +5126,10 @@ async fn pipeline_conditional_start_guard() {
             .deployment_resources_desired_status,
         ResourcesDesiredStatus::Provisioned
     );
+    assert!(matches!(
+        start(pipeline.id, Version(1), "v0").await,
+        Err(DBError::ConditionalStartPrecondition { .. })
+    ));
     db.set_deployment_resources_desired_status_stopped(tenant, "guarded")
         .await
         .unwrap();
@@ -5137,7 +5141,7 @@ async fn pipeline_conditional_start_guard() {
         "v0",
         false,
         &Some(json!({"workers": 2})),
-        &Some("select 2".to_string()),
+        &None,
         &None,
         &None,
         &None,
@@ -5155,6 +5159,32 @@ async fn pipeline_conditional_start_guard() {
             .deployment_resources_desired_status,
         ResourcesDesiredStatus::Stopped
     );
+    db.update_pipeline(
+        tenant,
+        "guarded",
+        &None,
+        &PatchClientMetadata::default(),
+        "v0",
+        false,
+        &None,
+        &Some("select 2".to_string()),
+        &None,
+        &None,
+        &None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        start(pipeline.id, Version(2), "v0").await,
+        Err(DBError::OutdatedPipelineVersion { .. })
+    ));
+    assert_eq!(
+        db.get_pipeline(tenant, "guarded")
+            .await
+            .unwrap()
+            .deployment_resources_desired_status,
+        ResourcesDesiredStatus::Stopped
+    );
     db.delete_pipeline(tenant, "guarded").await.unwrap();
     let replacement = db
         .new_pipeline(tenant, Uuid::now_v7(), "v0", desc)
@@ -5163,7 +5193,7 @@ async fn pipeline_conditional_start_guard() {
     assert_ne!(replacement.id, pipeline.id);
     assert!(matches!(
         start(pipeline.id, Version(1), "v0").await,
-        Err(DBError::PreconditionViolation { .. })
+        Err(DBError::ConditionalStartPrecondition { .. })
     ));
     assert_eq!(
         db.get_pipeline(tenant, "guarded")

@@ -2016,8 +2016,8 @@ async fn post_pipeline_start_inner(
             .await?
         }
         _ => {
-            return Err(DBError::PreconditionViolation {
-                precondition: "expected_pipeline_id and expected_version must be provided together"
+            return Err(DBError::ConditionalStartPrecondition {
+                reason: "expected_pipeline_id and expected_version must be provided together"
                     .to_string(),
             }
             .into());
@@ -2962,6 +2962,139 @@ mod tests {
             ),
         ] {
             assert_eq!(backward_compatible_runtime_status_details(input), expected);
+        }
+    }
+
+    #[actix_web::test]
+    async fn conditional_start_http_guards() {
+        use crate::api::main::ServerState;
+        use crate::db::storage::Storage;
+        use crate::db::test::setup_pg;
+        use crate::db::types::pipeline::PipelineDescr;
+        use crate::db::types::program::{ProgramInfo, RustCompilationInfo, SqlCompilationInfo};
+        use crate::db::types::resources_status::ResourcesDesiredStatus;
+        use crate::db::types::tenant::TenantId;
+        use crate::db::types::version::Version;
+        use actix_web::{App, HttpMessage, test, web};
+        use feldera_types::program_schema::ProgramSchema;
+        use std::{collections::BTreeMap, sync::Arc};
+        use tokio::sync::Mutex;
+        use uuid::Uuid;
+
+        let (db, _temp) = setup_pg().await;
+        let db = Arc::new(Mutex::new(db));
+        let state = ServerState::test_state(db.clone()).await;
+        let platform = state.common_config.platform_version.clone();
+        let tenant = TenantId(Uuid::nil());
+        let id = Uuid::now_v7();
+        {
+            let db = db.lock().await;
+            let p = db
+                .new_pipeline(
+                    tenant,
+                    id,
+                    &platform,
+                    PipelineDescr {
+                        name: "test".to_string(),
+                        description: String::new(),
+                        tags: vec![],
+                        runtime_config: json!({}),
+                        program_code: String::new(),
+                        udf_rust: String::new(),
+                        udf_toml: String::new(),
+                        program_config: json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+            db.transit_program_status_to_compiling_sql(tenant, p.id, Version(1))
+                .await
+                .unwrap();
+            db.transit_program_status_to_sql_compiled(
+                tenant,
+                p.id,
+                Version(1),
+                &SqlCompilationInfo {
+                    exit_code: 0,
+                    messages: vec![],
+                },
+                &serde_json::to_value(ProgramInfo {
+                    schema: serde_json::to_value(ProgramSchema {
+                        inputs: vec![],
+                        outputs: vec![],
+                    })
+                    .unwrap(),
+                    main_rust: String::new(),
+                    udf_stubs: String::new(),
+                    input_connectors: BTreeMap::new(),
+                    output_connectors: BTreeMap::new(),
+                    circuit_ir: None,
+                    dataflow: None,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            db.transit_program_status_to_compiling_rust(tenant, p.id, Version(1))
+                .await
+                .unwrap();
+            db.transit_program_status_to_success(
+                tenant,
+                p.id,
+                Version(1),
+                &RustCompilationInfo::from_process_output_streams(0, String::new(), String::new()),
+                "def",
+                "123",
+                "456",
+            )
+            .await
+            .unwrap();
+        }
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .service(super::post_pipeline_start_if_current),
+        )
+        .await;
+        for (query, expected) in [
+            (String::new(), 409),
+            (
+                format!("?expected_pipeline_id={id}&expected_version=2"),
+                409,
+            ),
+            (
+                format!(
+                    "?expected_pipeline_id={}&expected_version=1",
+                    Uuid::now_v7()
+                ),
+                409,
+            ),
+            (
+                format!("?expected_pipeline_id={id}&expected_version=1"),
+                202,
+            ),
+        ] {
+            let req = test::TestRequest::post()
+                .uri(&format!("/pipelines/test/start-if-current{query}"))
+                .to_request();
+            req.extensions_mut().insert(tenant);
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status().as_u16(), expected);
+            let desired = db
+                .lock()
+                .await
+                .get_pipeline(tenant, "test")
+                .await
+                .unwrap()
+                .deployment_resources_desired_status;
+            assert_eq!(
+                desired,
+                if expected == 202 {
+                    ResourcesDesiredStatus::Provisioned
+                } else {
+                    ResourcesDesiredStatus::Stopped
+                }
+            );
         }
     }
 
