@@ -633,6 +633,25 @@ class FelderaAdapter(BaseAdapter):
 
         return ""
 
+    @available
+    def run_isolated_unit_test(
+        self, sql, expected_rows, expected_sql, render_expected, udf_sql_path, udf_rust_path, udf_toml_path
+    ):
+        from dbt.adapters.feldera.isolated_unit import run_unit_test
+
+        udf_sql, udf_rust, udf_toml = self._read_udfs(udf_sql_path, udf_rust_path, udf_toml_path)
+        return run_unit_test(
+            self._get_client(),
+            sql,
+            expected_rows,
+            expected_sql,
+            render_expected,
+            udf_sql,
+            udf_rust,
+            udf_toml,
+            self._get_credentials().timeout,
+        )
+
     def _read_udfs(self, sql_path: str | None, rust_path: str | None, toml_path: str | None) -> tuple[str, str, str]:
         def read_file(path: str | None) -> str:
             return (Path(self.config.project_root) / path).read_text(encoding="utf-8") if path else ""
