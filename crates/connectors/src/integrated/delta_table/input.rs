@@ -136,6 +136,7 @@ static MAX_CONCURRENT_READERS: AtomicUsize = AtomicUsize::new(0);
 struct DataFileBudget {
     limit: u64,
     reserved: AtomicU64,
+    fence: Option<String>,
 }
 
 impl DataFileBudget {
@@ -161,6 +162,7 @@ fn data_file_budget(
     pipeline: Option<&str>,
     endpoint: &str,
     limit: Option<u64>,
+    fence: Option<&str>,
 ) -> AnyResult<Option<Arc<DataFileBudget>>> {
     let Some(pipeline) = pipeline.filter(|name| !name.is_empty()) else {
         if limit.is_some() {
@@ -174,14 +176,33 @@ fn data_file_budget(
         .lock()
         .map_err(|_| anyhow!("data-file budget registry lock poisoned"))?;
     if let Some(budget) = budgets.get(&key) {
-        if limit != Some(budget.limit) {
-            bail!("max_data_file_bytes changed or removed for endpoint '{endpoint}'");
+        if limit != Some(budget.limit) || fence != budget.fence.as_deref() {
+            bail!("data-file budget or fence changed or removed for endpoint '{endpoint}'");
         }
         return Ok(Some(Arc::clone(budget)));
     }
     let Some(limit) = limit else {
         return Ok(None);
     };
+    if let Some(path) = fence {
+        let path = std::path::Path::new(path);
+        let marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| {
+                anyhow!(
+                    "cannot claim data-file budget fence '{}': {e}",
+                    path.display()
+                )
+            })?;
+        marker.sync_all()?;
+        std::fs::File::open(
+            path.parent()
+                .ok_or_else(|| anyhow!("invalid data-file budget fence path"))?,
+        )?
+        .sync_all()?;
+    }
     DATA_FILE_BUDGET_EPOCH.get_or_init(|| {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -190,6 +211,7 @@ fn data_file_budget(
     let budget = Arc::new(DataFileBudget {
         limit,
         reserved: AtomicU64::new(0),
+        fence: fence.map(str::to_owned),
     });
     budgets.insert(key, Arc::clone(&budget));
     Ok(Some(budget))
@@ -201,12 +223,22 @@ mod data_file_budget_tests {
 
     #[test]
     fn concurrent_reservations_and_reopen() {
-        let a = data_file_budget(Some("pipeline-a"), "data-file-budget-test-a", Some(50))
-            .unwrap()
-            .unwrap();
-        let b = data_file_budget(Some("pipeline-a"), "data-file-budget-test-b", Some(50))
-            .unwrap()
-            .unwrap();
+        let a = data_file_budget(
+            Some("pipeline-a"),
+            "data-file-budget-test-a",
+            Some(50),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let b = data_file_budget(
+            Some("pipeline-a"),
+            "data-file-budget-test-b",
+            Some(50),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(20));
         let threads: Vec<_> = (0..20)
             .map(|_| {
@@ -229,17 +261,37 @@ mod data_file_budget_tests {
         assert!(a.reserve(1).is_ok());
         assert!(a.reserve(1).is_err());
         assert!(b.reserve(50).is_ok());
-        let reopened = data_file_budget(Some("pipeline-a"), "data-file-budget-test-a", Some(50))
-            .unwrap()
-            .unwrap();
+        let reopened = data_file_budget(
+            Some("pipeline-a"),
+            "data-file-budget-test-a",
+            Some(50),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(reopened.reserved.load(Ordering::Acquire), 50);
-        assert!(data_file_budget(Some("pipeline-a"), "data-file-budget-test-a", None).is_err());
-        assert!(data_file_budget(Some("pipeline-a"), "data-file-budget-test-a", Some(51)).is_err());
-        let other = data_file_budget(Some("pipeline-b"), "data-file-budget-test-a", Some(50))
-            .unwrap()
-            .unwrap();
+        assert!(
+            data_file_budget(Some("pipeline-a"), "data-file-budget-test-a", None, None).is_err()
+        );
+        assert!(
+            data_file_budget(
+                Some("pipeline-a"),
+                "data-file-budget-test-a",
+                Some(51),
+                None
+            )
+            .is_err()
+        );
+        let other = data_file_budget(
+            Some("pipeline-b"),
+            "data-file-budget-test-a",
+            Some(50),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert!(other.reserve(50).is_ok());
-        assert!(data_file_budget(None, "data-file-budget-test-a", Some(50)).is_err());
+        assert!(data_file_budget(None, "data-file-budget-test-a", Some(50), None).is_err());
     }
 }
 
@@ -1135,6 +1187,7 @@ impl DeltaTableInputReader {
             pipeline_name.as_deref(),
             &endpoint_name,
             config.max_data_file_bytes,
+            config.data_file_budget_fence.as_deref(),
         )?;
 
         if config.end_version.is_some() && !config.follow() {

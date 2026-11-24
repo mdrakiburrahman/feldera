@@ -575,6 +575,11 @@ pub struct DeltaTableReaderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_data_file_bytes: Option<u64>,
 
+    /// Absolute path of a durable, exclusive-create admission marker. Requires
+    /// `max_data_file_bytes` and a shared persistent filesystem across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_file_budget_fence: Option<String>,
+
     /// Transaction mode.
     ///
     /// Determines how the connector breaks up its input into transactions.
@@ -1000,6 +1005,19 @@ fn test_delta_data_file_budget_config() {
     assert!(config.validate().is_ok());
 
     for raw in [
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"off","data_file_budget_fence":"/tmp/fence"}"#,
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"off","max_data_file_bytes":42,"data_file_budget_fence":"relative"}"#,
+    ] {
+        let config: DeltaTableReaderConfig = serde_json::from_str(raw).unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("data_file_budget_fence")
+        );
+    }
+
+    for raw in [
         r#"{"uri":"memory://","mode":"snapshot","max_data_file_bytes":42}"#,
         r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"auto","max_data_file_bytes":42}"#,
         r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"off","timestamp_column":"ts","max_data_file_bytes":42}"#,
@@ -1300,6 +1318,14 @@ impl DeltaTableReaderConfig {
     /// Reject settings the connector cannot act on, so a misconfigured pipeline
     /// fails at startup naming the setting rather than at the first read.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(path) = &self.data_file_budget_fence {
+            if self.max_data_file_bytes.is_none() || !std::path::Path::new(path).is_absolute() {
+                return Err(
+                    "'data_file_budget_fence' requires 'max_data_file_bytes' and an absolute path"
+                        .to_string(),
+                );
+            }
+        }
         if self.max_data_file_bytes.is_some()
             && (!matches!(self.mode, DeltaTableIngestMode::SnapshotAndFollow)
                 || self.reads_change_feed()
