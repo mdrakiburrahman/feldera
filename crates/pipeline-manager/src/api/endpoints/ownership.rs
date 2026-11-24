@@ -372,3 +372,30 @@ pub(crate) async fn advance(
 ) -> Result<HttpResponse, actix_web::Error> {
     transition(state, http, tenant, name, body, true).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_hash_matches_python_ascii_json() {
+        let mut identity = BTreeMap::new();
+        for field in [
+            "cluster_uid", "namespace_uid", "pipeline_name", "pipeline_id", "deployment_name",
+            "deployment_uid", "incarnation", "runtime_pod_uid", "runtime_container_id",
+            "runtime_image_id",
+        ] {
+            identity.insert(field.to_string(), json!("x"));
+        }
+        identity.insert("deployment_name".into(), json!("caf\u{e9}-\u{1f600}"));
+        identity.insert("program_sha256".into(), json!("a".repeat(64)));
+        identity.insert("frozen_admission_sha256".into(), json!("b".repeat(64)));
+        identity.insert("destination_inventory_sha256".into(), json!("c".repeat(64)));
+        identity.insert("program_version".into(), json!(1));
+        identity.insert("deployment_generation".into(), json!(1));
+        assert_eq!(
+            identity_hash(&identity).unwrap(),
+            "e63316854eed1cd704aeab3700095e8d3f2e850e52df55cbc7cef949b0e2cbdb"
+        );
+    }
+}

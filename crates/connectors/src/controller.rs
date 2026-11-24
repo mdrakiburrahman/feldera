@@ -6827,6 +6827,7 @@ impl ControllerInit {
                 clock_timezone_offset: checkpoint_config.global.clock_timezone_offset,
                 pin_cpus: config.global.pin_cpus,
                 provisioning_timeout: config.global.provisioning_timeout,
+                writer_incarnation_fence: config.global.writer_incarnation_fence,
                 max_parallel_connector_init: config.global.max_parallel_connector_init,
                 init_containers: config.global.init_containers,
                 checkpoint_during_suspend: config.global.checkpoint_during_suspend,

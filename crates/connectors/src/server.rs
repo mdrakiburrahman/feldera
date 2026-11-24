@@ -1846,6 +1846,30 @@ async fn protected_writer_http(
     }
 }
 
+#[cfg(test)]
+mod protected_writer_http_tests {
+    use super::*;
+    use actix_web::{middleware::from_fn, test};
+
+    #[actix_web::test]
+    async fn rejects_mutating_engine_requests() {
+        let app = test::init_service(
+            App::new()
+                .wrap(from_fn(protected_writer_http))
+                .route("/stats", web::get().to(|| async { HttpResponse::Ok().finish() }))
+                .route("/pause", web::get().to(|| async { HttpResponse::Ok().finish() }))
+                .route("/ingress/t", web::post().to(|| async { HttpResponse::Ok().finish() })),
+        ).await;
+        for (request, expected) in [
+            (test::TestRequest::get().uri("/stats").to_request(), StatusCode::OK),
+            (test::TestRequest::get().uri("/pause").to_request(), StatusCode::FORBIDDEN),
+            (test::TestRequest::post().uri("/ingress/t").to_request(), StatusCode::FORBIDDEN),
+        ] {
+            assert_eq!(test::call_service(&app, request).await.status(), expected);
+        }
+    }
+}
+
 fn build_app<T>(app: App<T>, state: WebData<ServerState>) -> App<T>
 where
     T: ServiceFactory<ServiceRequest, Config = (), Error = ActixError, InitError = ()>,
