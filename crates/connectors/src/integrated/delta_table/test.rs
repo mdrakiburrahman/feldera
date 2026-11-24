@@ -5876,6 +5876,82 @@ pub fn delta_data_file_budget_test(engine: &dyn PipelineTestEngine) {
 }
 
 #[engine_test(requires(Storage))]
+pub fn delta_data_file_budget_retraction_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        let table_dir = TempDir::new().unwrap();
+        let uri = table_dir.path().to_str().unwrap();
+        let relation = basic_relation();
+        let first = change_feed_row(1, "first");
+        let table = create_table_from_arrow(uri, &change_feed_arrow_schema(), &[]).await;
+        let table = write_data_to_table(table, &relation, std::slice::from_ref(&first)).await;
+        #[allow(deprecated)]
+        let files: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .log_data()
+            .iter()
+            .map(|file| file.add_action().path)
+            .collect();
+        assert_eq!(files.len(), 1);
+        let path = table_dir.path().join(&files[0]);
+        let size = std::fs::metadata(&path).unwrap().len();
+        let storage = TempDir::new().unwrap();
+        let pipeline_config: PipelineConfig = serde_json::from_value(json!({
+            "name": "test", "workers": 4,
+            "storage_config": { "path": storage.path() },
+            "inputs": {
+                "budget_retraction": { "stream": "test_input1", "transport": {
+                    "name": "delta_table_input",
+                    "config": { "uri": uri, "mode": "snapshot_and_follow",
+                        "change_feed": "off", "max_data_file_bytes": size }
+                }}
+            }
+        }))
+        .unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors_copy = Arc::clone(&errors);
+        let pipeline = off_runtime(move || {
+            engine.controller(
+                &identity(&relation, &[Some("output")]),
+                &pipeline_config,
+                Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
+            )
+        })
+        .unwrap();
+        pipeline.start();
+        let relation = basic_relation();
+        let output = SqlIdentifier::from("test_output1");
+        wait_or_connector_error(&pipeline, &output, &relation, &[first], &errors).await;
+        pipeline.pause_input_endpoint("budget_retraction").unwrap();
+        wait(
+            || {
+                pipeline
+                    .is_input_endpoint_paused("budget_retraction")
+                    .unwrap_or(false)
+            },
+            60_000,
+        )
+        .unwrap();
+        let _table = table.delete().await.unwrap().0;
+        std::fs::write(path, vec![0; size as usize]).unwrap();
+        pipeline.start_input_endpoint("budget_retraction").unwrap();
+        wait(
+            || {
+                errors
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.contains("max_data_file_bytes exceeded"))
+            },
+            60_000,
+        )
+        .expect("retraction must reserve before opening the data file");
+        assert!(!errors.lock().unwrap().iter().any(|e| e.contains("Parquet")));
+        pipeline.stop().unwrap();
+    })
+}
+
+#[engine_test(requires(Storage))]
 pub fn delta_follow_retention_policies_test(engine: &dyn PipelineTestEngine) {
     run_async_on(2, async {
         for policy in [None, Some("ignore_changes"), Some("ignore_deletes")] {

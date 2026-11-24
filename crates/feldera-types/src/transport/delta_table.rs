@@ -990,6 +990,31 @@ fn test_delta_ignore_policies_require_file_following() {
 
 #[cfg(test)]
 #[test]
+fn test_delta_data_file_budget_config() {
+    let config: DeltaTableReaderConfig = serde_json::from_str(
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"off","max_data_file_bytes":42}"#,
+    ).unwrap();
+    assert_eq!(config.max_data_file_bytes, Some(42));
+    assert!(config.object_store_config.is_empty());
+    assert!(config.validate().is_ok());
+
+    for raw in [
+        r#"{"uri":"memory://","mode":"snapshot","max_data_file_bytes":42}"#,
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"auto","max_data_file_bytes":42}"#,
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"off","timestamp_column":"ts","max_data_file_bytes":42}"#,
+    ] {
+        let config: DeltaTableReaderConfig = serde_json::from_str(raw).unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("max_data_file_bytes")
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn test_delta_transaction_mode_catchup_serde() {
     let config: DeltaTableReaderConfig = serde_json::from_str(
         r#"{"uri":"s3://bucket/t","mode":"follow","transaction_mode":"catchup"}"#,
