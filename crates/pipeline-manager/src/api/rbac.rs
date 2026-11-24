@@ -732,8 +732,13 @@ mod test {
     /// them explicitly. They are still classified in `ROUTE_MIN_ROLE`, so RBAC
     /// covers them; they are only invisible to the OpenAPI enumeration:
     /// - `.../testing`: a test-only hook intentionally hidden from the spec.
-    const REGISTERED_BUT_UNDOCUMENTED: &[(&str, &str)] =
-        &[("POST", "/v0/pipelines/{pipeline_name}/testing")];
+    const REGISTERED_BUT_UNDOCUMENTED: &[(&str, &str)] = &[
+        ("POST", "/v0/pipelines/{pipeline_name}/testing"),
+        ("PUT", "/v0/pipelines/{pipeline_name}/writer-owner"),
+        ("GET", "/v0/pipelines/{pipeline_name}/writer-owner"),
+        ("POST", "/v0/pipelines/{pipeline_name}/writer-owner/bind"),
+        ("POST", "/v0/pipelines/{pipeline_name}/writer-owner/advance"),
+    ];
 
     /// Deny-by-default has teeth only if every registered route is classified.
     /// Enumerate the `/v0` surface from the OpenAPI document (which mirrors

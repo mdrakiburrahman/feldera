@@ -1928,7 +1928,7 @@ pub(crate) async fn post_pipeline_start(
     path: web::Path<String>,
     query: web::Query<PostStartPipelineParameters>,
 ) -> Result<HttpResponse, ManagerError> {
-    post_pipeline_start_inner(state, tenant_id, path, query, false).await
+    post_pipeline_start_inner(state, tenant_id, path, query, false, None).await
 }
 
 /// Start a pipeline only if its admitted identity and version still match.
@@ -1950,8 +1950,9 @@ pub(crate) async fn post_pipeline_start_if_current(
     tenant_id: ReqData<TenantId>,
     path: web::Path<String>,
     query: web::Query<PostStartPipelineParameters>,
+    writer_start: Option<ReqData<super::ownership::WriterStart>>,
 ) -> Result<HttpResponse, ManagerError> {
-    post_pipeline_start_inner(state, tenant_id, path, query, true).await
+    post_pipeline_start_inner(state, tenant_id, path, query, true, writer_start).await
 }
 
 async fn post_pipeline_start_inner(
@@ -1960,6 +1961,7 @@ async fn post_pipeline_start_inner(
     path: web::Path<String>,
     query: web::Query<PostStartPipelineParameters>,
     require_precondition: bool,
+    writer_start: Option<ReqData<super::ownership::WriterStart>>,
 ) -> Result<HttpResponse, ManagerError> {
     let pipeline_name = path.into_inner();
     let PostStartPipelineParameters {
@@ -1999,6 +2001,22 @@ async fn post_pipeline_start_inner(
                 initial_status,
                 bootstrap_config,
                 dismiss_error,
+            )
+            .await?
+        }
+        (Some(id), Some(version)) if writer_start.is_some() => {
+            let authority = writer_start.as_ref().unwrap();
+            db.start_protected_writer(
+                *tenant_id,
+                &pipeline_name,
+                initial_status,
+                bootstrap_config,
+                dismiss_error,
+                PipelineId(id),
+                Version(version),
+                &state.common_config.platform_version,
+                authority.generation,
+                &authority.nonce,
             )
             .await?
         }

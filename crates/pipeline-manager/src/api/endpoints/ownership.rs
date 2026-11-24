@@ -37,6 +37,12 @@ pub(crate) struct Transition {
     next_nonce: Option<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct WriterStart {
+    pub generation: i64,
+    pub nonce: String,
+}
+
 fn conflict(message: &str) -> HttpResponse {
     HttpResponse::Conflict().json(json!({
         "message": message,
@@ -46,7 +52,7 @@ fn conflict(message: &str) -> HttpResponse {
 }
 
 fn valid_text(value: &str) -> bool {
-    !value.is_empty() && !value.chars().any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+    !value.is_empty() && !value.chars().any(|c| matches!(c, '\r' | '\n' | '\u{0085}' | '\u{2028}' | '\u{2029}'))
 }
 
 fn valid_hash(value: &str) -> bool {
@@ -82,7 +88,7 @@ fn identity_hash(identity: &BTreeMap<String, Value>) -> Result<String, &'static 
     let json = serde_json::to_string(identity).map_err(|_| "cannot encode identity")?;
     let mut ascii = String::new();
     for ch in json.chars() {
-        if ch.is_ascii() {
+        if ch <= '\u{007e}' {
             ascii.push(ch);
         } else {
             for unit in ch.encode_utf16(&mut [0; 2]) {
@@ -151,14 +157,10 @@ pub(crate) async fn guard(
             && phase == "prepared" && header_generation == Some(generation)
             && header_nonce == Some(nonce.as_str())
         {
-            tx.execute(
-                "UPDATE pipeline_writer_owner SET phase='starting' WHERE tenant_id=$1 AND pipeline_name=$2",
-                &[&principal.acting_tenant.0, &name],
-            ).await.map_err(actix_web::error::ErrorServiceUnavailable)?;
-            tx.commit().await.map_err(actix_web::error::ErrorServiceUnavailable)?;
-            return Ok(next.call(req).await?.map_into_boxed_body());
+            req.extensions_mut().insert(WriterStart { generation, nonce });
+        } else {
+            return Ok(req.into_response(conflict("protected pipeline is read-only")));
         }
-        return Ok(req.into_response(conflict("protected pipeline is read-only")));
     }
     let result = next.call(req).await;
     tx.rollback().await.map_err(actix_web::error::ErrorServiceUnavailable)?;

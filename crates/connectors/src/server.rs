@@ -1192,6 +1192,7 @@ pub fn run_server(
     let client_auth = args
         .require_client_certificates
         .then(|| Arc::new(pipeline_client_auth(&args)));
+    let writer_read_only = config.global.writer_incarnation_fence.is_some();
 
     let server = HttpServer::new({
         let client_auth = client_auth.clone();
@@ -1199,6 +1200,10 @@ pub fn run_server(
             let state = state.clone();
             let client_auth = client_auth.clone();
             let app = App::new()
+                .wrap(Condition::new(
+                    writer_read_only,
+                    from_fn(protected_writer_http),
+                ))
                 .wrap(Condition::new(
                     client_auth.is_some(),
                     from_fn(move |req, next| {
@@ -1826,6 +1831,19 @@ async fn authorize_pipeline_caller(
         next,
     )
     .await
+}
+
+async fn protected_writer_http(
+    req: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> Result<ServiceResponse<actix_web::body::BoxBody>, ActixError> {
+    let allowed = req.method() == actix_web::http::Method::GET
+        && matches!(req.match_info().as_str(), "/status" | "/stats" | "/metrics");
+    if allowed {
+        Ok(next.call(req).await?.map_into_boxed_body())
+    } else {
+        Ok(req.into_response(HttpResponse::Forbidden().body("protected writer is read-only")))
+    }
 }
 
 fn build_app<T>(app: App<T>, state: WebData<ServerState>) -> App<T>

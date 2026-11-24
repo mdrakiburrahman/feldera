@@ -1995,6 +1995,56 @@ impl Storage for StoragePostgres {
 }
 
 impl StoragePostgres {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_protected_writer(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+        initial: RuntimeDesiredStatus,
+        bootstrap_config: BootstrapConfig,
+        dismiss_error: bool,
+        expected_id: PipelineId,
+        expected_version: Version,
+        platform_version: &str,
+        generation: i64,
+        nonce: &str,
+    ) -> Result<PipelineId, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let current = operations::pipeline::get_pipeline(&txn, tenant_id, pipeline_name, true).await?;
+        let owner = txn.query_opt(
+            "SELECT pipeline_id,pipeline_version,generation,nonce,phase FROM pipeline_writer_owner \
+             WHERE tenant_id=$1 AND pipeline_name=$2 FOR UPDATE",
+            &[&tenant_id.0, &pipeline_name],
+        ).await?;
+        let valid_owner = owner.is_some_and(|o| {
+            o.get::<_, Uuid>(0) == expected_id.0 && o.get::<_, i64>(1) == expected_version.0
+                && o.get::<_, i64>(2) == generation && o.get::<_, String>(3) == nonce
+                && o.get::<_, String>(4) == "prepared"
+        });
+        if !valid_owner || current.id != expected_id || current.version != expected_version
+            || current.program_status != ProgramStatus::Success
+            || current.program_info.is_none() || current.platform_version != platform_version
+            || current.deployment_resources_status != ResourcesStatus::Stopped
+            || current.deployment_resources_desired_status != ResourcesDesiredStatus::Stopped
+        {
+            return Err(DBError::ConditionalStartPrecondition {
+                reason: "protected start authority or admitted pipeline changed".to_string(),
+            });
+        }
+        txn.query_one("SELECT set_config('feldera.writer_start', '1', true)", &[]).await?;
+        let pipeline_id = operations::pipeline::set_deployment_resources_desired_status(
+            &txn, tenant_id, pipeline_name, ResourcesDesiredStatus::Provisioned,
+            Some(initial), Some(bootstrap_config), dismiss_error,
+        ).await?;
+        txn.execute(
+            "UPDATE pipeline_writer_owner SET phase='starting' WHERE tenant_id=$1 AND pipeline_name=$2",
+            &[&tenant_id.0, &pipeline_name],
+        ).await?;
+        txn.commit().await?;
+        Ok(pipeline_id)
+    }
+
     /// Public mirror of the `Storage::count_pipelines_needing_compilation`
     /// trait method: the enterprise runner derives compiler autoscaling demand
     /// from it but cannot name the crate-private `Storage` trait.
