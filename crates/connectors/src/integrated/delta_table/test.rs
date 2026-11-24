@@ -5766,18 +5766,13 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
 
         let table_dir = TempDir::new().unwrap();
         let uri = table_dir.path().to_str().unwrap();
-        let mut relation = basic_relation();
-        relation
-            .fields
-            .iter_mut()
-            .find(|f| f.name.name() == "s")
-            .unwrap()
-            .columntype = ColumnType::varchar(true);
-        let first = change_feed_row(1, "20260102");
-        let second = change_feed_row(2, "20260103");
-        let excluded = change_feed_row(3, "20250101");
-        let null = json!({ "id": 4, "b": false, "i": null, "s": null });
-        let table = create_table_from_arrow(uri, &arrow_schema_of(&relation.fields), &["s"]).await;
+        let relation = basic_relation();
+        let first = json!({ "id": 1, "b": false, "i": 1, "s": "20260102" });
+        let second = json!({ "id": 2, "b": false, "i": 2, "s": "20260103" });
+        let excluded = json!({ "id": 3, "b": false, "i": 3, "s": "20250101" });
+        let null = json!({ "id": 4, "b": false, "i": null, "s": "20260104" });
+        let table =
+            create_table_from_arrow(uri, &arrow_schema_of(&relation.fields), &["s", "i"]).await;
         let table = write_data_to_table(
             table,
             &relation,
@@ -5807,7 +5802,7 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
         let second_size = size_for("20260103");
         let null_file = adds
             .iter()
-            .find(|add| add.partition_values.get("s").is_some_and(Option::is_none))
+            .find(|add| add.partition_values.get("i").is_some_and(Option::is_none))
             .unwrap();
         let null_path = table_dir.path().join(&null_file.path);
         let null_size = std::fs::metadata(&null_path).unwrap().len();
@@ -5848,7 +5843,7 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
             ),
             (
                 "budget_selected_or",
-                r#"("s" = '20260102' OR "s" = '20260103' OR "s" IS NULL) AND "id" > 0"#,
+                r#"("s" = '20260102' OR "s" = '20260103' OR "i" IS NULL) AND "id" > 0"#,
                 first_size + second_size + null_size,
                 vec![first.clone(), second.clone(), null.clone()],
             ),
@@ -5946,6 +5941,55 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
                 "excluded object was opened"
             );
         }
+        let storage = TempDir::new().unwrap();
+        let config: PipelineConfig = serde_json::from_value(json!({
+            "name": "test", "workers": 4,
+            "storage_config": { "path": storage.path() },
+            "inputs": { "budget_unknown_or": { "stream": "test_input1", "transport": {
+                "name": "delta_table_input", "config": {
+                    "uri": uri, "mode": "snapshot_and_follow", "change_feed": "off",
+                    "filter": r#"("s" ~ '^not-a-date$' OR "id" = 3)"#,
+                    "max_data_file_bytes": first_size + second_size + null_size
+                }
+            }}}
+        }))
+        .unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors_copy = Arc::clone(&errors);
+        let pipeline = off_runtime(move || {
+            engine.controller(
+                &identity(&relation, &[Some("output")]),
+                &config,
+                Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
+            )
+        })
+        .unwrap();
+        pipeline.start();
+        wait(
+            || {
+                errors
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.contains("max_data_file_bytes exceeded"))
+            },
+            60_000,
+        )
+        .expect("an unsupported OR must retain the unproven files");
+        pipeline.stop().unwrap();
+        let mut buffer = [0u8; 4096];
+        let count = unsafe {
+            libc::read(
+                watcher.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        assert_eq!(count, -1, "over-budget snapshot opened a data file");
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     })
 }
 
