@@ -1401,6 +1401,11 @@ export type DeltaTableReaderConfig = {
   cdc_order_by?: string | null
   change_feed?: DeltaTableChangeFeed | null
   /**
+   * Absolute path of a durable, exclusive-create admission marker. Requires
+   * `max_data_file_bytes` and a shared persistent filesystem across restarts.
+   */
+  data_file_budget_fence?: string | null
+  /**
    * Optional timestamp for the snapshot in the ISO-8601/RFC-3339 format, e.g.,
    * "2024-12-09T16:09:53+00:00".
    *
@@ -1609,6 +1614,8 @@ export type DeltaTableReaderConfig = {
     | string
     | null
     | DeltaTableChangeFeed
+    | null
+    | string
     | null
     | string
     | null
