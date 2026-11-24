@@ -4,6 +4,9 @@ The names of tables, columns, functions, user-defined types, field
 names, and other metadata elements used in a SQL query are represented
 by identifiers.
 
+Identifiers are limited to 1024 characters. Longer identifiers are rejected,
+not truncated.
+
 Unquoted identifiers, such as `emp`, are typically composed of
 letters, digits, and underscores, starting with a letter; this is the
 form we recommend.  For compatibility with other SQL dialects, the
