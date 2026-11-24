@@ -7,6 +7,7 @@ import sqlglot
 from sqlglot import exp
 
 from dbt.adapters.contracts.connection import AdapterResponse
+from dbt.adapters.feldera.column import _char_sql_type
 from dbt.adapters.feldera.pipeline_manager import PipelineStateManager, _admit_start, _start_admitted
 from feldera.enums import CompilationProfile, PipelineStatus, ProgramStatus
 from feldera.pipeline import Pipeline
@@ -54,6 +55,8 @@ def _inspect(pipeline, expected_views):
 def _sql_type(column):
     t = column["columntype"]
     name = t["type"]
+    if name == "CHAR":
+        return _char_sql_type(t.get("precision"))
     if name in ("DECIMAL", "NUMERIC") and t.get("precision", -1) > 0:
         return f"{name}({t['precision']},{t.get('scale', 0)})"
     return name
