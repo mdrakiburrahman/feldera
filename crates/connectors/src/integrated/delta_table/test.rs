@@ -5950,6 +5950,30 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
             )
             .is_err()
         );
+        // Local object-store HEAD opens files for metadata; IN_ACCESS witnesses data reads.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        );
+        let access_watcher = unsafe { OwnedFd::from_raw_fd(fd) };
+        for path in [
+            table_dir.path().join(&file_for("20260102").path),
+            table_dir.path().join(&file_for("20260103").path),
+            null_path.clone(),
+            excluded_path.clone(),
+        ] {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let wd = unsafe {
+                libc::inotify_add_watch(access_watcher.as_raw_fd(), path.as_ptr(), libc::IN_ACCESS)
+            };
+            assert!(
+                wd >= 0,
+                "inotify_add_watch: {}",
+                std::io::Error::last_os_error()
+            );
+        }
         let storage = TempDir::new().unwrap();
         let config: PipelineConfig = serde_json::from_value(json!({
             "name": "test", "workers": 4,
@@ -5983,12 +6007,12 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
         let mut buffer = [0u8; 4096];
         let count = unsafe {
             libc::read(
-                watcher.as_raw_fd(),
+                access_watcher.as_raw_fd(),
                 buffer.as_mut_ptr().cast(),
                 buffer.len(),
             )
         };
-        assert_eq!(count, -1, "over-budget snapshot opened a data file");
+        assert_eq!(count, -1, "over-budget snapshot read a data file");
         assert_eq!(
             std::io::Error::last_os_error().kind(),
             std::io::ErrorKind::WouldBlock
