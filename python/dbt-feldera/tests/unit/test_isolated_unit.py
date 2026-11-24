@@ -130,11 +130,13 @@ def test_ambiguous_creation_only_cleans_up_owned_pipeline(owned):
         pipeline.delete.assert_not_called()
 
 
-@pytest.mark.parametrize("command", ["test", "build"])
-def test_unit_only_invocation_does_not_finalize_workload(tmp_path, monkeypatch, command):
+@pytest.mark.parametrize(("command", "expected"), [("test", 1), ("test", 2), ("build", 2)])
+@pytest.mark.parametrize("safe_seed_reuse", [False, True])
+def test_unit_only_invocation_does_not_finalize_workload(tmp_path, monkeypatch, command, expected, safe_seed_reuse):
     (tmp_path / "models").mkdir()
     (tmp_path / "dbt_project.yml").write_text(
         "name: isolation_test\nversion: '1.0'\nconfig-version: 2\nprofile: isolation_test\n"
+        f"vars:\n  feldera_safe_seed_reuse: {str(safe_seed_reuse).lower()}\n"
     )
     (tmp_path / "profiles.yml").write_text(
         "isolation_test:\n  target: dev\n  outputs:\n    dev:\n"
@@ -147,7 +149,6 @@ def test_unit_only_invocation_does_not_finalize_workload(tmp_path, monkeypatch, 
         "    given: []\n    expect:\n      rows: [{id: 1}]\n"
     )
     monkeypatch.chdir(tmp_path)
-    expected = 1 if command == "test" else 2
     table = agate.Table([(1, "actual"), (expected, "expected")], ["id", "actual_or_expected"])
     with (
         patch.object(FelderaAdapter, "list_schemas", return_value=[]),
@@ -159,6 +160,9 @@ def test_unit_only_invocation_does_not_finalize_workload(tmp_path, monkeypatch, 
         result = dbtRunner().invoke(
             [command, "--profiles-dir", str(tmp_path), "--select", "sample", "--no-partial-parse"]
         )
-        assert result.success == (command == "test"), str(result.exception)
+        assert result.success == (expected == 1), str(result.exception)
         assert any(entry.node.resource_type == "unit_test" for entry in result.result.results)
+        assert all(
+            entry.status == "success" for entry in result.result.results if entry.node.resource_type == "operation"
+        )
         finalize.assert_not_called()

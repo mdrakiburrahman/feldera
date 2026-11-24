@@ -22,7 +22,7 @@
             {% set state.failed = true %}
         {% endif %}
     {% endfor %}
-    {% if var('feldera_safe_seed_reuse', false) and state.failed %}
+    {% if var('feldera_safe_seed_reuse', false) and state.deploy and state.failed %}
         {{ exceptions.raise_compiler_error("Safe seed reuse refuses to deploy after a failed or skipped node") }}
     {% endif %}
     {% if state.deploy %}
