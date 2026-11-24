@@ -36,7 +36,6 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
     Volatility,
 };
-use datafusion::object_store::ObjectStoreExt;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, PhysicalExpr, SendableRecordBatchStream,
