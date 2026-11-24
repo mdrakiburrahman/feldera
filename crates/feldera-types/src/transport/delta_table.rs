@@ -567,6 +567,13 @@ pub struct DeltaTableReaderConfig {
     #[serde(default, skip_serializing_if = "is_default")]
     pub ignore_deletes: bool,
 
+    /// Optional per-endpoint limit on logical data-file bytes reserved in this process.
+    /// The complete snapshot is charged before reading, even when filters prune files;
+    /// each followed file read, including retractions, is charged again. Metadata,
+    /// transfer ranges, and retries are not measured. Counters reset on process restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_data_file_bytes: Option<u64>,
+
     /// Transaction mode.
     ///
     /// Determines how the connector breaks up its input into transactions.
@@ -1267,6 +1274,13 @@ impl DeltaTableReaderConfig {
     /// Reject settings the connector cannot act on, so a misconfigured pipeline
     /// fails at startup naming the setting rather than at the first read.
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_data_file_bytes.is_some()
+            && (!matches!(self.mode, DeltaTableIngestMode::SnapshotAndFollow)
+                || self.reads_change_feed()
+                || self.timestamp_column.is_some())
+        {
+            return Err("'max_data_file_bytes' requires 'snapshot_and_follow', change feed off, and no timestamp_column".to_string());
+        }
         if self.ignore_changes || self.ignore_deletes {
             let option = if self.ignore_changes {
                 "ignore_changes"

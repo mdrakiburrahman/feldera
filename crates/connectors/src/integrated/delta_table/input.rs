@@ -131,6 +131,56 @@ const DEFAULT_MAX_CONCURRENT_READERS: usize = 6;
 /// connector initialization.
 static MAX_CONCURRENT_READERS: AtomicUsize = AtomicUsize::new(0);
 
+struct DataFileBudget {
+    limit: u64,
+    reserved: AtomicU64,
+}
+
+impl DataFileBudget {
+    fn reserve(&self, bytes: u64) -> AnyResult<()> {
+        self.reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.limit)
+            })
+            .map(|_| ())
+            .map_err(|used| anyhow!(
+                "max_data_file_bytes exceeded: {used} bytes reserved, {bytes} requested, limit {}",
+                self.limit
+            ))
+    }
+}
+
+// Pipeline members run in separate processes. Keep reservations across reader reopens.
+static DATA_FILE_BUDGETS: OnceLock<Mutex<HashMap<String, Arc<DataFileBudget>>>> = OnceLock::new();
+static DATA_FILE_BUDGET_EPOCH: OnceLock<Duration> = OnceLock::new();
+
+fn data_file_budget(endpoint: &str, limit: Option<u64>) -> AnyResult<Option<Arc<DataFileBudget>>> {
+    let mut budgets = DATA_FILE_BUDGETS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| anyhow!("data-file budget registry lock poisoned"))?;
+    if let Some(budget) = budgets.get(endpoint) {
+        if limit != Some(budget.limit) {
+            bail!("max_data_file_bytes changed or removed for endpoint '{endpoint}'");
+        }
+        return Ok(Some(Arc::clone(budget)));
+    }
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    DATA_FILE_BUDGET_EPOCH.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+    });
+    let budget = Arc::new(DataFileBudget {
+        limit,
+        reserved: AtomicU64::new(0),
+    });
+    budgets.insert(endpoint.to_string(), Arc::clone(&budget));
+    Ok(Some(budget))
+}
+
 /// Format a DataFusion error, appending actionable guidance when the
 /// underlying variant is `ResourcesExhausted` (the shared memory pool ran
 /// out). `find_root` walks past `Context(...)` / `ArrowError(...)` wrappers
@@ -997,8 +1047,12 @@ impl DeltaTableInputReader {
         }
 
         if distributed.is_some() {
+            if config.max_data_file_bytes.is_some() {
+                bail!("'max_data_file_bytes' does not support distributed Delta readers");
+            }
             validate_distributed(&config)?;
         }
+        let data_file_budget = data_file_budget(&endpoint_name, config.max_data_file_bytes)?;
 
         if config.end_version.is_some() && !config.follow() {
             bail!(
@@ -1098,6 +1152,11 @@ impl DeltaTableInputReader {
             resume_info.clone(),
             distributed,
         ));
+        if let Some(budget) = data_file_budget {
+            endpoint.metrics.data_file_budget.set(budget).map_err(|_| {
+                anyhow!("data-file budget initialized twice for endpoint '{endpoint_name}'")
+            })?;
+        }
 
         // This is needed to initialize completed_frontier for the connector. It's not ideal, as the completion
         // status for the frontier will be set to the current time instead of whenever the table version in resume_info
@@ -1343,6 +1402,7 @@ enum DeltaPhase {
 }
 
 struct DeltaTableMetrics {
+    data_file_budget: OnceLock<Arc<DataFileBudget>>,
     /// Current phase of the connector (see [DeltaPhase]).
     phase: Atomic<DeltaPhase>,
     /// Unix epoch seconds when this run finished reading the snapshot; 0 if
@@ -1374,6 +1434,7 @@ const VERSION_METRIC_UNSET: u64 = u64::MAX;
 impl DeltaTableMetrics {
     fn new() -> Self {
         Self {
+            data_file_budget: OnceLock::new(),
             phase: Atomic::new(DeltaPhase::LoadingSnapshot),
             snapshot_completed_ts: AtomicU64::new(0),
             snapshot_records_total: AtomicU64::new(0),
@@ -1421,7 +1482,7 @@ impl DeltaTableMetrics {
 
 impl ConnectorMetrics for DeltaTableMetrics {
     fn metrics(&self) -> Vec<(&'static str, &'static str, ValueType, f64)> {
-        vec![
+        let mut metrics = vec![
             (
                 "input_connector_delta_phase",
                 "Current phase: 0=loading_snapshot, 1=follow/streaming, 2=completed.",
@@ -1477,7 +1538,45 @@ impl ConnectorMetrics for DeltaTableMetrics {
                 ValueType::Counter,
                 self.commits_from_file_actions.load(Ordering::Relaxed) as f64,
             ),
-        ]
+        ];
+        if let Some(budget) = self.data_file_budget.get() {
+            let epoch = DATA_FILE_BUDGET_EPOCH
+                .get()
+                .expect("budget epoch initialized");
+            metrics.extend([
+                (
+                    "input_connector_delta_data_file_bytes_reserved",
+                    "Logical data-file bytes reserved in this process.",
+                    ValueType::Gauge,
+                    budget.reserved.load(Ordering::Acquire) as f64,
+                ),
+                (
+                    "input_connector_delta_data_file_bytes_limit",
+                    "Per-endpoint logical data-file byte limit.",
+                    ValueType::Gauge,
+                    budget.limit as f64,
+                ),
+                (
+                    "input_connector_delta_budget_process_id",
+                    "Process ID holding the data-file budget.",
+                    ValueType::Gauge,
+                    std::process::id() as f64,
+                ),
+                (
+                    "input_connector_delta_budget_epoch_seconds",
+                    "Seconds of the process budget registry incarnation.",
+                    ValueType::Gauge,
+                    epoch.as_secs() as f64,
+                ),
+                (
+                    "input_connector_delta_budget_epoch_nanos",
+                    "Nanoseconds of the process budget registry incarnation.",
+                    ValueType::Gauge,
+                    epoch.subsec_nanos() as f64,
+                ),
+            ]);
+        }
+        metrics
     }
 }
 
@@ -3279,6 +3378,26 @@ impl DeltaTableInputEndpointInner {
             &self.endpoint_name,
         );
 
+        if self.metrics.data_file_budget.get().is_some() {
+            let snapshot = table.snapshot().map_err(|e| {
+                ControllerError::input_transport_error(
+                    &self.endpoint_name,
+                    true,
+                    anyhow!("error accessing Delta snapshot: {e}"),
+                )
+            })?;
+            #[allow(deprecated)]
+            let paths: Vec<String> = snapshot
+                .log_data()
+                .iter()
+                .map(|file| file.add_action().path)
+                .collect();
+            for path in paths {
+                self.reserve_data_file(table, &path).await.map_err(|e| {
+                    ControllerError::input_transport_error(&self.endpoint_name, true, e)
+                })?;
+            }
+        }
         let provider = table.table_provider().await.map_err(|e| {
             ControllerError::input_transport_error(
                 &self.endpoint_name,
@@ -5072,6 +5191,23 @@ impl DeltaTableInputEndpointInner {
         .await
     }
 
+    async fn reserve_data_file(&self, table: &DeltaTable, path: &str) -> AnyResult<()> {
+        let Some(budget) = self.metrics.data_file_budget.get() else {
+            return Ok(());
+        };
+        let location =
+            Path::parse(path).map_err(|e| anyhow!("invalid data-file path '{path}': {e}"))?;
+        let metadata = table
+            .log_store()
+            .object_store()
+            .head(&location)
+            .await
+            .map_err(|e| anyhow!("cannot determine data-file size for '{path}': {e}"))?;
+        let size = u64::try_from(metadata.size)
+            .map_err(|_| anyhow!("invalid data-file size for '{path}'"))?;
+        budget.reserve(size)
+    }
+
     /// Decode a deletion vector into its bitmap of row positions, or the empty
     /// set when there is no active DV. Retries transient object-store failures.
     async fn decode_dv(
@@ -5286,6 +5422,7 @@ impl DeltaTableInputEndpointInner {
         receiver: &mut Receiver<PipelineState>,
         start_transaction: Option<Option<String>>,
     ) -> AnyResult<()> {
+        self.reserve_data_file(table, path).await?;
         let description = format!("file '{path}'");
         let read_schema = self.physical_read_schema(|name| self.needs_column(name))?;
 
@@ -5346,6 +5483,7 @@ impl DeltaTableInputEndpointInner {
             // empty delta means the rewrite left this side unchanged, so there
             // is nothing to emit.
             Some(positions) if !positions.is_empty() => {
+                self.reserve_data_file(table, path).await?;
                 let description = format!("file '{path}'");
                 let provider = self
                     .file_provider(
