@@ -5766,13 +5766,24 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
 
         let table_dir = TempDir::new().unwrap();
         let uri = table_dir.path().to_str().unwrap();
-        let relation = basic_relation();
+        let mut relation = basic_relation();
+        relation
+            .fields
+            .iter_mut()
+            .find(|f| f.name.name() == "s")
+            .unwrap()
+            .columntype = ColumnType::varchar(true);
         let first = change_feed_row(1, "20260102");
         let second = change_feed_row(2, "20260103");
         let excluded = change_feed_row(3, "20250101");
-        let table = create_table_from_arrow(uri, &change_feed_arrow_schema(), &["s"]).await;
-        let table =
-            write_data_to_table(table, &relation, &[first.clone(), second.clone(), excluded]).await;
+        let null = json!({ "id": 4, "b": false, "i": null, "s": null });
+        let table = create_table_from_arrow(uri, &arrow_schema_of(&relation.fields), &["s"]).await;
+        let table = write_data_to_table(
+            table,
+            &relation,
+            &[first.clone(), second.clone(), excluded, null.clone()],
+        )
+        .await;
         #[allow(deprecated)]
         let adds: Vec<_> = table
             .snapshot()
@@ -5781,7 +5792,7 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
             .iter()
             .map(|file| file.add_action())
             .collect();
-        assert_eq!(adds.len(), 3);
+        assert_eq!(adds.len(), 4);
         let file_for = |value: &str| {
             adds.iter()
                 .find(|add| add.partition_values.get("s").and_then(|v| v.as_deref()) == Some(value))
@@ -5794,6 +5805,12 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
         };
         let first_size = size_for("20260102");
         let second_size = size_for("20260103");
+        let null_file = adds
+            .iter()
+            .find(|add| add.partition_values.get("s").is_some_and(Option::is_none))
+            .unwrap();
+        let null_path = table_dir.path().join(&null_file.path);
+        let null_size = std::fs::metadata(&null_path).unwrap().len();
         let excluded_path = table_dir.path().join(&file_for("20250101").path);
         let excluded_size = std::fs::metadata(&excluded_path).unwrap().len();
         std::fs::write(&excluded_path, vec![0; excluded_size as usize]).unwrap();
@@ -5819,6 +5836,7 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
         };
         let first_watch = watch(&table_dir.path().join(&file_for("20260102").path));
         let second_watch = watch(&table_dir.path().join(&file_for("20260103").path));
+        let null_watch = watch(&null_path);
         let excluded_watch = watch(&excluded_path);
 
         for (alias, filter, size, expected) in [
@@ -5830,9 +5848,9 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
             ),
             (
                 "budget_selected_or",
-                r#"("s" = '20260102' OR "s" = '20260103') AND "id" > 0"#,
-                first_size + second_size,
-                vec![first.clone(), second.clone()],
+                r#"("s" = '20260102' OR "s" = '20260103' OR "s" IS NULL) AND "id" > 0"#,
+                first_size + second_size + null_size,
+                vec![first.clone(), second.clone(), null.clone()],
             ),
         ] {
             let storage = TempDir::new().unwrap();
@@ -5907,16 +5925,21 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
                 opened.contains(&first_watch),
                 "selected object was not observed opening"
             );
-            if expected.len() == 2 {
+            if expected.len() == 3 {
                 assert!(
                     opened.contains(&second_watch),
                     "second selected object was not observed opening"
+                );
+                assert!(
+                    opened.contains(&null_watch),
+                    "NULL partition was not observed opening"
                 );
             } else {
                 assert!(
                     !opened.contains(&second_watch),
                     "unselected object was opened"
                 );
+                assert!(!opened.contains(&null_watch), "NULL partition was opened");
             }
             assert!(
                 !opened.contains(&excluded_watch),
