@@ -7,6 +7,8 @@ from datetime import datetime
 import agate
 import sqlglot
 from sqlglot import exp
+from sqlglot.dialects.dialect import Dialect
+from sqlglot.tokens import Tokenizer, TokenType
 
 from dbt.adapters.contracts.connection import AdapterResponse
 from dbt.adapters.feldera.column import _char_sql_type
@@ -20,14 +22,23 @@ from feldera.runtime_config import RuntimeConfig
 _admission_context = threading.local()
 
 
+class _UnitDialect(Dialect):
+    class Tokenizer(Tokenizer):
+        KEYWORDS = {**Tokenizer.KEYWORDS, "ROW": TokenType.STRUCT}
+
+
 def is_isolated_unit_pipeline(pipeline):
     """Identify the exact validated scratch instance during its admission callback."""
     return pipeline is not None and getattr(_admission_context, "pipeline", None) is pipeline
 
 
 def _query_only(sql):
-    statements = [stmt for stmt in sqlglot.parse(sql) if stmt is not None]
-    if len(statements) != 1 or not isinstance(statements[0], exp.Query):
+    statements = [stmt for stmt in sqlglot.parse(sql, dialect=_UnitDialect) if stmt is not None]
+    if (
+        len(statements) != 1
+        or not isinstance(statements[0], exp.Query)
+        or any(statements[0].find_all(exp.DML, exp.DDL, exp.Into, exp.Command))
+    ):
         raise ValueError("A dbt unit test must contain exactly one query")
 
 

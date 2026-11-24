@@ -3,11 +3,13 @@ from unittest.mock import Mock, patch
 import agate
 import pytest
 from feldera.enums import PipelineStatus
+from sqlglot.errors import ParseError
 
 from dbt.adapters.contracts.connection import AdapterResponse
 from dbt.adapters.feldera.impl import FelderaAdapter
 from dbt.adapters.feldera.isolated_unit import (
     _normalize_expected_rows,
+    _query_only,
     _sql_type,
     is_isolated_unit_pipeline,
     run_unit_test,
@@ -42,6 +44,25 @@ def test_expected_timestamp_normalization_is_typed_and_preserves_values():
         {"Ts": None},
     ]
     assert rows[0]["Ts"] == "2026-02-02T00:00:00.123456789"
+
+
+def test_query_validation_supports_named_row_cast():
+    _query_only("select cast(row('alpha', 7) as row(name varchar, amount integer)) as value")
+    _query_only("select cast(row(';drop table t', 7) as row(name varchar, amount integer)) as value")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select 1; drop table t",
+        "select 1 into t",
+        "with changed as (delete from t returning *) select * from changed",
+        "select cast(row('x') as row(name NO_TYPE))",
+    ],
+)
+def test_query_validation_rejects_mutation_and_unparsed_sql(sql):
+    with pytest.raises((ValueError, ParseError)):
+        _query_only(sql)
 
 
 def _info(outputs, inputs=None):
