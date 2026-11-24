@@ -68,7 +68,10 @@ class TestPipelineStateManager(unittest.TestCase):
         self.assertEqual(program, "")
 
     def test_assembly_is_stable_and_dependency_aware(self):
-        tables = {"z_input": "CREATE TABLE z_input (id INT)", "a_input": "CREATE TABLE a_input (id INT)"}
+        tables = {
+            "z_input": "CREATE TABLE z_input (items ROW(value INT) ARRAY, id INT)",
+            "a_input": "CREATE TABLE a_input (items ROW(value INT) ARRAY, id INT)",
+        }
         views = {
             "a_result": "CREATE VIEW a_result AS SELECT * FROM z_base",
             "z_base": "CREATE VIEW z_base AS SELECT * FROM z_input",
@@ -95,6 +98,19 @@ class TestPipelineStateManager(unittest.TestCase):
         self.manager.register_view("pipe", "ZBase", 'CREATE VIEW "ZBase" AS SELECT * FROM a_result')
         with self.assertRaisesRegex(RuntimeError, "dependency cycle"):
             self.manager.assemble_program("pipe")
+
+    def test_dependency_order_preserves_calcite_row_casts(self):
+        ddl = (
+            'CREATE MATERIALIZED VIEW "a_result" WITH (\'connectors\' = \'[]\') AS '
+            'SELECT CAST(ROW(id, ARRAY[ROW(id)], id) AS '
+            'ROW(resource_type STRING, resources ROW(value BIGINT) ARRAY, replica_count INT)) '
+            'AS payload FROM "ZBase"'
+        )
+        self.manager.register_view("pipe", "a_result", ddl)
+        self.manager.register_view("pipe", "ZBase", 'CREATE VIEW "ZBase" AS SELECT 1 AS id')
+        program = self.manager.assemble_program("pipe")
+        self.assertLess(program.index('CREATE VIEW "ZBase"'), program.index('CREATE MATERIALIZED VIEW "a_result"'))
+        self.assertIn(ddl + ";", program)
 
     def test_assemble_program_semicolons(self):
         """Each statement should end with a semicolon."""

@@ -270,13 +270,13 @@ class PipelineStateManager:
         from sqlglot import exp
         from sqlglot.optimizer.scope import traverse_scope
 
-        from dbt.adapters.feldera.sqlglot_parser import FelderaDialect, parser
+        from dbt.adapters.feldera.sqlglot_parser import FelderaDependencyDialect, parser
 
-        tables = sorted(table_ddls, key=lambda ddl: sorted(parser.extract_table_names([ddl])))
+        tables = sorted(table_ddls)
         views = {}
         dependencies = {}
         for ddl in view_ddls:
-            statement = sqlglot.parse_one(ddl, dialect=FelderaDialect)
+            statement = sqlglot.parse_one(ddl, dialect=FelderaDependencyDialect)
             if not isinstance(statement, exp.Create) or not isinstance(statement.this, exp.Table):
                 raise RuntimeError("Cannot determine dependencies of a registered view")
             name = parser._normalize_identifier(statement.this)
