@@ -309,6 +309,26 @@ clears state. Seed runs still replace the pipeline and reload seed data.
 Tests in `dbt build` run before the on-run-end deployment; deploy models with
 `dbt run` before testing a new or changed pipeline.
 
+An in-process runner can register a synchronous admission callback before
+invoking dbt. It receives the compiled SDK `Pipeline` immediately before
+start; an exception prevents that start. No callback is required by default.
+Set `required=True` to fail closed when no callback is registered, and clear
+the process-local setting after the invocation:
+
+```python
+from dbt.adapters.feldera.pipeline_manager import set_pre_start_hook
+from dbt.cli.main import dbtRunner
+
+set_pre_start_hook(check_pipeline, required=True)
+try:
+    result = dbtRunner().invoke(["run"])
+finally:
+    set_pre_start_hook(None)
+```
+
+Calling `set_pre_start_hook(None, required=True)` requires registration before
+any subsequent start. A running pipeline reused without a start is not checked.
+
 ## License
 
 Apache-2.0 — see [LICENSE](../../LICENSE) for details.

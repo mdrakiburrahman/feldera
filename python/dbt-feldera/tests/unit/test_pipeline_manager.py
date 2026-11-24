@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 from feldera.enums import PipelineStatus
 from feldera.runtime_config import RuntimeConfig
 
-from dbt.adapters.feldera.pipeline_manager import PipelineStateManager, _normalize_runtime_config
+from dbt.adapters.feldera.pipeline_manager import PipelineStateManager, _normalize_runtime_config, set_pre_start_hook
 
 
 class TestPipelineStateManager(unittest.TestCase):
@@ -346,6 +346,68 @@ class TestPipelineReuse(unittest.TestCase):
         )
         self.update()
         self.pipeline.modify.assert_called_once()
+
+
+class TestPreStartAdmission(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(set_pre_start_hook, None)
+        set_pre_start_hook(None)
+        self.manager = PipelineStateManager()
+        self.manager.register_view("pipe", "result", "CREATE VIEW result AS SELECT 1")
+        self.pipeline = Mock()
+        self.pipeline.program_code.return_value = ""
+        self.pipeline.program_config.return_value = {"profile": "dev"}
+        self.pipeline.runtime_config.return_value = RuntimeConfig.from_dict({"workers": 4})
+        self.pipeline.status.return_value = PipelineStatus.STOPPED
+
+    def run_start(self, path):
+        if path == "deploy":
+            with patch("dbt.adapters.feldera.pipeline_manager.PipelineBuilder") as builder:
+                builder.return_value.create_or_replace.return_value = self.pipeline
+                try:
+                    self.manager.deploy(Mock(), "pipe", replace=True)
+                finally:
+                    builder.return_value.create_or_replace.assert_called_once_with(wait=True)
+        else:
+            with (
+                patch("dbt.adapters.feldera.pipeline_manager.Pipeline.get", return_value=self.pipeline),
+                patch.object(self.manager, "_wait_for_compilation") as wait,
+            ):
+                try:
+                    self.manager.update_with_views(Mock(), "pipe")
+                finally:
+                    wait.assert_called_once()
+
+    def test_admission_at_both_starts(self):
+        for path in ("deploy", "update"):
+            for mode in ("optional", "accepted", "rejected", "required"):
+                with self.subTest(path=path, mode=mode):
+                    self.pipeline.reset_mock()
+
+                    def admit(pipeline):
+                        pipeline.start.assert_not_called()
+                        if mode == "rejected":
+                            raise ValueError("denied")
+
+                    callback = Mock(side_effect=admit)
+                    set_pre_start_hook(
+                        callback if mode in ("accepted", "rejected") else None,
+                        required=mode in ("accepted", "required"),
+                    )
+                    if mode == "rejected":
+                        with self.assertRaisesRegex(ValueError, "denied"):
+                            self.run_start(path)
+                    elif mode == "required":
+                        with self.assertRaisesRegex(RuntimeError, "pre-start admission hook is required"):
+                            self.run_start(path)
+                    else:
+                        self.run_start(path)
+                    if mode in ("accepted", "rejected"):
+                        callback.assert_called_once_with(self.pipeline)
+                    if mode in ("rejected", "required"):
+                        self.pipeline.start.assert_not_called()
+                    else:
+                        self.pipeline.start.assert_called_once_with()
 
 
 if __name__ == "__main__":
