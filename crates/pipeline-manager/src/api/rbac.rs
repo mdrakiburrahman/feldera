@@ -85,7 +85,7 @@ static ROUTE_MIN_ROLE: &[(&str, &str, Role)] = &[
     ("POST", "/v0/pipelines/{pipeline_name}/start_transaction", Role::Write), // start_transaction
     ("GET", "/v0/pipelines/{pipeline_name}/stats", Role::Read), // get_pipeline_stats
     ("PUT", "/v0/pipelines/{pipeline_name}/writer-owner", Role::Write),
-    ("GET", "/v0/pipelines/{pipeline_name}/writer-owner", Role::Read),
+    ("GET", "/v0/pipelines/{pipeline_name}/writer-owner", Role::Write),
     ("POST", "/v0/pipelines/{pipeline_name}/writer-owner/bind", Role::Write),
     ("POST", "/v0/pipelines/{pipeline_name}/writer-owner/advance", Role::Write),
     ("POST", "/v0/pipelines/{pipeline_name}/stop", Role::Write), // post_pipeline_stop
@@ -155,7 +155,7 @@ pub(crate) fn min_role_for(method: &str, pattern: &str) -> Option<Role> {
 /// POST /v0/pipelines/p/tables/t/connectors/c/start
 ///   => .../connectors/{connector_name}/{action}           (no literal claims it)
 /// ```
-fn classify(method: &str, path: &str) -> Option<(&'static str, Role)> {
+pub(crate) fn classify(method: &str, path: &str) -> Option<(&'static str, Role)> {
     let segments: Vec<&str> = path.split('/').collect();
     let candidates = candidates_by_shape().get(&(method, segments.len()))?;
     let mut best: Option<(usize, &'static str, Role)> = None;
@@ -341,15 +341,7 @@ pub(crate) async fn rbac_middleware(
     match authorize(method.as_str(), routed, &path, principal.as_ref()) {
         Ok(pattern) => {
             audit(&method, pattern, principal.as_ref());
-            if pattern.starts_with("/v0/pipelines/{pipeline_name}/writer-owner")
-                && method == Method::GET
-            {
-                Ok(next.call(req).await?.map_into_boxed_body())
-            } else if method != Method::GET || min_role_for(method.as_str(), pattern) == Some(Role::Write) {
-                super::endpoints::ownership::guard(req, next, pattern, &path).await
-            } else {
-                Ok(next.call(req).await?.map_into_boxed_body())
-            }
+            Ok(next.call(req).await?.map_into_boxed_body())
         }
         Err(resp) => Ok(req.into_response(resp)),
     }

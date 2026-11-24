@@ -896,6 +896,7 @@ fn build_app(
             // (reads it), then the handler.
             app.app_data(auth_configuration.clone()).service(
                 api_scope(&base_path)
+                    .wrap(middleware::from_fn(endpoints::ownership::middleware))
                     .wrap(middleware::from_fn(crate::api::rbac::rbac_middleware))
                     .wrap(auth_middleware)
                     .wrap(middleware::from_fn(
@@ -906,6 +907,7 @@ fn build_app(
         }
         None => app.service(
             api_scope(&base_path)
+                .wrap(middleware::from_fn(endpoints::ownership::middleware))
                 .wrap(middleware::from_fn(crate::api::rbac::rbac_middleware))
                 .wrap_fn(|req, srv| {
                     let req = crate::auth::tag_with_default_tenant_id(req);

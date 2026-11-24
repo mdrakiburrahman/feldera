@@ -1,5 +1,7 @@
 use crate::api::main::ServerState;
+use crate::config::BasePath;
 use crate::db::types::tenant::TenantId;
+use crate::db::types::role::Role;
 use actix_web::{
     body::{BoxBody, MessageBody},
     dev::{ServiceRequest, ServiceResponse},
@@ -96,6 +98,24 @@ async fn client(state: &web::Data<ServerState>) -> Result<deadpool_postgres::Cli
     pool.get().await.map_err(actix_web::error::ErrorServiceUnavailable)
 }
 
+pub(crate) async fn middleware(
+    req: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
+    let path = BasePath::strip_from(&req, req.match_info().as_str()).to_string();
+    let method = req.method();
+    let Some((pattern, role)) = crate::api::rbac::classify(method.as_str(), &path) else {
+        return Ok(req.into_response(HttpResponse::Forbidden().finish()));
+    };
+    if pattern == "/v0/pipelines/{pipeline_name}/writer-owner" && *method == actix_web::http::Method::GET {
+        return Ok(next.call(req).await?.map_into_boxed_body());
+    }
+    if *method != actix_web::http::Method::GET || role == Role::Write {
+        return guard(req, next, pattern, &path).await;
+    }
+    Ok(next.call(req).await?.map_into_boxed_body())
+}
+
 pub(crate) async fn guard(
     req: ServiceRequest,
     next: Next<impl MessageBody + 'static>,
@@ -109,7 +129,8 @@ pub(crate) async fn guard(
         .ok_or_else(|| actix_web::error::ErrorForbidden("missing tenant"))?;
     let state = req.app_data::<web::Data<ServerState>>().cloned()
         .ok_or_else(|| actix_web::error::ErrorServiceUnavailable("manager state unavailable"))?;
-    let mut db = client(&state).await?;
+    let pool = state.db.lock().await.writer_owner_pool.clone();
+    let mut db = pool.get().await.map_err(actix_web::error::ErrorServiceUnavailable)?;
     let tx = db.transaction().await.map_err(actix_web::error::ErrorServiceUnavailable)?;
     let lock_key = format!("feldera-writer-owner:{}:{name}", principal.acting_tenant.0);
     tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[&lock_key])
@@ -209,10 +230,12 @@ pub(crate) async fn read(
         &[&tenant.0, &name.into_inner()],
     ).await.map_err(actix_web::error::ErrorServiceUnavailable)?;
     let Some(r) = row else { return Ok(HttpResponse::NotFound().finish()); };
+    let phase: String = r.get(5);
+    let nonce = (phase == "bound").then(|| r.get::<_, String>(4));
     Ok(HttpResponse::Ok().json(json!({
         "claim_uid":r.get::<_,String>(0), "scope_sha256":r.get::<_,String>(1),
         "reservation_id":r.get::<_,String>(2), "generation":r.get::<_,i64>(3),
-        "nonce":r.get::<_,String>(4), "phase":r.get::<_,String>(5),
+        "nonce":nonce, "phase":phase,
         "identity_sha256":r.get::<_,Option<String>>(6), "fence_id":r.get::<_,Uuid>(7),
         "pipeline_id":r.get::<_,Uuid>(8), "deployment_id":r.get::<_,Option<Uuid>>(9)
     })))
@@ -224,7 +247,7 @@ async fn transition(
     tenant: web::ReqData<TenantId>,
     name: web::Path<String>,
     body: web::Json<Transition>,
-    advance: bool,
+    is_advance: bool,
 ) -> Result<HttpResponse, actix_web::Error> {
     let name = name.into_inner();
     let b = body.into_inner();
@@ -254,8 +277,8 @@ async fn transition(
     if row.get::<_, String>(0) != b.claim_uid || row.get::<_, String>(1) != b.scope_sha256
         || row.get::<_, String>(2) != b.reservation_id || row.get::<_, i64>(3) != b.current_generation
         || row.get::<_, String>(4) != b.current_nonce
-        || row.get::<_, String>(5) != if advance { "bound" } else { "starting" }
-        || (advance && prior_hash.as_deref() != Some(hash.as_str()))
+        || row.get::<_, String>(5) != if is_advance { "bound" } else { "starting" }
+        || (is_advance && prior_hash.as_deref() != Some(hash.as_str()))
         || b.identity["pipeline_id"].as_str().and_then(|v| Uuid::parse_str(v).ok()) != Some(pipeline_id)
     {
         return Ok(conflict("ownership or pipeline identity mismatch"));
@@ -269,7 +292,7 @@ async fn transition(
     let deployment: Option<Uuid> = p.get(3);
     if p.get::<_,Uuid>(0) != pipeline_id || p.get::<_,i64>(1) != pipeline_version
         || b.identity["program_version"].as_i64() != Some(p.get(2))
-        || deployment.is_none() || (advance && deployment != old_deployment)
+        || deployment.is_none() || (is_advance && deployment != old_deployment)
         || p.get::<_,String>(4) != "provisioned"
         || p.get::<_,Option<String>>(5).as_deref() != Some("running")
     {
@@ -289,7 +312,7 @@ async fn transition(
     {
         return Ok(conflict("runtime incarnation mismatch"));
     }
-    let (generation, nonce) = if advance {
+    let (generation, nonce) = if is_advance {
         let Some(generation) = b.next_generation else { return Ok(conflict("missing next generation")); };
         let Some(nonce) = b.next_nonce else { return Ok(conflict("missing next nonce")); };
         if b.current_generation.checked_add(1) != Some(generation)

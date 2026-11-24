@@ -86,6 +86,7 @@ pub struct StoragePostgres {
     pub config: tokio_postgres::Config,
     /// Pool from which clients can be taken.
     pub(crate) pool: Pool,
+    pub(crate) writer_owner_pool: Pool,
     /// Embedded Postgres instance which is used in development mode.
     /// It will not be persisted after termination.
     #[cfg(feature = "postgresql_embedded")]
@@ -2061,11 +2062,20 @@ impl StoragePostgres {
         };
         let mgr = Manager::from_config(config.clone(), tls, mgr_config);
         let pool = Pool::builder(mgr).max_size(16).build().unwrap();
+        let owner_mgr = Manager::from_config(
+            config.clone(),
+            db_config.tls_connector()?,
+            deadpool_postgres::ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        );
+        let writer_owner_pool = Pool::builder(owner_mgr).max_size(16).build().unwrap();
         #[cfg(feature = "postgresql_embedded")]
         return Ok(Self {
             db_config: db_config.clone(),
             config,
             pool,
+            writer_owner_pool,
             pg_inst,
         });
         #[cfg(not(feature = "postgresql_embedded"))]
@@ -2073,6 +2083,7 @@ impl StoragePostgres {
             db_config: db_config.clone(),
             config,
             pool,
+            writer_owner_pool,
         });
     }
 
