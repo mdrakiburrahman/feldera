@@ -3528,7 +3528,7 @@ impl DeltaTableInputEndpointInner {
             let paths: Vec<String> = snapshot
                 .snapshot()
                 .file_views(store.as_ref(), predicate)
-                .map_ok(|file| Path::from(file.path().as_ref()).to_string())
+                .map_ok(|file| file.path().to_string())
                 .try_collect()
                 .await
                 .map_err(|e| {
@@ -3549,7 +3549,9 @@ impl DeltaTableInputEndpointInner {
         };
         let mut builder = table.table_provider();
         if let Some(paths) = selected_paths {
-            builder = builder.with_file_paths(paths);
+            // Provider selection resolves URL paths; reservations use object-store keys.
+            builder =
+                builder.with_file_paths(paths.into_iter().map(|path| Path::from(path).to_string()));
         }
         let provider = builder.await.map_err(|e| {
             ControllerError::input_transport_error(
