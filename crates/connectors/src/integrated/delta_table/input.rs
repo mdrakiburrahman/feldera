@@ -36,6 +36,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
     Volatility,
 };
+use datafusion::object_store::ObjectStoreExt;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, PhysicalExpr, SendableRecordBatchStream,
@@ -139,7 +140,7 @@ struct DataFileBudget {
 impl DataFileBudget {
     fn reserve(&self, bytes: u64) -> AnyResult<()> {
         self.reserved
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|total| *total <= self.limit)
             })
             .map(|_| ())
@@ -179,6 +180,44 @@ fn data_file_budget(endpoint: &str, limit: Option<u64>) -> AnyResult<Option<Arc<
     });
     budgets.insert(endpoint.to_string(), Arc::clone(&budget));
     Ok(Some(budget))
+}
+
+#[cfg(test)]
+mod data_file_budget_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_reservations_and_reopen() {
+        let a = data_file_budget("data-file-budget-test-a", Some(50))
+            .unwrap()
+            .unwrap();
+        let b = data_file_budget("data-file-budget-test-b", Some(50))
+            .unwrap()
+            .unwrap();
+        let threads: Vec<_> = (0..20)
+            .map(|_| {
+                let a = Arc::clone(&a);
+                std::thread::spawn(move || a.reserve(7).is_ok())
+            })
+            .collect();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|ok| *ok)
+                .count(),
+            7
+        );
+        assert!(a.reserve(1).is_ok());
+        assert!(a.reserve(1).is_err());
+        assert!(b.reserve(50).is_ok());
+        let reopened = data_file_budget("data-file-budget-test-a", Some(50))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.reserved.load(Ordering::Acquire), 50);
+        assert!(data_file_budget("data-file-budget-test-a", None).is_err());
+        assert!(data_file_budget("data-file-budget-test-a", Some(51)).is_err());
+    }
 }
 
 /// Format a DataFusion error, appending actionable guidance when the
