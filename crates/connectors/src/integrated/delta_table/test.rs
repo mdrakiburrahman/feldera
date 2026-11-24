@@ -6209,6 +6209,11 @@ pub fn delta_data_file_budget_restart_fence_test(engine: &dyn PipelineTestEngine
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "replacement test did not run: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
         }
     })
 }
