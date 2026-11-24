@@ -266,6 +266,50 @@ writers to seed tables while checking.
 Use one dbt thread for deterministic SQL assembly. The normal admission hook
 does not check an already-running pipeline; the caller must admit reuse.
 
+An in-process runner can opt in to version-1 seed verification receipts:
+
+```python
+from dbt.adapters.feldera.seed_evidence import set_seed_verification_hook
+from dbt.cli.main import dbtRunner
+
+receipts = []
+set_seed_verification_hook(receipts.append)
+try:
+    result = dbtRunner().invoke(["build"])
+finally:
+    set_seed_verification_hook(None)
+# Consume receipts only if result.success is true.
+```
+
+The callback runs once after all selected seeds are verified and the pipeline
+and stats incarnations rechecked. It requires `feldera_safe_seed_reuse`. Each
+pipeline entry contains its identity, before/after observed input endpoints and
+counts, and seed entries with `cold_nonempty`, `cold_empty`, or
+`unchanged_reuse` outcomes. Only a cold nonempty entry has an ingress stream,
+observed endpoint name, and completion token. Failed or changed verification
+does not call the hook. Serialize invocations and seed writers while it is
+installed. A callback is not proof that later dbt hooks succeeded: the runner
+must also check the final dbt result.
+
+The v1 digest is SHA-256 over UTF-8 compact JSON (`ensure_ascii=False`,
+sorted object keys, no insignificant whitespace). The hashed object is
+`{"version":1,"schema":[...],"rows":[...]}`. Schema entries retain column
+order and contain `name` (Arrow), `feldera_name`, `arrow_type`, and the
+compiled `feldera_type` object. Each row is an ordered JSON array of cells;
+its SHA-256 is recorded alongside its multiplicity in `rows`, sorted by
+lowercase hexadecimal row hash. Cells are `null` or tagged pairs: `bool`
+with a JSON boolean; `int` and `decimal` with base-10 strings (decimal retains
+its Arrow scale); `float32`/`float64` with big-endian IEEE-754 hex; `string`
+with its text; `binary` with lowercase hex; and `temporal` with integer Arrow
+ticks as a string. The Arrow type binds temporal unit and timezone. Non-finite
+floats and unsupported nested types fail closed. Receipts contain hashes and
+counts, not raw rows. Expected and observed digests must match.
+
+To independently verify a receipt against a fresh Arrow query, call
+`verify_seed_digest(schema, compiled_fields, batches, receipt_digest)` from
+`dbt.adapters.feldera.seed_evidence`; it returns `False` on a mismatch. Use
+the compiled input fields for that table and the receipt's `observed` digest.
+
 ### Summary
 
 | Materialization                    | Feldera SQL                | Best for                                                                    |

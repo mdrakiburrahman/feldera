@@ -10,6 +10,7 @@ import agate
 from dbt.adapters.base import BaseAdapter, available
 from dbt.adapters.base.relation import InformationSchema
 from dbt.adapters.contracts.relation import RelationType
+from dbt.adapters.feldera import seed_evidence
 from dbt.adapters.feldera.column import FelderaColumn
 from dbt.adapters.feldera.connections import FelderaConnectionHandle, FelderaConnectionManager
 from dbt.adapters.feldera.credentials import FelderaCredentials
@@ -513,18 +514,22 @@ class FelderaAdapter(BaseAdapter):
         :param data: A list of dicts representing rows to ingest.
         :return: An empty string.
         """
+        self._push_seed_data(pipeline_name, table_name, data)
+        return ""
+
+    def _push_seed_data(self, pipeline_name: str, table_name: str, data: list) -> str:
         client = self._get_client()
         try:
             p = _pipeline_state.get_pipeline(client, pipeline_name)
             if p is None:
                 p = Pipeline.get(pipeline_name, client)
-            p.input_json(table_name, data)
+            token = p.input_json(table_name, data)
             logger.info("Pushed %d rows to '%s.%s'", len(data), pipeline_name, table_name)
         except Exception as exc:
             logger.error("Failed to push seed data to '%s.%s': %s", pipeline_name, table_name, exc)
             raise
 
-        return ""
+        return token
 
     @available
     def stash_seed(
@@ -592,6 +597,10 @@ class FelderaAdapter(BaseAdapter):
         udf_sql, udf_rust, udf_toml = self._read_udfs(udf_sql_path, udf_rust_path, udf_toml_path)
 
         seed_pipelines = _pipeline_state.get_pending_seed_pipelines()
+        receipt_hook = seed_evidence.get_seed_verification_hook()
+        if receipt_hook and seed_pipelines and not safe_seed_reuse:
+            raise RuntimeError("Seed verification evidence requires safe seed reuse")
+        receipts = []
         for pipeline_name in seed_pipelines:
             logger.info("Finalizing seeds for pipeline '%s'", pipeline_name)
 
@@ -621,6 +630,8 @@ class FelderaAdapter(BaseAdapter):
             )
 
             pending = _pipeline_state.pop_pending_seeds(pipeline_name)
+            seed_names = {table_name for table_name, _, _ in pending}
+            receipt = None
             if safe_seed_reuse:
                 before = before or client.http.get(f"/pipelines/{pipeline_name}")
                 if (
@@ -630,10 +641,41 @@ class FelderaAdapter(BaseAdapter):
                     or before.get("deployment_status") != "Running"
                 ):
                     raise RuntimeError(f"Pipeline '{pipeline_name}' is not a running identified incarnation")
+            if receipt_hook:
+                identity, initial_inputs, descriptor = seed_evidence.snapshot(client, pipeline_name, seed_names)
+                identity_keys = ("id", "version", "program_version", "deployment_id")
+                if any(before.get(key) != identity[key] for key in identity_keys):
+                    raise RuntimeError(f"Pipeline '{pipeline_name}' changed before seed verification")
+                receipt = {
+                    "pipeline_name": pipeline_name,
+                    "identity": identity,
+                    "inputs_before": seed_evidence.summarize_inputs(initial_inputs),
+                    "seeds": [],
+                }
             for table_name, agate_table, column_types in pending:
                 rows = self._convert_agate_rows(agate_table, column_types)
+                ingress = None
                 if rows and (not safe_seed_reuse or existing is None):
-                    self.push_seed_data(pipeline_name, table_name, rows)
+                    if receipt_hook:
+                        prior_identity, prior_inputs, _ = seed_evidence.snapshot(client, pipeline_name, seed_names)
+                        if prior_identity != identity:
+                            raise RuntimeError(f"Pipeline '{pipeline_name}' changed before seed submission")
+                        token = self._push_seed_data(pipeline_name, table_name, rows)
+                        if not isinstance(token, str) or not token:
+                            raise RuntimeError(f"Seed '{table_name}' has no completion token")
+                        current_identity, current_inputs, _ = seed_evidence.snapshot(client, pipeline_name, seed_names)
+                        candidates = [
+                            (name, entry) for name, entry in current_inputs.items()
+                            if name not in prior_inputs and entry["stream"] == table_name
+                        ]
+                        if current_identity != identity or len(candidates) != 1:
+                            raise RuntimeError(f"Seed '{table_name}' ingress identity is ambiguous")
+                        endpoint_name, entry = candidates[0]
+                        if entry["metrics"].get("total_records") != len(rows):
+                            raise RuntimeError(f"Seed '{table_name}' ingress count differs")
+                        ingress = {"stream": entry["stream"], "endpoint_name": endpoint_name, "completion_token": token}
+                    else:
+                        self.push_seed_data(pipeline_name, table_name, rows)
                     logger.info(
                         "Loaded %d seed rows into '%s.%s'",
                         len(rows),
@@ -641,12 +683,41 @@ class FelderaAdapter(BaseAdapter):
                         table_name,
                     )
                 if safe_seed_reuse:
-                    self._verify_seed_rows(deployed, table_name, rows)
+                    if receipt_hook:
+                        digest = seed_evidence.verify_and_digest(deployed, table_name, rows, descriptor)
+                        outcome = (
+                            "unchanged_reuse" if existing is not None else ("cold_nonempty" if rows else "cold_empty")
+                        )
+                        receipt["seeds"].append({
+                            "table": table_name,
+                            "outcome": outcome,
+                            "ingress": ingress,
+                            **digest,
+                        })
+                    else:
+                        self._verify_seed_rows(deployed, table_name, rows)
             if before is not None:
                 after = client.http.get(f"/pipelines/{pipeline_name}")
                 keys = ("id", "version", "program_version", "deployment_id", "deployment_status")
                 if any(before.get(key) != after.get(key) for key in keys):
                     raise RuntimeError(f"Pipeline '{pipeline_name}' changed during seed verification")
+            if receipt_hook:
+                after_identity, after_inputs, _ = seed_evidence.snapshot(client, pipeline_name, seed_names)
+                if after_identity != identity:
+                    raise RuntimeError(f"Pipeline '{pipeline_name}' changed during seed verification")
+                receipt["inputs_after"] = seed_evidence.summarize_inputs(after_inputs)
+                if existing is not None and receipt["inputs_before"] != receipt["inputs_after"]:
+                    raise RuntimeError(f"Pipeline '{pipeline_name}' inputs changed during seed reuse")
+                for item in receipt["seeds"]:
+                    if item["ingress"] is not None:
+                        endpoint = after_inputs.get(item["ingress"]["endpoint_name"])
+                        if (
+                            endpoint is None
+                            or endpoint["stream"] != item["table"]
+                            or endpoint["metrics"].get("total_records") != item["observed"]["row_count"]
+                        ):
+                            raise RuntimeError(f"Seed '{item['table']}' ingress changed during verification")
+                receipts.append(receipt)
 
         view_pipelines = _pipeline_state.get_pipelines_with_views()
         for pipeline_name in view_pipelines:
@@ -668,6 +739,14 @@ class FelderaAdapter(BaseAdapter):
                 udf_toml=udf_toml,
             )
 
+        if receipt_hook and receipts:
+            for receipt in receipts:
+                identity, inputs, _ = seed_evidence.snapshot(
+                    client, receipt["pipeline_name"], {item["table"] for item in receipt["seeds"]}
+                )
+                if identity != receipt["identity"] or seed_evidence.summarize_inputs(inputs) != receipt["inputs_after"]:
+                    raise RuntimeError(f"Pipeline '{receipt['pipeline_name']}' changed before receipt delivery")
+            receipt_hook({"version": 1, "pipelines": receipts})
         return ""
 
     @staticmethod
