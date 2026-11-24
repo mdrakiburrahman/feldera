@@ -263,8 +263,12 @@ match. Changed or partially loaded seed data, a changed program, and
 in place. Enabling this mode for an existing pipeline also requires a cold
 rebuild because seed tables become materialized. Serialize builds and other
 writers to seed tables while checking.
-Use one dbt thread for deterministic SQL assembly. The normal admission hook
-does not check an already-running pipeline; the caller must admit reuse.
+SQL assembly uses deterministic dependency ordering even with multiple dbt
+threads. This changes statement ordering compared with older adapter versions,
+so an existing pipeline whose program order differs needs a cold rebuild once.
+Reuse refusals identify differing fields without exposing their values. The
+normal admission hook does not check an already-running pipeline; the caller
+must admit reuse.
 
 An in-process runner can opt in to version-1 seed verification receipts:
 

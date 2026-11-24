@@ -67,6 +67,35 @@ class TestPipelineStateManager(unittest.TestCase):
         program = self.manager.assemble_program("empty_pipeline")
         self.assertEqual(program, "")
 
+    def test_assembly_is_stable_and_dependency_aware(self):
+        tables = {"z_input": "CREATE TABLE z_input (id INT)", "a_input": "CREATE TABLE a_input (id INT)"}
+        views = {
+            "a_result": "CREATE VIEW a_result AS SELECT * FROM z_base",
+            "z_base": "CREATE VIEW z_base AS SELECT * FROM z_input",
+            "b_other": "CREATE VIEW b_other AS SELECT * FROM a_input",
+        }
+        programs = []
+        for order in (list(views), list(reversed(views))):
+            manager = PipelineStateManager()
+            for name in reversed(list(tables)) if len(programs) else tables:
+                manager.register_table("pipe", name, tables[name])
+            for name in order:
+                manager.register_view("pipe", name, views[name])
+            programs.append(manager.assemble_program("pipe"))
+        self.assertEqual(programs[0], programs[1])
+        self.assertLess(programs[0].index("CREATE VIEW z_base"), programs[0].index("CREATE VIEW a_result"))
+
+    def test_dependency_order_respects_quoted_identifiers_and_cte_shadowing(self):
+        self.manager.register_view("pipe", "a_result", 'CREATE VIEW a_result AS SELECT * FROM "ZBase"')
+        self.manager.register_view(
+            "pipe", "ZBase", 'CREATE VIEW "ZBase" AS WITH a_result AS (SELECT 1 AS id) SELECT * FROM a_result'
+        )
+        program = self.manager.assemble_program("pipe")
+        self.assertLess(program.index('CREATE VIEW "ZBase"'), program.index("CREATE VIEW a_result"))
+        self.manager.register_view("pipe", "ZBase", 'CREATE VIEW "ZBase" AS SELECT * FROM a_result')
+        with self.assertRaisesRegex(RuntimeError, "dependency cycle"):
+            self.manager.assemble_program("pipe")
+
     def test_assemble_program_semicolons(self):
         """Each statement should end with a semicolon."""
         self.manager.register_table("pipe", "t1", "CREATE TABLE t1 (id INT)")
@@ -301,6 +330,50 @@ class TestPipelineReuse(unittest.TestCase):
                 )
         self.assertIs(result, self.pipeline)
         builder.assert_not_called()
+
+    def test_parallel_registration_order_reuses_in_both_deploy_paths(self):
+        views = {
+            "z_base": "CREATE VIEW z_base AS SELECT * FROM events",
+            "a_result": "CREATE VIEW a_result AS SELECT * FROM z_base",
+            "b_other": "CREATE VIEW b_other AS SELECT * FROM events",
+        }
+        managers = []
+        for order in (list(views), list(reversed(views))):
+            manager = PipelineStateManager()
+            manager.register_table("pipe", "events", "CREATE TABLE events (id INT)")
+            for name in order:
+                manager.register_view("pipe", name, views[name])
+            managers.append(manager)
+        self.pipeline.program_code.return_value = managers[0].assemble_program("pipe")
+        with patch("dbt.adapters.feldera.pipeline_manager.Pipeline.get", return_value=self.pipeline):
+            with patch("dbt.adapters.feldera.pipeline_manager.PipelineBuilder") as builder:
+                reused = managers[1].deploy(
+                    Mock(), "pipe", runtime_config=self.config, udf_rust="rust", udf_toml="toml", require_existing=True
+                )
+                self.assertIs(reused, self.pipeline)
+                builder.assert_not_called()
+            reused = managers[1].update_with_views(
+                Mock(), "pipe", runtime_config=self.config, udf_rust="rust", udf_toml="toml"
+            )
+            self.assertIs(reused, self.pipeline)
+        self.pipeline.stop.assert_not_called()
+        self.pipeline.modify.assert_not_called()
+        self.pipeline.start.assert_not_called()
+
+    def test_refusal_identifies_changed_fields_without_values(self):
+        self.pipeline.program_code.return_value = "different SQL"
+        with patch("dbt.adapters.feldera.pipeline_manager.Pipeline.get", return_value=self.pipeline):
+            with self.assertRaisesRegex(RuntimeError, "program_code, udf_rust") as error:
+                self.manager.deploy(
+                    Mock(),
+                    "pipe",
+                    runtime_config=self.config,
+                    udf_sql=self.udf_sql,
+                    udf_rust="private value",
+                    udf_toml="toml",
+                    require_existing=True,
+                )
+        self.assertNotIn("private value", str(error.exception))
 
     def test_seed_reuse_rejects_changed_program_without_replacing(self):
         self.pipeline.program_code.return_value = "CREATE VIEW different AS SELECT 1;"

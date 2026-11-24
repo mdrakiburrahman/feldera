@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from graphlib import CycleError, TopologicalSorter
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import agate
@@ -249,20 +250,56 @@ class PipelineStateManager:
         Assemble all registered tables and views into a pipeline SQL program.
 
         Tables are emitted first (inputs), then views (transforms).
-        Views are emitted in registration (insertion) order — dbt resolves
-        the dependency graph before calling materializations, so views
-        arrive in the correct dependency order.
+        Views are emitted in dependency order, with stable ordering among
+        independent relations regardless of materialization completion order.
 
         :param pipeline: The pipeline (schema) name.
         :return: The assembled SQL program string.
         """
         with self._lock:
-            parts = []
-            for _name, ddl in self._tables.get(pipeline, {}).items():
-                parts.append(ddl.rstrip().rstrip(";") + ";")
-            for _name, ddl in self._views.get(pipeline, {}).items():
-                parts.append(ddl.rstrip().rstrip(";") + ";")
-            return "\n\n".join(parts)
+            return "\n\n".join(
+                self._ordered_ddls(
+                    list(self._tables.get(pipeline, {}).values()),
+                    list(self._views.get(pipeline, {}).values()),
+                )
+            )
+
+    @staticmethod
+    def _ordered_ddls(table_ddls: List[str], view_ddls: List[str]) -> List[str]:
+        import sqlglot
+        from sqlglot import exp
+        from sqlglot.optimizer.scope import traverse_scope
+
+        from dbt.adapters.feldera.sqlglot_parser import FelderaDialect, parser
+
+        tables = sorted(table_ddls, key=lambda ddl: sorted(parser.extract_table_names([ddl])))
+        views = {}
+        dependencies = {}
+        for ddl in view_ddls:
+            statement = sqlglot.parse_one(ddl, dialect=FelderaDialect)
+            if not isinstance(statement, exp.Create) or not isinstance(statement.this, exp.Table):
+                raise RuntimeError("Cannot determine dependencies of a registered view")
+            name = parser._normalize_identifier(statement.this)
+            if name in views:
+                raise RuntimeError("Duplicate registered view identifier")
+            views[name] = ddl
+            dependencies[name] = {
+                parser._normalize_identifier(source)
+                for scope in traverse_scope(statement.expression)
+                for source in scope.sources.values()
+                if isinstance(source, exp.Table)
+            }
+        graph = TopologicalSorter({name: deps.intersection(views) for name, deps in dependencies.items()})
+        try:
+            graph.prepare()
+        except CycleError as exc:
+            raise RuntimeError("Registered views contain a dependency cycle") from exc
+        ordered = list(tables)
+        while graph.is_active():
+            ready = sorted(graph.get_ready())
+            ordered.extend(views[name] for name in ready)
+            graph.done(*ready)
+        return [ddl.rstrip().rstrip(";") + ";" for ddl in ordered]
 
     def has_sql_changed(self, pipeline: str) -> bool:
         """
@@ -384,21 +421,23 @@ class PipelineStateManager:
                     if require_existing:
                         raise RuntimeError(f"Pipeline '{pipeline}' disappeared before seed verification") from exc
                 else:
-                    if (
-                        existing.status() == PipelineStatus.RUNNING
-                        and existing.program_code() == sql
-                        and existing.udf_rust() == udf_rust
-                        and existing.udf_toml() == udf_toml
-                        and _normalize_runtime_config(vars(existing.runtime_config()))
-                        == _normalize_runtime_config(config)
-                        and existing.program_config().get("profile") == compilation_profile
-                    ):
+                    comparisons = {
+                        "status": existing.status() == PipelineStatus.RUNNING,
+                        "program_code": existing.program_code() == sql,
+                        "udf_rust": existing.udf_rust() == udf_rust,
+                        "udf_toml": existing.udf_toml() == udf_toml,
+                        "runtime_config": _normalize_runtime_config(vars(existing.runtime_config()))
+                        == _normalize_runtime_config(config),
+                        "compilation_profile": existing.program_config().get("profile") == compilation_profile,
+                    }
+                    differing_fields = [field for field, matches in comparisons.items() if not matches]
+                    if not differing_fields:
                         self._deployed_sql[pipeline] = sql
                         self._pipelines[pipeline] = existing
                         return existing
                     if require_existing:
                         raise RuntimeError(
-                            f"Pipeline '{pipeline}' differs from the requested program or configuration; "
+                            f"Pipeline '{pipeline}' differs in {', '.join(differing_fields)}; "
                             "a cold rebuild is required"
                         )
 
@@ -499,13 +538,11 @@ class PipelineStateManager:
                 for name, ddl in local_tables.items():
                     table_parts.append(ddl.rstrip().rstrip(";") + ";")
 
-            # Assemble new views
-            view_parts = []
-            for _name, ddl in local_views.items():
-                view_parts.append(ddl.rstrip().rstrip(";") + ";")
-
             # Combine existing tables with new views
-            full_sql = "\n\n".join(([udf_sql.strip()] if udf_sql.strip() else []) + table_parts + view_parts)
+            full_sql = "\n\n".join(
+                ([udf_sql.strip()] if udf_sql.strip() else [])
+                + self._ordered_ddls(table_parts, list(local_views.values()))
+            )
             config = dict(runtime_config or {})
             config.setdefault("workers", workers)
             program_config = dict(p.program_config())
