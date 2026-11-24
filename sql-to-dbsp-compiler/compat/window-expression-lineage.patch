@@ -1,0 +1,43 @@
+diff --git a/core/src/main/java/org/apache/calcite/rel/metadata/RelMdExpressionLineage.java b/core/src/main/java/org/apache/calcite/rel/metadata/RelMdExpressionLineage.java
+--- a/core/src/main/java/org/apache/calcite/rel/metadata/RelMdExpressionLineage.java
++++ b/core/src/main/java/org/apache/calcite/rel/metadata/RelMdExpressionLineage.java
+@@ -38,6 +38,7 @@
+ import org.apache.calcite.rex.RexBuilder;
+ import org.apache.calcite.rex.RexInputRef;
+ import org.apache.calcite.rex.RexNode;
++import org.apache.calcite.rex.RexOver;
+ import org.apache.calcite.rex.RexShuttle;
+ import org.apache.calcite.rex.RexTableInputRef;
+ import org.apache.calcite.rex.RexTableInputRef.RelTableRef;
+@@ -499,6 +500,11 @@
+   protected static @Nullable Set<RexNode> createAllPossibleExpressions(RexBuilder rexBuilder,
+       RexNode expr, Map<RexInputRef, Set<RexNode>> mapping) {
++    // Inline OVER results have unknown lineage, just like Window outputs.
++    if (RexOver.containsOver(expr)) {
++      return null;
++    }
++
+     // Extract input fields referenced by expression
+     final ImmutableBitSet predFieldsUsed = extractInputRefs(expr);
+ 
+     if (predFieldsUsed.isEmpty()) {
+diff --git a/core/src/test/java/org/apache/calcite/test/RelMetadataTest.java b/core/src/test/java/org/apache/calcite/test/RelMetadataTest.java
+--- a/core/src/test/java/org/apache/calcite/test/RelMetadataTest.java
++++ b/core/src/test/java/org/apache/calcite/test/RelMetadataTest.java
+@@ -4623,3 +4623,16 @@
++  @Test void testExpressionLineageInlineWindow() {
++    final RelNode rel =
++        sql("select empno, row_number() over (partition by deptno order by sal)\n"
++            + "from (select * from emp union all select * from emp)").toRel();
++    final RelMetadataQuery mq = rel.getCluster().getMetadataQuery();
++    final List<RelDataTypeField> fields = rel.getRowType().getFieldList();
++
++    final Set<RexNode> origins =
++        mq.getExpressionLineage(rel, RexInputRef.of(0, fields));
++    assertThat(origins, hasSize(2));
++    assertNull(mq.getExpressionLineage(rel, RexInputRef.of(1, fields)));
++  }
++
+   /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7843">[CALCITE-7843]
+    * RelMdExpressionLineage should support Window</a>. */
+   @Test void testExpressionLineageWindow() {
