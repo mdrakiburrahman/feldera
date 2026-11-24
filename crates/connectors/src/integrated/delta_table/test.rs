@@ -6021,6 +6021,72 @@ pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEn
 }
 
 #[engine_test(requires(Storage))]
+pub fn delta_data_file_budget_encoded_partition_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        let table_dir = TempDir::new().unwrap();
+        let uri = table_dir.path().to_str().unwrap();
+        let relation = basic_relation();
+        let selected = json!({ "id": 1, "b": false, "i": 1, "s": "space % / plus+" });
+        let excluded = json!({ "id": 2, "b": false, "i": 2, "s": "other" });
+        let table = create_table_from_arrow(uri, &arrow_schema_of(&relation.fields), &["s"]).await;
+        let table = write_data_to_table(table, &relation, &[selected.clone(), excluded]).await;
+        #[allow(deprecated)]
+        let selected_size = table
+            .snapshot()
+            .unwrap()
+            .log_data()
+            .iter()
+            .map(|file| file.add_action())
+            .find(|add| {
+                add.partition_values.get("s").and_then(|v| v.as_deref()) == Some("space % / plus+")
+            })
+            .unwrap()
+            .size as u64;
+        let storage = TempDir::new().unwrap();
+        let config: PipelineConfig = serde_json::from_value(json!({
+            "name": "test", "workers": 4,
+            "storage_config": { "path": storage.path() },
+            "inputs": { "budget_encoded": { "stream": "test_input1", "transport": {
+                "name": "delta_table_input", "config": {
+                    "uri": uri, "mode": "snapshot_and_follow", "change_feed": "off",
+                    "filter": "\"s\" = 'space % / plus+'", "max_data_file_bytes": selected_size
+                }
+            }}}
+        }))
+        .unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors_copy = Arc::clone(&errors);
+        let rel = relation.clone();
+        let pipeline = off_runtime(move || {
+            engine.controller(
+                &identity(&rel, &[Some("output")]),
+                &config,
+                Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
+            )
+        })
+        .unwrap();
+        pipeline.start();
+        wait_or_connector_error(
+            &pipeline,
+            &SqlIdentifier::from("test_output1"),
+            &relation,
+            &[selected],
+            &errors,
+        )
+        .await;
+        assert_eq!(
+            delta_endpoint_gauge(
+                &pipeline,
+                "budget_encoded",
+                "input_connector_delta_data_file_bytes_reserved"
+            ) as u64,
+            selected_size
+        );
+        pipeline.stop().unwrap();
+    })
+}
+
+#[engine_test(requires(Storage))]
 pub fn delta_data_file_budget_mapped_deletion_vector_test(engine: &dyn PipelineTestEngine) {
     run_async_on(2, async {
         let table_dir = TempDir::new().unwrap();
