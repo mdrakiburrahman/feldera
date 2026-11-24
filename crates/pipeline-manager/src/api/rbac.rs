@@ -84,6 +84,10 @@ static ROUTE_MIN_ROLE: &[(&str, &str, Role)] = &[
     ("POST", "/v0/pipelines/{pipeline_name}/start_compaction", Role::Write), // post_pipeline_start_compaction
     ("POST", "/v0/pipelines/{pipeline_name}/start_transaction", Role::Write), // start_transaction
     ("GET", "/v0/pipelines/{pipeline_name}/stats", Role::Read), // get_pipeline_stats
+    ("PUT", "/v0/pipelines/{pipeline_name}/writer-owner", Role::Write),
+    ("GET", "/v0/pipelines/{pipeline_name}/writer-owner", Role::Read),
+    ("POST", "/v0/pipelines/{pipeline_name}/writer-owner/bind", Role::Write),
+    ("POST", "/v0/pipelines/{pipeline_name}/writer-owner/advance", Role::Write),
     ("POST", "/v0/pipelines/{pipeline_name}/stop", Role::Write), // post_pipeline_stop
     ("GET", "/v0/pipelines/{pipeline_name}/support_bundle", Role::Read), // get_pipeline_support_bundle
     ("GET", "/v0/pipelines/{pipeline_name}/tables/{table_name}/connectors/{connector_name}/completion_token", Role::Write), // completion_token
@@ -337,7 +341,15 @@ pub(crate) async fn rbac_middleware(
     match authorize(method.as_str(), routed, &path, principal.as_ref()) {
         Ok(pattern) => {
             audit(&method, pattern, principal.as_ref());
-            Ok(next.call(req).await?.map_into_boxed_body())
+            if pattern.starts_with("/v0/pipelines/{pipeline_name}/writer-owner")
+                && method == Method::GET
+            {
+                Ok(next.call(req).await?.map_into_boxed_body())
+            } else if method != Method::GET || min_role_for(method.as_str(), pattern) == Some(Role::Write) {
+                super::endpoints::ownership::guard(req, next, pattern, &path).await
+            } else {
+                Ok(next.call(req).await?.map_into_boxed_body())
+            }
         }
         Err(resp) => Ok(req.into_response(resp)),
     }

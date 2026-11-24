@@ -131,6 +131,7 @@ fn extended_pipeline_2() -> ExtendedPipelineDescr {
             clock_timezone_offset: None,
             pin_cpus: Vec::new(),
             provisioning_timeout: Some(ConfigDuration::from_secs(1200)),
+            writer_incarnation_fence: None,
             max_parallel_connector_init: Some(10),
             init_containers: None,
             checkpoint_during_suspend: false,
