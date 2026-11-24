@@ -1,6 +1,8 @@
+import re
 import threading
 import time
 import uuid
+from datetime import datetime
 
 import agate
 import sqlglot
@@ -62,6 +64,28 @@ def _sql_type(column):
     return name
 
 
+def _normalize_timestamp_literal(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?", value
+    ):
+        return value
+    try:
+        datetime.fromisoformat(value[:17] + "59" + value[19:] if value[17:19] == "60" else value)
+    except ValueError:
+        return value
+    return value[:10] + " " + value[11:]
+
+
+def _normalize_expected_rows(rows, types):
+    return [
+        {
+            name: _normalize_timestamp_literal(value) if types.get(name.lower()) == "TIMESTAMP" else value
+            for name, value in row.items()
+        }
+        for row in rows
+    ]
+
+
 def _agate_type(column):
     name = column["columntype"]["type"]
     if name in ("BOOLEAN",):
@@ -106,7 +130,7 @@ def run_unit_test(client, sql, expected_rows, expected_sql, render_expected, udf
         types = {name: _sql_type(field) for name, field in names.items()}
         quoted = {name: '"' + field["name"].replace('"', '""') + '"' for name, field in names.items()}
         if not expected_sql:
-            expected_sql = render_expected(expected_rows, types, quoted)
+            expected_sql = render_expected(_normalize_expected_rows(expected_rows, types), types, quoted)
         _query_only(expected_sql)
         expected = (
             "CREATE MATERIALIZED VIEW dbt_unit_expected AS "

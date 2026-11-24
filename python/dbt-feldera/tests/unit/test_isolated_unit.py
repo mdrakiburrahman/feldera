@@ -6,7 +6,12 @@ from feldera.enums import PipelineStatus
 
 from dbt.adapters.contracts.connection import AdapterResponse
 from dbt.adapters.feldera.impl import FelderaAdapter
-from dbt.adapters.feldera.isolated_unit import _sql_type, is_isolated_unit_pipeline, run_unit_test
+from dbt.adapters.feldera.isolated_unit import (
+    _normalize_expected_rows,
+    _sql_type,
+    is_isolated_unit_pipeline,
+    run_unit_test,
+)
 from dbt.adapters.feldera.pipeline_manager import set_pre_start_hook
 from dbt.cli.main import dbtRunner
 
@@ -19,6 +24,25 @@ def test_char_output_type_preserves_width():
 def test_char_output_type_rejects_unknown_width(precision):
     with pytest.raises(ValueError, match="CHAR column has unknown or invalid width"):
         _sql_type({"columntype": {"type": "CHAR", "precision": precision}})
+
+
+def test_expected_timestamp_normalization_is_typed_and_preserves_values():
+    rows = [
+        {"Ts": "2026-02-02T00:00:00.123456789", "text": "2026-02-02T00:00:00.123456789"},
+        {"Ts": "2024-12-31T23:59:60"},
+        {"Ts": "2026-02-02T00:00:00+02:00"},
+        {"Ts": "2026-02-30T00:00:00"},
+        {"Ts": None},
+    ]
+    assert _normalize_expected_rows(rows, {"ts": "TIMESTAMP", "text": "VARCHAR"}) == [
+        {"Ts": "2026-02-02 00:00:00.123456789", "text": "2026-02-02T00:00:00.123456789"},
+        {"Ts": "2024-12-31 23:59:60"},
+        {"Ts": "2026-02-02T00:00:00+02:00"},
+        {"Ts": "2026-02-30T00:00:00"},
+        {"Ts": None},
+    ]
+    assert rows[0]["Ts"] == "2026-02-02T00:00:00.123456789"
+
 
 def _info(outputs, inputs=None):
     return {
