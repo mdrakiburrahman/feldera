@@ -21,8 +21,13 @@ COPY --chown=ubuntu crates/connectors/src/integrated/ feldera/crates/connectors/
 COPY --chown=ubuntu crates/feldera-types/src/transport/ feldera/crates/feldera-types/src/transport/
 COPY --chown=ubuntu build/sql2dbsp-jar-with-dependencies.jar feldera/sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar
 
+# The tar keeps whole-second mtimes. A build that crosses a second boundary
+# can leave a dependency stamped after its dependent, and Cargo would then
+# rebuild most of the graph on each pod's first compile, so give every
+# precompiled file the same mtime.
 RUN tar -xzf dot-cargo.tar.gz -C / \
     && rm working-dir-precompiled.tar.gz \
     && ./compiler-server --compiler-working-directory=$HOME/working-dir --sql-compiler-path=$HOME/feldera/sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar --compilation-cargo-lock-path=$HOME/feldera/Cargo.lock --dbsp-override-path=$HOME/feldera --precompile \
+    && built=$(date +%s) && find $HOME/working-dir -exec touch -h -d "@$built" {} + \
     && tar czf $HOME/working-dir-precompiled.tar.gz $HOME/working-dir \
     && rm -rf $HOME/working-dir $HOME/.cargo
