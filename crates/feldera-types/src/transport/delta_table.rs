@@ -125,6 +125,27 @@ fn is_default<T: Default + Eq>(t: &T) -> bool {
     *t == T::default()
 }
 
+/// Accepts `"true"` and `"false"` as well as booleans. Feldera services whose configuration
+/// types lack an option keep it as a string in `object_store_config`.
+fn deserialize_bool_or_string<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrString {
+        Bool(bool),
+        String(String),
+    }
+
+    match BoolOrString::deserialize(deserializer)? {
+        BoolOrString::Bool(value) => Ok(value),
+        BoolOrString::String(value) => value.parse().map_err(|_| {
+            serde::de::Error::invalid_value(serde::de::Unexpected::Str(&value), &"true or false")
+        }),
+    }
+}
+
 fn is_default_lookup_chunk_size(n: &ConfigSize) -> bool {
     *n == default_lookup_chunk_size()
 }
@@ -555,6 +576,39 @@ pub struct DeltaTableReaderConfig {
     /// Table read mode.
     pub mode: DeltaTableIngestMode,
 
+    /// While following, skip file removals and insert all live rows from each data-changing Add.
+    /// Rewrites can re-emit rows that were already ingested. Takes precedence over `ignore_deletes`.
+    /// Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
+    #[serde(
+        default,
+        skip_serializing_if = "is_default",
+        deserialize_with = "deserialize_bool_or_string"
+    )]
+    pub ignore_changes: bool,
+
+    /// While following, skip commits that only remove files. Reject commits that both add and
+    /// remove data unless `ignore_changes` is also enabled.
+    /// Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
+    #[serde(
+        default,
+        skip_serializing_if = "is_default",
+        deserialize_with = "deserialize_bool_or_string"
+    )]
+    pub ignore_deletes: bool,
+
+    /// Optional per-endpoint limit on logical data-file bytes reserved in this process.
+    /// Snapshot files not excluded by conservative metadata pruning are charged
+    /// before reading. Each followed file read, including retractions, is charged
+    /// again. Metadata, transfer ranges, and retries are not measured. Counters reset
+    /// on process restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_data_file_bytes: Option<u64>,
+
+    /// Absolute path of a durable, exclusive-create admission marker. Requires
+    /// `max_data_file_bytes` and a shared persistent filesystem across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_file_budget_fence: Option<String>,
+
     /// Transaction mode.
     ///
     /// Determines how the connector breaks up its input into transactions.
@@ -947,6 +1001,78 @@ fn test_delta_change_feed_excludes_cdc_mode() {
 
 #[cfg(test)]
 #[test]
+fn test_delta_ignore_policies_require_file_following() {
+    use serde_json::json;
+
+    for option in ["ignore_changes", "ignore_deletes"] {
+        for (mode, cdf, expected_error) in [
+            ("snapshot", "off", "snapshot_and_follow"),
+            ("cdc", "off", "snapshot_and_follow"),
+            ("follow", "auto", "change_feed"),
+            ("snapshot_and_follow", "require", "change_feed"),
+        ] {
+            for value in [json!(true), json!("true")] {
+                let mut raw = json!({"uri": "memory://", "mode": mode, "change_feed": cdf});
+                raw[option] = value;
+                let config: DeltaTableReaderConfig = serde_json::from_value(raw).unwrap();
+                assert!(config.object_store_config.is_empty());
+                let error = config.validate().unwrap_err();
+                assert!(
+                    error.contains(option) && error.contains(expected_error),
+                    "{error}"
+                );
+            }
+        }
+
+        let mut raw = json!({"uri": "memory://", "mode": "follow"});
+        raw[option] = json!("false");
+        let config: DeltaTableReaderConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!config.ignore_changes && !config.ignore_deletes);
+        raw[option] = json!("yes");
+        assert!(serde_json::from_value::<DeltaTableReaderConfig>(raw).is_err());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn test_delta_data_file_budget_config() {
+    let config: DeltaTableReaderConfig = serde_json::from_str(
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"off","max_data_file_bytes":42}"#,
+    ).unwrap();
+    assert_eq!(config.max_data_file_bytes, Some(42));
+    assert!(config.object_store_config.is_empty());
+    assert!(config.validate().is_ok());
+
+    for raw in [
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"off","data_file_budget_fence":"/tmp/fence"}"#,
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"off","max_data_file_bytes":42,"data_file_budget_fence":"relative"}"#,
+    ] {
+        let config: DeltaTableReaderConfig = serde_json::from_str(raw).unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("data_file_budget_fence")
+        );
+    }
+
+    for raw in [
+        r#"{"uri":"memory://","mode":"snapshot","max_data_file_bytes":42}"#,
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"auto","max_data_file_bytes":42}"#,
+        r#"{"uri":"memory://","mode":"snapshot_and_follow","change_feed":"off","timestamp_column":"ts","max_data_file_bytes":42}"#,
+    ] {
+        let config: DeltaTableReaderConfig = serde_json::from_str(raw).unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("max_data_file_bytes")
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn test_delta_transaction_mode_catchup_serde() {
     let config: DeltaTableReaderConfig = serde_json::from_str(
         r#"{"uri":"s3://bucket/t","mode":"follow","transaction_mode":"catchup"}"#,
@@ -1231,6 +1357,41 @@ impl DeltaTableReaderConfig {
     /// Reject settings the connector cannot act on, so a misconfigured pipeline
     /// fails at startup naming the setting rather than at the first read.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(path) = &self.data_file_budget_fence
+            && (self.max_data_file_bytes.is_none() || !std::path::Path::new(path).is_absolute())
+        {
+            return Err(
+                "'data_file_budget_fence' requires 'max_data_file_bytes' and an absolute path"
+                    .to_string(),
+            );
+        }
+        if self.max_data_file_bytes.is_some()
+            && (!matches!(self.mode, DeltaTableIngestMode::SnapshotAndFollow)
+                || self.reads_change_feed()
+                || self.timestamp_column.is_some())
+        {
+            return Err("'max_data_file_bytes' requires 'snapshot_and_follow', change feed off, and no timestamp_column".to_string());
+        }
+        if self.ignore_changes || self.ignore_deletes {
+            let option = if self.ignore_changes {
+                "ignore_changes"
+            } else {
+                "ignore_deletes"
+            };
+            if !self.follow() || self.is_cdc() {
+                return Err(format!(
+                    "'{option}' is only valid in 'follow' and 'snapshot_and_follow' modes"
+                ));
+            }
+            if self
+                .change_feed
+                .is_some_and(|feed| feed != DeltaTableChangeFeed::Off)
+            {
+                return Err(format!(
+                    "'{option}' requires 'change_feed' to be 'off' or omitted"
+                ));
+            }
+        }
         if self.batch_size.is_some_and(|n| n == 0) {
             return Err("'batch_size' must be greater than 0".to_string());
         }
@@ -1277,6 +1438,10 @@ impl DeltaTableReaderConfig {
     /// A configured value always wins: the override sets the default, it does
     /// not replace an explicit choice.
     pub fn change_feed(&self) -> DeltaTableChangeFeed {
+        // These policies operate on file actions, even if the global CDF default is enabled.
+        if self.ignore_changes || self.ignore_deletes {
+            return self.change_feed.unwrap_or(DeltaTableChangeFeed::Off);
+        }
         self.change_feed.unwrap_or_else(default_change_feed)
     }
 

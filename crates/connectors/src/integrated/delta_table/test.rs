@@ -5756,6 +5756,824 @@ fn change_feed_row(id: u32, s: &str) -> Value {
     json!({ "id": id, "b": false, "i": null, "s": s })
 }
 
+#[cfg(target_os = "linux")]
+#[engine_test(requires(Storage))]
+pub fn delta_data_file_budget_selected_snapshot_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let table_dir = TempDir::new().unwrap();
+        let uri = table_dir.path().to_str().unwrap();
+        let relation = basic_relation();
+        let first = json!({ "id": 1, "b": false, "i": 1, "s": "20260102" });
+        let second = json!({ "id": 2, "b": false, "i": 2, "s": "20260103" });
+        let excluded = json!({ "id": 3, "b": false, "i": 3, "s": "20250101" });
+        let null = json!({ "id": 4, "b": false, "i": null, "s": "20260104" });
+        let table =
+            create_table_from_arrow(uri, &arrow_schema_of(&relation.fields), &["s", "i"]).await;
+        let table = write_data_to_table(
+            table,
+            &relation,
+            &[first.clone(), second.clone(), excluded, null.clone()],
+        )
+        .await;
+        #[allow(deprecated)]
+        let adds: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .log_data()
+            .iter()
+            .map(|file| file.add_action())
+            .collect();
+        assert_eq!(adds.len(), 4);
+        let file_for = |value: &str| {
+            adds.iter()
+                .find(|add| add.partition_values.get("s").and_then(|v| v.as_deref()) == Some(value))
+                .unwrap()
+        };
+        let size_for = |value| {
+            std::fs::metadata(table_dir.path().join(&file_for(value).path))
+                .unwrap()
+                .len()
+        };
+        let first_size = size_for("20260102");
+        let second_size = size_for("20260103");
+        let null_file = adds
+            .iter()
+            .find(|add| add.partition_values.get("i").is_some_and(Option::is_none))
+            .unwrap();
+        let null_path = table_dir.path().join(&null_file.path);
+        let null_size = std::fs::metadata(&null_path).unwrap().len();
+        let excluded_path = table_dir.path().join(&file_for("20250101").path);
+        let excluded_size = std::fs::metadata(&excluded_path).unwrap().len();
+        std::fs::write(&excluded_path, vec![0; excluded_size as usize]).unwrap();
+        // Watch opens after fixture setup, including any opens during provider planning.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        );
+        let watcher = unsafe { OwnedFd::from_raw_fd(fd) };
+        let watch = |path: &std::path::Path| {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let wd = unsafe {
+                libc::inotify_add_watch(watcher.as_raw_fd(), path.as_ptr(), libc::IN_OPEN)
+            };
+            assert!(
+                wd >= 0,
+                "inotify_add_watch: {}",
+                std::io::Error::last_os_error()
+            );
+            wd
+        };
+        let first_watch = watch(&table_dir.path().join(&file_for("20260102").path));
+        let second_watch = watch(&table_dir.path().join(&file_for("20260103").path));
+        let null_watch = watch(&null_path);
+        let excluded_watch = watch(&excluded_path);
+
+        for (alias, filter, size, expected) in [
+            (
+                "budget_selected_between",
+                r#"(("s" BETWEEN '20260101' AND '20260131') AND "s" ~ '^[0-9]{8}(\r\n|[\n\r\x{85}\x{2028}\x{2029}])?$') AND "s" IN ('20260102') AND ("id" = 1 OR "s" = '20250101')"#,
+                first_size,
+                vec![first.clone()],
+            ),
+            (
+                "budget_selected_or",
+                r#"("s" = '20260102' OR "s" = '20260103' OR "i" IS NULL) AND "id" > 0"#,
+                first_size + second_size + null_size,
+                vec![first.clone(), second.clone(), null.clone()],
+            ),
+        ] {
+            let storage = TempDir::new().unwrap();
+            let config: PipelineConfig = serde_json::from_value(json!({
+                "name": "test", "workers": 4,
+                "storage_config": { "path": storage.path() },
+                "inputs": { (alias): { "stream": "test_input1", "transport": {
+                    "name": "delta_table_input", "config": {
+                        "uri": uri, "mode": "snapshot_and_follow", "change_feed": "off",
+                        "filter": filter, "snapshot_filter": filter, "max_data_file_bytes": size
+                    }
+                }}}
+            }))
+            .unwrap();
+            let errors = Arc::new(Mutex::new(Vec::new()));
+            let errors_copy = Arc::clone(&errors);
+            let rel = relation.clone();
+            let pipeline = off_runtime(move || {
+                engine.controller(
+                    &identity(&rel, &[Some("output")]),
+                    &config,
+                    Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
+                )
+            })
+            .unwrap();
+            pipeline.start();
+            wait_or_connector_error(
+                &pipeline,
+                &SqlIdentifier::from("test_output1"),
+                &relation,
+                &expected,
+                &errors,
+            )
+            .await;
+            assert_eq!(
+                delta_endpoint_gauge(
+                    &pipeline,
+                    alias,
+                    "input_connector_delta_data_file_bytes_reserved"
+                ) as u64,
+                size
+            );
+            pipeline.stop().unwrap();
+            let mut opened = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let count = unsafe {
+                    libc::read(
+                        watcher.as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                if count < 0 {
+                    let error = std::io::Error::last_os_error();
+                    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                    break;
+                }
+                assert!(count > 0);
+                let mut offset = 0;
+                while offset < count as usize {
+                    let event = unsafe {
+                        std::ptr::read_unaligned(
+                            buffer.as_ptr().add(offset).cast::<libc::inotify_event>(),
+                        )
+                    };
+                    opened.push(event.wd);
+                    offset += std::mem::size_of::<libc::inotify_event>() + event.len as usize;
+                }
+            }
+            assert!(
+                opened.contains(&first_watch),
+                "selected object was not observed opening"
+            );
+            if expected.len() == 3 {
+                assert!(
+                    opened.contains(&second_watch),
+                    "second selected object was not observed opening"
+                );
+                assert!(
+                    opened.contains(&null_watch),
+                    "NULL partition was not observed opening"
+                );
+            } else {
+                assert!(
+                    !opened.contains(&second_watch),
+                    "unselected object was opened"
+                );
+                assert!(!opened.contains(&null_watch), "NULL partition was opened");
+            }
+            assert!(
+                !opened.contains(&excluded_watch),
+                "excluded object was opened"
+            );
+        }
+        let unsupported_or = r#"("s" ~ '^[A-Za-z]{2}[0-9]+$' OR "id" = 3)"#;
+        assert!(
+            deltalake::delta_datafusion::expr::parse_sql_predicate_to_kernel(
+                unsupported_or,
+                table.snapshot().unwrap().schema().as_ref(),
+                &datafusion::prelude::SessionContext::new().state(),
+            )
+            .is_err()
+        );
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        );
+        let access_watcher = unsafe { OwnedFd::from_raw_fd(fd) };
+        for path in [
+            table_dir.path().join(&file_for("20260102").path),
+            table_dir.path().join(&file_for("20260103").path),
+            null_path.clone(),
+            excluded_path.clone(),
+        ] {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let wd = unsafe {
+                libc::inotify_add_watch(
+                    access_watcher.as_raw_fd(),
+                    path.as_ptr(),
+                    libc::IN_OPEN | libc::IN_ACCESS,
+                )
+            };
+            assert!(
+                wd >= 0,
+                "inotify_add_watch: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let storage = TempDir::new().unwrap();
+        let config: PipelineConfig = serde_json::from_value(json!({
+            "name": "test", "workers": 4,
+            "storage_config": { "path": storage.path() },
+            "inputs": { "budget_unknown_or": { "stream": "test_input1", "transport": {
+                "name": "delta_table_input", "config": {
+                    "uri": uri, "mode": "snapshot_and_follow", "change_feed": "off",
+                    "filter": unsupported_or,
+                    "max_data_file_bytes": first_size + second_size + null_size
+                }
+            }}}
+        }))
+        .unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors_copy = Arc::clone(&errors);
+        let result = off_runtime(move || {
+            engine.controller(
+                &identity(&relation, &[Some("output")]),
+                &config,
+                Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
+            )
+        });
+        let error = match result {
+            Err(error) => format!("{error:?}"),
+            Ok(pipeline) => {
+                pipeline.stop().unwrap();
+                panic!("an unsupported OR must retain the unproven files");
+            }
+        };
+        assert!(error.contains("max_data_file_bytes exceeded"), "{error}");
+        let mut buffer = [0u8; 4096];
+        let count = unsafe {
+            libc::read(
+                access_watcher.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        assert_eq!(count, -1, "over-budget snapshot opened or read a data file");
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    })
+}
+
+#[engine_test(requires(Storage))]
+pub fn delta_data_file_budget_encoded_partition_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        let table_dir = TempDir::new().unwrap();
+        let uri = table_dir.path().to_str().unwrap();
+        let relation = basic_relation();
+        let selected = json!({ "id": 1, "b": false, "i": 1, "s": "space % / plus+" });
+        let excluded = json!({ "id": 2, "b": false, "i": 2, "s": "other" });
+        let table = create_table_from_arrow(uri, &arrow_schema_of(&relation.fields), &["s"]).await;
+        let table = write_data_to_table(table, &relation, &[selected.clone(), excluded]).await;
+        #[allow(deprecated)]
+        let selected_size = table
+            .snapshot()
+            .unwrap()
+            .log_data()
+            .iter()
+            .map(|file| file.add_action())
+            .find(|add| {
+                add.partition_values.get("s").and_then(|v| v.as_deref()) == Some("space % / plus+")
+            })
+            .unwrap()
+            .size as u64;
+        let storage = TempDir::new().unwrap();
+        let config: PipelineConfig = serde_json::from_value(json!({
+            "name": "test", "workers": 4,
+            "storage_config": { "path": storage.path() },
+            "inputs": { "budget_encoded": { "stream": "test_input1", "transport": {
+                "name": "delta_table_input", "config": {
+                    "uri": uri, "mode": "snapshot_and_follow", "change_feed": "off",
+                    "filter": "\"s\" = 'space % / plus+'", "max_data_file_bytes": selected_size
+                }
+            }}}
+        }))
+        .unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors_copy = Arc::clone(&errors);
+        let rel = relation.clone();
+        let pipeline = off_runtime(move || {
+            engine.controller(
+                &identity(&rel, &[Some("output")]),
+                &config,
+                Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
+            )
+        })
+        .unwrap();
+        pipeline.start();
+        wait_or_connector_error(
+            &pipeline,
+            &SqlIdentifier::from("test_output1"),
+            &relation,
+            &[selected],
+            &errors,
+        )
+        .await;
+        assert_eq!(
+            delta_endpoint_gauge(
+                &pipeline,
+                "budget_encoded",
+                "input_connector_delta_data_file_bytes_reserved"
+            ) as u64,
+            selected_size
+        );
+        pipeline.stop().unwrap();
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[engine_test(requires(Storage))]
+pub fn delta_data_file_budget_restart_fence_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        const ROOT_ENV: &str = "FELDERA_DELTA_FENCE_TEST_ROOT";
+        let parent_root = TempDir::new().unwrap();
+        let child_root = std::env::var_os(ROOT_ENV);
+        let root = child_root
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| parent_root.path().to_path_buf());
+        let table_path = root.join("table");
+        let uri = table_path.to_str().unwrap();
+        let fence = root.join("admission");
+        let relation = basic_relation();
+        let row = json!({ "id": 1, "b": false, "i": 1, "s": "local" });
+
+        let watcher = if child_root.is_some() {
+            let file = std::fs::read_dir(&table_path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+                .unwrap();
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(fd >= 0);
+            let watcher = unsafe { OwnedFd::from_raw_fd(fd) };
+            let file = CString::new(file.as_os_str().as_bytes()).unwrap();
+            assert!(
+                unsafe {
+                    libc::inotify_add_watch(watcher.as_raw_fd(), file.as_ptr(), libc::IN_OPEN)
+                } >= 0
+            );
+            Some(watcher)
+        } else {
+            let table = create_table_from_arrow(uri, &arrow_schema_of(&relation.fields), &[]).await;
+            write_data_to_table(table, &relation, std::slice::from_ref(&row)).await;
+            None
+        };
+        let storage = TempDir::new().unwrap();
+        let config: PipelineConfig = serde_json::from_value(json!({
+            "name": "restart_test", "workers": 4,
+            "storage_config": { "path": storage.path() },
+            "inputs": { "budget_restart": { "stream": "test_input1", "transport": {
+                "name": "delta_table_input", "config": {
+                    "uri": uri, "mode": "snapshot_and_follow", "change_feed": "off",
+                    "max_data_file_bytes": 1000000, "data_file_budget_fence": fence
+                }
+            }}}
+        }))
+        .unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors_copy = Arc::clone(&errors);
+        let rel = relation.clone();
+        let result = off_runtime(move || {
+            engine.controller(
+                &identity(&rel, &[Some("output")]),
+                &config,
+                Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
+            )
+        });
+        if let Some(watcher) = watcher {
+            let error = match result {
+                Err(error) => format!("{error:?}"),
+                Ok(pipeline) => {
+                    pipeline.stop().unwrap();
+                    panic!("replacement process reused the admission");
+                }
+            };
+            assert!(
+                error.contains("cannot claim data-file budget fence"),
+                "{error}"
+            );
+            let mut buffer = [0u8; 1024];
+            let count = unsafe {
+                libc::read(
+                    watcher.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            assert_eq!(count, -1, "replacement opened the data file");
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        } else {
+            let pipeline = result.unwrap();
+            pipeline.start();
+            wait_or_connector_error(
+                &pipeline,
+                &SqlIdentifier::from("test_output1"),
+                &relation,
+                &[row],
+                &errors,
+            )
+            .await;
+            assert!(
+                delta_endpoint_gauge(
+                    &pipeline,
+                    "budget_restart",
+                    "input_connector_delta_data_file_bytes_reserved"
+                ) > 0.0
+            );
+            pipeline.stop().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "integrated::delta_table::test::delta_data_file_budget_restart_fence_test",
+                    "--nocapture",
+                ])
+                .env(ROOT_ENV, root)
+                .env_remove("FELDERA_ENGINE_TEST_CASE")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "replacement failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "replacement test did not run: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    })
+}
+
+#[engine_test(requires(Storage))]
+pub fn delta_data_file_budget_mapped_deletion_vector_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        let table_dir = TempDir::new().unwrap();
+        let first = [uniform_row(1, "alpha", "Coffee", "settled")];
+        let second = [
+            uniform_row(2, "beta", "Shop", "settled"),
+            uniform_row(3, "gamma", "Shop", "deleted"),
+        ];
+        let relation = uniform_relation();
+        write_id_mapped_table_with_deletion_vector(
+            table_dir.path(),
+            &relation,
+            &[&first, &second],
+            &[1],
+        );
+        let size: u64 = std::fs::read_dir(table_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .sum();
+        assert!(size > 0);
+        let storage = TempDir::new().unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = delta_input_controller(
+            engine,
+            table_dir.path().to_str().unwrap(),
+            json!({"mode": "snapshot_and_follow", "change_feed": "off",
+                "filter": "id > 0", "max_data_file_bytes": size}),
+            &relation,
+            storage.path(),
+            &errors,
+        )
+        .await
+        .unwrap();
+        pipeline.start();
+        wait_or_connector_error(
+            &pipeline,
+            &SqlIdentifier::from("test_output1"),
+            &relation,
+            &[first[0].clone(), second[0].clone()],
+            &errors,
+        )
+        .await;
+        assert_eq!(
+            delta_endpoint_gauge(
+                &pipeline,
+                "test_input1",
+                "input_connector_delta_data_file_bytes_reserved"
+            ) as u64,
+            size
+        );
+        pipeline.stop().unwrap();
+    })
+}
+
+#[engine_test(requires(Storage))]
+pub fn delta_data_file_budget_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        let table_dir = TempDir::new().unwrap();
+        let uri = table_dir.path().to_str().unwrap();
+        let relation = basic_relation();
+        let first = change_feed_row(1, "first");
+        let next = change_feed_row(2, "next");
+        let table = create_table_from_arrow(uri, &change_feed_arrow_schema(), &[]).await;
+        let table = write_data_to_table(table, &relation, std::slice::from_ref(&first)).await;
+        #[allow(deprecated)]
+        let initial: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .log_data()
+            .iter()
+            .map(|file| file.add_action().path)
+            .collect();
+        assert_eq!(initial.len(), 1);
+        let size = std::fs::metadata(table_dir.path().join(&initial[0]))
+            .unwrap()
+            .len();
+        let config = json!({
+            "uri": uri, "mode": "snapshot_and_follow", "change_feed": "off",
+            "max_data_file_bytes": size,
+        });
+        let storage = TempDir::new().unwrap();
+        let pipeline_config: PipelineConfig = serde_json::from_value(json!({
+            "name": "test", "workers": 4,
+            "storage_config": { "path": storage.path() },
+            "inputs": {
+                "budget_alias_a": { "stream": "test_input1", "transport": {
+                    "name": "delta_table_input", "config": config
+                }},
+                "budget_alias_b": { "stream": "test_input1", "transport": {
+                    "name": "delta_table_input", "config": config
+                }}
+            }
+        }))
+        .unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors_copy = Arc::clone(&errors);
+        let pipeline = off_runtime(move || {
+            engine.controller(
+                &identity(&relation, &[Some("output")]),
+                &pipeline_config,
+                Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
+            )
+        })
+        .unwrap();
+        pipeline.start();
+        let relation = basic_relation();
+        let output = SqlIdentifier::from("test_output1");
+        wait_or_connector_error(
+            &pipeline,
+            &output,
+            &relation,
+            &[first.clone(), first],
+            &errors,
+        )
+        .await;
+        for alias in ["budget_alias_a", "budget_alias_b"] {
+            assert_eq!(
+                delta_endpoint_gauge(
+                    &pipeline,
+                    alias,
+                    "input_connector_delta_data_file_bytes_reserved"
+                ) as u64,
+                size
+            );
+            assert_eq!(
+                delta_endpoint_gauge(
+                    &pipeline,
+                    alias,
+                    "input_connector_delta_data_file_bytes_limit"
+                ) as u64,
+                size
+            );
+            pipeline.pause_input_endpoint(alias).unwrap();
+            wait(
+                || pipeline.is_input_endpoint_paused(alias).unwrap_or(false),
+                60_000,
+            )
+            .unwrap();
+        }
+
+        let table = write_data_to_table(table, &relation, &[next]).await;
+        #[allow(deprecated)]
+        let added: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .log_data()
+            .iter()
+            .map(|file| file.add_action().path)
+            .filter(|path| !initial.contains(path))
+            .collect();
+        assert_eq!(added.len(), 1);
+        let path = table_dir.path().join(&added[0]);
+        let length = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::write(path, vec![0; length]).unwrap();
+        for alias in ["budget_alias_a", "budget_alias_b"] {
+            pipeline.start_input_endpoint(alias).unwrap();
+        }
+        wait(
+            || {
+                errors
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.contains("max_data_file_bytes exceeded"))
+            },
+            60_000,
+        )
+        .expect("follow must reject the new file before opening its invalid Parquet data");
+        assert!(!errors.lock().unwrap().iter().any(|e| e.contains("Parquet")));
+        pipeline.stop().unwrap();
+    })
+}
+
+#[engine_test(requires(Storage))]
+pub fn delta_data_file_budget_retraction_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        let table_dir = TempDir::new().unwrap();
+        let uri = table_dir.path().to_str().unwrap();
+        let relation = basic_relation();
+        let first = change_feed_row(1, "first");
+        let table = create_table_from_arrow(uri, &change_feed_arrow_schema(), &[]).await;
+        let table = write_data_to_table(table, &relation, std::slice::from_ref(&first)).await;
+        #[allow(deprecated)]
+        let files: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .log_data()
+            .iter()
+            .map(|file| file.add_action().path)
+            .collect();
+        assert_eq!(files.len(), 1);
+        let path = table_dir.path().join(&files[0]);
+        let size = std::fs::metadata(&path).unwrap().len();
+        let storage = TempDir::new().unwrap();
+        let pipeline_config: PipelineConfig = serde_json::from_value(json!({
+            "name": "test", "workers": 4,
+            "storage_config": { "path": storage.path() },
+            "inputs": {
+                "budget_retraction": { "stream": "test_input1", "transport": {
+                    "name": "delta_table_input",
+                    "config": { "uri": uri, "mode": "snapshot_and_follow",
+                        "change_feed": "off", "max_data_file_bytes": size }
+                }}
+            }
+        }))
+        .unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors_copy = Arc::clone(&errors);
+        let pipeline = off_runtime(move || {
+            engine.controller(
+                &identity(&relation, &[Some("output")]),
+                &pipeline_config,
+                Box::new(move |e, _| errors_copy.lock().unwrap().push(e.to_string())),
+            )
+        })
+        .unwrap();
+        pipeline.start();
+        let relation = basic_relation();
+        let output = SqlIdentifier::from("test_output1");
+        wait_or_connector_error(&pipeline, &output, &relation, &[first], &errors).await;
+        pipeline.pause_input_endpoint("budget_retraction").unwrap();
+        wait(
+            || {
+                pipeline
+                    .is_input_endpoint_paused("budget_retraction")
+                    .unwrap_or(false)
+            },
+            60_000,
+        )
+        .unwrap();
+        let _table = table.delete().await.unwrap().0;
+        std::fs::write(path, vec![0; size as usize]).unwrap();
+        pipeline.start_input_endpoint("budget_retraction").unwrap();
+        wait(
+            || {
+                errors
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.contains("max_data_file_bytes exceeded"))
+            },
+            60_000,
+        )
+        .expect("retraction must reserve before opening the data file");
+        assert!(!errors.lock().unwrap().iter().any(|e| e.contains("Parquet")));
+        pipeline.stop().unwrap();
+    })
+}
+
+#[engine_test(requires(Storage))]
+pub fn delta_follow_retention_policies_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        for policy in [None, Some("ignore_changes"), Some("ignore_deletes")] {
+            let table_dir = TempDir::new().unwrap();
+            let uri = table_dir.path().to_str().unwrap();
+            let relation = basic_relation();
+            let expired = change_feed_row(1, "expired");
+            let live = change_feed_row(2, "kept");
+            let appended = change_feed_row(3, "new");
+            let initial = [expired.clone(), live.clone()];
+            let delta = create_table_from_arrow(uri, &change_feed_arrow_schema(), &["s"]).await;
+            let delta = write_data_to_table(delta, &relation, &initial).await;
+
+            let storage_dir = TempDir::new().unwrap();
+            let errors = Arc::new(Mutex::new(Vec::new()));
+            let mut config = json!({"mode": "snapshot_and_follow", "change_feed": "off"});
+            if let Some(policy) = policy {
+                config[policy] = json!(true);
+            }
+            let pipeline =
+                delta_input_controller(engine, uri, config, &relation, storage_dir.path(), &errors)
+                    .await
+                    .unwrap();
+            pipeline.start();
+            let output = SqlIdentifier::from("test_output1");
+            wait_or_connector_error(&pipeline, &output, &relation, &initial, &errors).await;
+
+            pipeline
+                .pause_input_endpoint(DELTA_TEST_INPUT_ENDPOINT)
+                .unwrap();
+            wait(
+                || {
+                    pipeline
+                        .is_input_endpoint_paused(DELTA_TEST_INPUT_ENDPOINT)
+                        .unwrap_or(false)
+                },
+                60_000,
+            )
+            .expect("Delta input must pause before retention");
+            let delta = delta
+                .delete()
+                .with_predicate(col("s").eq(lit("expired")))
+                .await
+                .unwrap()
+                .0;
+            if policy.is_some() {
+                // Make a read of the deleted file impossible before releasing the commit to Feldera.
+                let partition = table_dir.path().join("s=expired");
+                let mut files = std::fs::read_dir(&partition).unwrap();
+                let file = files.next().unwrap().unwrap().path();
+                assert_eq!(file.extension().unwrap(), "parquet");
+                assert!(files.next().is_none());
+                std::fs::remove_file(file).unwrap();
+            }
+            let delta =
+                write_data_to_table(delta, &relation, std::slice::from_ref(&appended)).await;
+            pipeline
+                .start_input_endpoint(DELTA_TEST_INPUT_ENDPOINT)
+                .unwrap();
+
+            let mut expected = vec![live, appended];
+            if policy.is_some() {
+                expected.push(expired);
+            }
+            wait_or_connector_error(&pipeline, &output, &relation, &expected, &errors).await;
+
+            let _rewritten = delta
+                .update()
+                .with_predicate(col("id").eq(lit(2i64)))
+                .with_update("b", lit(true))
+                .await
+                .unwrap();
+            if policy == Some("ignore_deletes") {
+                wait(
+                    || {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|e| e.contains("rewrites data") && e.contains("ignore_deletes"))
+                    },
+                    60_000,
+                )
+                .expect("ignore_deletes must reject the rewrite");
+            } else {
+                let mut rewritten = expected[0].clone();
+                rewritten["b"] = json!(true);
+                if policy == Some("ignore_changes") {
+                    expected.push(rewritten);
+                } else {
+                    expected[0] = rewritten;
+                }
+                wait_or_connector_error(&pipeline, &output, &relation, &expected, &errors).await;
+            }
+            pipeline.stop().unwrap();
+        }
+    })
+}
+
 /// The Arrow schema of [`basic_relation`], as the Delta writer sees it.
 fn change_feed_arrow_schema() -> Arc<ArrowSchema> {
     arrow_schema_of(&basic_relation().fields)
@@ -8027,6 +8845,7 @@ pub(super) fn z85_encode(bytes: &[u8]) -> String {
 
 fn write_id_mapped_log(
     table_dir: &Path,
+    mode: &str,
     schema_string: &str,
     partition_columns: &[&str],
     change_data_feed: bool,
@@ -8061,7 +8880,7 @@ fn write_id_mapped_log(
                 "schemaString": schema_string,
                 "partitionColumns": partition_columns,
                 "configuration": {
-                    "delta.columnMapping.mode": "id",
+                    "delta.columnMapping.mode": mode,
                     "delta.columnMapping.maxColumnId": max_column_id.to_string(),
                     "delta.enableChangeDataFeed": change_data_feed.to_string(),
                 },
@@ -8275,7 +9094,7 @@ fn write_id_mapped_table_with_deletion_vector(
     let (table_schema, schema_string) = id_mapped_schema(relation, true);
     let stored: Vec<usize> = (0..table_schema.fields().len()).collect();
 
-    write_id_mapped_log(table_dir, &schema_string, &[], false, 1, |version| {
+    write_id_mapped_log(table_dir, "id", &schema_string, &[], false, 1, |version| {
         files
             .iter()
             .enumerate()
@@ -8329,6 +9148,7 @@ fn write_id_mapped_table_with(
 
     write_id_mapped_log(
         table_dir,
+        "id",
         &schema_string,
         partition_column.as_slice(),
         false,
@@ -8368,6 +9188,92 @@ fn write_id_mapped_table_with(
     );
 }
 
+/// `batch` with its columns' field ids renumbered from `first` in file order, the
+/// way a writer that ignores the log's column mapping ids stamps them. A column
+/// the file leaves out, such as a partition column, then shifts every later one
+/// onto the id the log gives its neighbour. Only top-level columns are
+/// renumbered, so `batch` must be flat.
+fn renumber_field_ids(batch: &RecordBatch, first: i64) -> RecordBatch {
+    let fields: Vec<arrow::datatypes::Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(first..)
+        .map(|(field, id)| {
+            assert!(!field.data_type().is_nested());
+            let mut metadata = field.metadata().clone();
+            metadata.insert("PARQUET:field_id".to_string(), id.to_string());
+            field.as_ref().clone().with_metadata(metadata)
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), batch.columns().to_vec()).unwrap()
+}
+
+/// A `columnMapping.mode = 'name'` table partitioned on `partition`, one file
+/// per commit, every file naming its columns physically as Delta does.
+///
+/// The first commit's file is stamped with the log's column mapping ids, as
+/// Spark writes them. Every later one is renumbered by [`renumber_field_ids`],
+/// as another writer leaves them, and the last of them carries a deletion vector
+/// masking its rows at the indexes `deleted` gives.
+fn write_name_mapped_mixed_writers_table(
+    table_dir: &Path,
+    relation: &Relation,
+    partition: (&str, &[&str]),
+    commits: &[&[Value]],
+    deleted: &[u32],
+) {
+    let (table_schema, schema_string) = id_mapped_schema(relation, false);
+    let (partition_column, partition_values) = partition;
+    let stored: Vec<usize> = table_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name() != partition_column)
+        .map(|(index, _)| index)
+        .collect();
+    let partition_key = format!(
+        "col-{}",
+        table_schema
+            .field_with_name(partition_column)
+            .unwrap()
+            .metadata()["PARQUET:field_id"]
+    );
+
+    write_id_mapped_log(
+        table_dir,
+        "name",
+        &schema_string,
+        &[partition_column],
+        false,
+        commits.len(),
+        |version| {
+            let index = version as usize - 1;
+            let batch = to_physical_batch(
+                &id_mapped_batch(relation, &table_schema, commits[index])
+                    .project(&stored)
+                    .unwrap(),
+            );
+            let batch = match version {
+                1 => batch,
+                _ => renumber_field_ids(&batch, 100),
+            };
+            let name = format!("part-{version:05}-0.parquet");
+            write_parquet(table_dir, &name, &batch);
+            let key = &partition_key;
+            vec![IdMappedFile {
+                path: name,
+                partition_values: json!({key: partition_values[index]}),
+                change_data: false,
+                deleted_rows: match index == commits.len() - 1 {
+                    true => deleted.to_vec(),
+                    false => Vec::new(),
+                },
+            }]
+        },
+    );
+}
+
 /// A `mode = 'id'` table with the Change Data Feed on: commit 1 adds `rows`,
 /// commit 2 records `changes` in a `cdc` action with their `_change_type`.
 ///
@@ -8391,6 +9297,7 @@ fn write_id_mapped_change_data_table(
 
     write_id_mapped_log(
         table_dir,
+        "id",
         &schema_string,
         &[],
         true,
@@ -8869,6 +9776,71 @@ pub fn follow_id_mapped_partitioned_test(engine: &dyn PipelineTestEngine) {
             rows_zset(&uniform_relation(), &expected),
             "the partition column must come back from the log, not as NULL"
         );
+    })
+}
+
+/// A `mode = 'name'` table resolves its columns by physical name, whatever
+/// field ids its data files carry.
+///
+/// Spark stamps a column with its column mapping id, so the partition column
+/// `b`, which no data file stores, leaves a gap between `id` and `i`. The second
+/// commit's writer numbered the stored columns contiguously instead, putting
+/// the log's id for `i` on `s`. Matching by field id read `s` into `i` there,
+/// which fails as text cast to BIGINT. That file's deletion vector also sends
+/// a follow read through the masked reader rather than the listing.
+#[engine_test]
+pub fn name_mapped_mixed_field_ids_test(engine: &dyn PipelineTestEngine) {
+    run_async_on(2, async {
+        let table_dir = TempDir::new().unwrap();
+        let spark = [
+            json!({"id": 1, "b": true, "i": 10, "s": "/logs/1.xel"}),
+            json!({"id": 2, "b": true, "i": null, "s": "/logs/2.xel"}),
+        ];
+        let renumbered = [
+            json!({"id": 3, "b": false, "i": 30, "s": "/logs/3.xel"}),
+            json!({"id": 4, "b": false, "i": null, "s": "/logs/4.xel"}),
+            json!({"id": 5, "b": false, "i": 50, "s": "/logs/5.xel"}),
+        ];
+        write_name_mapped_mixed_writers_table(
+            table_dir.path(),
+            &basic_relation(),
+            ("b", &["true", "false"]),
+            &[&spark, &renumbered],
+            &[2],
+        );
+        let table_uri = table_dir.path().display().to_string();
+        let expected = rows_zset(
+            &basic_relation(),
+            &[spark.to_vec(), renumbered[..2].to_vec()].concat(),
+        );
+
+        let uri = table_uri.clone();
+        let snapshot = off_runtime(move || {
+            let output_file = NamedTempFile::new().unwrap();
+            let pipeline = delta_table_input_pipeline(
+                engine,
+                &uri,
+                &basic_relation(),
+                &HashMap::from([("mode".to_string(), json!("snapshot"))]),
+                &output_file.path().display().to_string(),
+            );
+            pipeline.start();
+            wait(|| pipeline.pipeline_complete(), 60_000).expect("timeout ingesting the table");
+            pipeline.stop().unwrap();
+            file_zset(&basic_relation(), &output_file)
+        });
+        assert_zset_eq(&snapshot, &expected, "snapshot");
+
+        let follow = off_runtime(move || {
+            read_id_mapped_table(
+                engine,
+                &table_uri,
+                &basic_relation(),
+                2,
+                &[("mode", json!("follow"))],
+            )
+        });
+        assert_zset_eq(&follow, &expected, "follow");
     })
 }
 

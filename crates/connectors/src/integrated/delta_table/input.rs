@@ -2,12 +2,12 @@ use crate::catalog::{ArrowStream, InputCollectionHandle};
 use crate::format::InputBuffer;
 use crate::integrated::DistributedInput;
 use crate::integrated::delta_table::deletion_vector::{
-    MaskedFile, ReadMode, filtered_parquet_table, read_deletion_vector,
+    ColumnMatch, MaskedFile, ReadMode, filtered_parquet_table, read_deletion_vector,
 };
-use crate::integrated::delta_table::field_id_adapter::FieldIdAdapterFactory;
+use crate::integrated::delta_table::field_id_adapter::{FieldIdAdapterFactory, NameMappedSnapshot};
 use crate::integrated::delta_table::table_error_text;
 use crate::integrated::delta_table::{
-    ReadSchema, delta_input_serde_config, register_storage_handlers,
+    ReadSchema, add_identity_endpoint, delta_input_serde_config, register_storage_handlers,
 };
 use crate::transport::{InputEndpoint, InputQueue, InputReaderCommand, IntegratedInputEndpoint};
 use crate::{ControllerError, InputConsumer, InputReader, PipelineState};
@@ -48,6 +48,7 @@ use deltalake::datafusion::dataframe::DataFrame;
 use deltalake::datafusion::execution::context::SQLOptions;
 use deltalake::datafusion::logical_expr::{ExprSchemable, SortExpr};
 use deltalake::datafusion::prelude::{Expr, SessionConfig, SessionContext, cast, ident, lit};
+use deltalake::datafusion::sql::sqlparser::ast::{BinaryOperator, Expr as SqlExpr};
 use deltalake::datafusion::sql::sqlparser::dialect::GenericDialect;
 use deltalake::datafusion::sql::sqlparser::parser::Parser;
 use deltalake::datafusion::sql::sqlparser::tokenizer::Token;
@@ -81,7 +82,7 @@ use feldera_types::program_schema::{Field, Relation};
 use feldera_types::transport::delta_table::{
     DeltaTableIngestMode, DeltaTableReaderConfig, DeltaTableTransactionMode,
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -130,6 +131,168 @@ const DEFAULT_MAX_CONCURRENT_READERS: usize = 6;
 /// Used to detect conflicting values of `max_concurrent_readers` during parallel
 /// connector initialization.
 static MAX_CONCURRENT_READERS: AtomicUsize = AtomicUsize::new(0);
+
+struct DataFileBudget {
+    limit: u64,
+    reserved: AtomicU64,
+    fence: Option<String>,
+}
+
+impl DataFileBudget {
+    fn reserve(&self, bytes: u64) -> AnyResult<()> {
+        self.reserved
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.limit)
+            })
+            .map(|_| ())
+            .map_err(|used| anyhow!(
+                "max_data_file_bytes exceeded: {used} bytes reserved, {bytes} requested, limit {}",
+                self.limit
+            ))
+    }
+}
+
+// Keep reservations across reader reopens while isolating different pipelines.
+type DataFileBudgetRegistry = Mutex<HashMap<(String, String), Arc<DataFileBudget>>>;
+static DATA_FILE_BUDGETS: OnceLock<DataFileBudgetRegistry> = OnceLock::new();
+static DATA_FILE_BUDGET_EPOCH: OnceLock<Duration> = OnceLock::new();
+
+fn data_file_budget(
+    pipeline: Option<&str>,
+    endpoint: &str,
+    limit: Option<u64>,
+    fence: Option<&str>,
+) -> AnyResult<Option<Arc<DataFileBudget>>> {
+    let Some(pipeline) = pipeline.filter(|name| !name.is_empty()) else {
+        if limit.is_some() {
+            bail!("max_data_file_bytes requires a pipeline identity");
+        }
+        return Ok(None);
+    };
+    let key = (pipeline.to_string(), endpoint.to_string());
+    let mut budgets = DATA_FILE_BUDGETS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| anyhow!("data-file budget registry lock poisoned"))?;
+    if let Some(budget) = budgets.get(&key) {
+        if limit != Some(budget.limit) || fence != budget.fence.as_deref() {
+            bail!("data-file budget or fence changed or removed for endpoint '{endpoint}'");
+        }
+        return Ok(Some(Arc::clone(budget)));
+    }
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    if let Some(path) = fence {
+        let path = std::path::Path::new(path);
+        let marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| {
+                anyhow!(
+                    "cannot claim data-file budget fence '{}': {e}",
+                    path.display()
+                )
+            })?;
+        marker.sync_all()?;
+        std::fs::File::open(
+            path.parent()
+                .ok_or_else(|| anyhow!("invalid data-file budget fence path"))?,
+        )?
+        .sync_all()?;
+    }
+    DATA_FILE_BUDGET_EPOCH.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+    });
+    let budget = Arc::new(DataFileBudget {
+        limit,
+        reserved: AtomicU64::new(0),
+        fence: fence.map(str::to_owned),
+    });
+    budgets.insert(key, Arc::clone(&budget));
+    Ok(Some(budget))
+}
+
+#[cfg(test)]
+mod data_file_budget_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_reservations_and_reopen() {
+        let a = data_file_budget(
+            Some("pipeline-a"),
+            "data-file-budget-test-a",
+            Some(50),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let b = data_file_budget(
+            Some("pipeline-a"),
+            "data-file-budget-test-b",
+            Some(50),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(20));
+        let threads: Vec<_> = (0..20)
+            .map(|_| {
+                let a = Arc::clone(&a);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    a.reserve(7).is_ok()
+                })
+            })
+            .collect();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|ok| *ok)
+                .count(),
+            7
+        );
+        assert!(a.reserve(1).is_ok());
+        assert!(a.reserve(1).is_err());
+        assert!(b.reserve(50).is_ok());
+        let reopened = data_file_budget(
+            Some("pipeline-a"),
+            "data-file-budget-test-a",
+            Some(50),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reopened.reserved.load(Ordering::Acquire), 50);
+        assert!(
+            data_file_budget(Some("pipeline-a"), "data-file-budget-test-a", None, None).is_err()
+        );
+        assert!(
+            data_file_budget(
+                Some("pipeline-a"),
+                "data-file-budget-test-a",
+                Some(51),
+                None
+            )
+            .is_err()
+        );
+        let other = data_file_budget(
+            Some("pipeline-b"),
+            "data-file-budget-test-a",
+            Some(50),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(other.reserve(50).is_ok());
+        assert!(data_file_budget(None, "data-file-budget-test-a", Some(50), None).is_err());
+    }
+}
 
 /// Format a DataFusion error, appending actionable guidance when the
 /// underlying variant is `ResourcesExhausted` (the shared memory pool ran
@@ -760,9 +923,25 @@ pub(super) fn parse_cdc_order_by(df: &DataFrame, order_by: &str) -> AnyResult<Ve
         .collect()
 }
 
+fn collect_snapshot_conjuncts(expr: &SqlExpr, terms: &mut Vec<String>) {
+    match expr {
+        SqlExpr::Nested(inner) => collect_snapshot_conjuncts(inner, terms),
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_snapshot_conjuncts(left, terms);
+            collect_snapshot_conjuncts(right, terms);
+        }
+        _ => terms.push(expr.to_string()),
+    }
+}
+
 /// Integrated input connector that reads from a delta table.
 pub struct DeltaTableInputEndpoint {
     endpoint_name: String,
+    pipeline_name: Option<String>,
     config: DeltaTableReaderConfig,
     datafusion: SessionContext,
     consumer: Box<dyn InputConsumer>,
@@ -823,6 +1002,7 @@ impl DeltaTableInputEndpoint {
 
         Self {
             endpoint_name: endpoint_name.to_string(),
+            pipeline_name: pipeline_config.name.clone(),
             config: config.clone(),
             datafusion,
             consumer,
@@ -843,7 +1023,7 @@ impl IntegratedInputEndpoint for DeltaTableInputEndpoint {
         resume_info: Option<JsonValue>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(DeltaTableInputReader::new(
-            self.endpoint_name,
+            (self.endpoint_name, self.pipeline_name),
             self.config,
             self.datafusion,
             self.consumer,
@@ -926,7 +1106,7 @@ fn validate_distributed(config: &DeltaTableReaderConfig) -> AnyResult<()> {
 
 impl DeltaTableInputReader {
     fn new(
-        endpoint_name: String,
+        (endpoint_name, pipeline_name): (String, Option<String>),
         mut config: DeltaTableReaderConfig,
         datafusion: SessionContext,
         consumer: Box<dyn InputConsumer>,
@@ -997,8 +1177,17 @@ impl DeltaTableInputReader {
         }
 
         if distributed.is_some() {
+            if config.max_data_file_bytes.is_some() {
+                bail!("'max_data_file_bytes' does not support distributed Delta readers");
+            }
             validate_distributed(&config)?;
         }
+        let data_file_budget = data_file_budget(
+            pipeline_name.as_deref(),
+            &endpoint_name,
+            config.max_data_file_bytes,
+            config.data_file_budget_fence.as_deref(),
+        )?;
 
         if config.end_version.is_some() && !config.follow() {
             bail!(
@@ -1079,6 +1268,9 @@ impl DeltaTableInputReader {
             );
         }
 
+        add_identity_endpoint(&config.uri, &mut config.object_store_config, |name| {
+            std::env::var(name).ok()
+        });
         Self::prepare_unity_config(&config.object_store_config);
 
         let input_stream = input_handle
@@ -1095,6 +1287,11 @@ impl DeltaTableInputReader {
             resume_info.clone(),
             distributed,
         ));
+        if let Some(budget) = data_file_budget {
+            endpoint.metrics.data_file_budget.set(budget).map_err(|_| {
+                anyhow!("data-file budget initialized twice for endpoint '{endpoint_name}'")
+            })?;
+        }
 
         // This is needed to initialize completed_frontier for the connector. It's not ideal, as the completion
         // status for the frontier will be set to the current time instead of whenever the table version in resume_info
@@ -1340,6 +1537,7 @@ enum DeltaPhase {
 }
 
 struct DeltaTableMetrics {
+    data_file_budget: OnceLock<Arc<DataFileBudget>>,
     /// Current phase of the connector (see [DeltaPhase]).
     phase: Atomic<DeltaPhase>,
     /// Unix epoch seconds when this run finished reading the snapshot; 0 if
@@ -1371,6 +1569,7 @@ const VERSION_METRIC_UNSET: u64 = u64::MAX;
 impl DeltaTableMetrics {
     fn new() -> Self {
         Self {
+            data_file_budget: OnceLock::new(),
             phase: Atomic::new(DeltaPhase::LoadingSnapshot),
             snapshot_completed_ts: AtomicU64::new(0),
             snapshot_records_total: AtomicU64::new(0),
@@ -1418,7 +1617,7 @@ impl DeltaTableMetrics {
 
 impl ConnectorMetrics for DeltaTableMetrics {
     fn metrics(&self) -> Vec<(&'static str, &'static str, ValueType, f64)> {
-        vec![
+        let mut metrics = vec![
             (
                 "input_connector_delta_phase",
                 "Current phase: 0=loading_snapshot, 1=follow/streaming, 2=completed.",
@@ -1474,7 +1673,45 @@ impl ConnectorMetrics for DeltaTableMetrics {
                 ValueType::Counter,
                 self.commits_from_file_actions.load(Ordering::Relaxed) as f64,
             ),
-        ]
+        ];
+        if let Some(budget) = self.data_file_budget.get() {
+            let epoch = DATA_FILE_BUDGET_EPOCH
+                .get()
+                .expect("budget epoch initialized");
+            metrics.extend([
+                (
+                    "input_connector_delta_data_file_bytes_reserved",
+                    "Logical data-file bytes reserved in this process.",
+                    ValueType::Gauge,
+                    budget.reserved.load(Ordering::Acquire) as f64,
+                ),
+                (
+                    "input_connector_delta_data_file_bytes_limit",
+                    "Per-endpoint logical data-file byte limit.",
+                    ValueType::Gauge,
+                    budget.limit as f64,
+                ),
+                (
+                    "input_connector_delta_budget_process_id",
+                    "Process ID holding the data-file budget.",
+                    ValueType::Gauge,
+                    std::process::id() as f64,
+                ),
+                (
+                    "input_connector_delta_budget_epoch_seconds",
+                    "Seconds of the process budget registry incarnation.",
+                    ValueType::Gauge,
+                    epoch.as_secs() as f64,
+                ),
+                (
+                    "input_connector_delta_budget_epoch_nanos",
+                    "Nanoseconds of the process budget registry incarnation.",
+                    ValueType::Gauge,
+                    epoch.subsec_nanos() as f64,
+                ),
+            ]);
+        }
+        metrics
     }
 }
 
@@ -3276,7 +3513,97 @@ impl DeltaTableInputEndpointInner {
             &self.endpoint_name,
         );
 
-        let provider = table.table_provider().await.map_err(|e| {
+        let selected_paths = if self.metrics.data_file_budget.get().is_some() {
+            let snapshot = table.snapshot().map_err(|e| {
+                ControllerError::input_transport_error(
+                    &self.endpoint_name,
+                    true,
+                    anyhow!("error accessing Delta snapshot: {e}"),
+                )
+            })?;
+            let schema = snapshot.schema();
+            let mut terms = Vec::new();
+            if let Some(filter) = self.effective_snapshot_filter() {
+                let mut parser =
+                    Parser::new(&GenericDialect)
+                        .try_with_sql(&filter)
+                        .map_err(|e| {
+                            ControllerError::input_transport_error(
+                                &self.endpoint_name,
+                                true,
+                                anyhow!("error parsing snapshot filter: {e}"),
+                            )
+                        })?;
+                let expression = parser.parse_expr().map_err(|e| {
+                    ControllerError::input_transport_error(
+                        &self.endpoint_name,
+                        true,
+                        anyhow!("error parsing snapshot filter: {e}"),
+                    )
+                })?;
+                collect_snapshot_conjuncts(&expression, &mut terms);
+            }
+            let session = self.datafusion.state();
+            let supported: Vec<String> = terms
+                .into_iter()
+                .filter(|term| {
+                    deltalake::delta_datafusion::expr::parse_sql_predicate_to_kernel(
+                        term,
+                        schema.as_ref(),
+                        &session,
+                    )
+                    .is_ok()
+                })
+                .map(|term| format!("({term})"))
+                .collect();
+            let predicate = if supported.is_empty() {
+                None
+            } else {
+                Some(Arc::new(
+                    deltalake::delta_datafusion::expr::parse_sql_predicate_to_kernel(
+                        supported.join(" AND "),
+                        schema.as_ref(),
+                        &session,
+                    )
+                    .map_err(|e| {
+                        ControllerError::input_transport_error(
+                            &self.endpoint_name,
+                            true,
+                            anyhow!("error building snapshot file predicate: {e}"),
+                        )
+                    })?,
+                ))
+            };
+            let store = table.log_store();
+            let files: Vec<(String, i64)> = snapshot
+                .snapshot()
+                .file_views(store.as_ref(), predicate)
+                .map_ok(|file| (file.path().to_string(), file.size()))
+                .try_collect()
+                .await
+                .map_err(|e| {
+                    ControllerError::input_transport_error(
+                        &self.endpoint_name,
+                        true,
+                        anyhow!("error selecting snapshot files: {e}"),
+                    )
+                })?;
+            for (path, size) in &files {
+                self.reserve_data_file(path, Some(*size)).map_err(|e| {
+                    ControllerError::input_transport_error(&self.endpoint_name, true, e)
+                })?;
+            }
+            Some(files.into_iter().map(|(path, _)| path))
+        } else {
+            None
+        };
+        let mut builder = table.table_provider();
+        if let Some(paths) = selected_paths {
+            // Provider selection resolves URL paths; reservations use object-store keys.
+            builder =
+                builder.with_file_paths(paths.into_iter().map(|path| Path::from(path).to_string()));
+        }
+        let provider = builder.await.map_err(|e| {
             ControllerError::input_transport_error(
                 &self.endpoint_name,
                 true,
@@ -3290,7 +3617,26 @@ impl DeltaTableInputEndpointInner {
                 .map_err(|e| {
                     ControllerError::input_transport_error(&self.endpoint_name, true, e)
                 })?,
-            None => provider,
+            None => {
+                let mode = table
+                    .snapshot()
+                    .map_err(|e| {
+                        ControllerError::input_transport_error(
+                            &self.endpoint_name,
+                            true,
+                            anyhow!("error accessing Delta snapshot: {e}"),
+                        )
+                    })?
+                    .snapshot()
+                    .table_properties()
+                    .column_mapping_mode;
+                match mode {
+                    Some(ColumnMappingMode::Name) => {
+                        Arc::new(NameMappedSnapshot::new(provider)) as Arc<dyn TableProvider>
+                    }
+                    _ => provider,
+                }
+            }
         };
         self.datafusion
             .register_table("snapshot", provider)
@@ -4138,6 +4484,38 @@ impl DeltaTableInputEndpointInner {
         let used_column_names = self.used_columns();
         let used_columns: Vec<&str> = used_column_names.iter().map(String::as_str).collect();
 
+        if self.config.ignore_changes || self.config.ignore_deletes {
+            if !self.config.ignore_changes
+                && actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Add(add) if add.data_change))
+                && actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Remove(remove) if remove.data_change))
+            {
+                bail!(
+                    "Delta table version {version} rewrites data, which is not supported with 'ignore_deletes'; use 'ignore_changes' to re-ingest rewritten rows"
+                );
+            }
+
+            // A same-path deletion-vector rewrite uses only the new Add's vector.
+            for action in actions {
+                if matches!(action, Action::Add(add) if add.data_change) {
+                    self.process_action(
+                        action,
+                        version,
+                        table,
+                        &used_columns,
+                        input_stream,
+                        receiver,
+                        start_transaction.clone(),
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
+
         // TODO: consider processing all Add actions and all Remove actions in one
         // go using `ListingTable`, which understands partitioning and can probably
         // parallelize the load.
@@ -4195,6 +4573,9 @@ impl DeltaTableInputEndpointInner {
         // data-change pairs, so a metadata-only action never matches.
         for action in actions {
             if let Action::Remove(remove) = action {
+                if self.config.ignore_deletes {
+                    continue;
+                }
                 let newly_deleted = dv_deltas
                     .get(remove.path.as_str())
                     .map(|(newly_deleted, _)| newly_deleted);
@@ -5025,14 +5406,33 @@ impl DeltaTableInputEndpointInner {
             })
             .collect::<AnyResult<Vec<_>>>()?;
 
+        let matching = match self.column_mapping_mode()? {
+            Some(ColumnMappingMode::Name) => ColumnMatch::Name,
+            _ => ColumnMatch::FieldId,
+        };
         filtered_parquet_table(
             table.log_store().object_store(),
             files,
             read_schema,
+            matching,
             mode,
             self.datafusion.copied_config().target_partitions(),
         )
         .await
+    }
+
+    /// Charge the size the Delta log records, since probing the object store
+    /// for it would open the file before the budget admits it.
+    fn reserve_data_file(&self, path: &str, size: Option<i64>) -> AnyResult<()> {
+        let Some(budget) = self.metrics.data_file_budget.get() else {
+            return Ok(());
+        };
+        let size = size
+            .and_then(|size| u64::try_from(size).ok())
+            .ok_or_else(|| {
+                anyhow!("max_data_file_bytes requires the Delta log to record the size of '{path}'")
+            })?;
+        budget.reserve(size)
     }
 
     /// Decode a deletion vector into its bitmap of row positions, or the empty
@@ -5190,6 +5590,7 @@ impl DeltaTableInputEndpointInner {
             Action::Add(add) if add.data_change => {
                 self.add_with_polarity(
                     &add.path,
+                    Some(add.size),
                     true,
                     add.deletion_vector.as_ref(),
                     Some(&add.partition_values),
@@ -5208,6 +5609,7 @@ impl DeltaTableInputEndpointInner {
             {
                 self.add_with_polarity(
                     &remove.path,
+                    remove.size,
                     false,
                     remove.deletion_vector.as_ref(),
                     remove.partition_values.as_ref(),
@@ -5238,6 +5640,7 @@ impl DeltaTableInputEndpointInner {
     async fn add_with_polarity(
         &self,
         path: &str,
+        size: Option<i64>,
         polarity: bool,
         deletion_vector: Option<&DeletionVectorDescriptor>,
         partition_values: Option<&HashMap<String, Option<String>>>,
@@ -5249,6 +5652,7 @@ impl DeltaTableInputEndpointInner {
         receiver: &mut Receiver<PipelineState>,
         start_transaction: Option<Option<String>>,
     ) -> AnyResult<()> {
+        self.reserve_data_file(path, size)?;
         let description = format!("file '{path}'");
         let read_schema = self.physical_read_schema(|name| self.needs_column(name))?;
 
@@ -5309,6 +5713,12 @@ impl DeltaTableInputEndpointInner {
             // empty delta means the rewrite left this side unchanged, so there
             // is nothing to emit.
             Some(positions) if !positions.is_empty() => {
+                let size = match action {
+                    Action::Add(add) => Some(add.size),
+                    Action::Remove(remove) => remove.size,
+                    _ => None,
+                };
+                self.reserve_data_file(path, size)?;
                 let description = format!("file '{path}'");
                 let provider = self
                     .file_provider(

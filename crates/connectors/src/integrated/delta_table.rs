@@ -18,6 +18,7 @@ use feldera_types::serde_with_context::serde_config::{DecimalFormat, UuidFormat}
 use feldera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimestampFormat};
 pub use input::DeltaTableInputEndpoint;
 pub use output::DeltaTableWriter;
+use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::sync::{Arc, Once};
 
@@ -201,6 +202,112 @@ pub fn delta_input_serde_config() -> SqlSerdeConfig {
         // will have to deserialize into VARBINARY first. Alternatively, we can make
         // this configurable.
         .with_uuid_format(UuidFormat::String)
+}
+
+/// Uses `IDENTITY_ENDPOINT`, which Azure sets on hosts with a managed identity,
+/// as the managed identity endpoint of an Azure `uri`. object_store reads that
+/// variable only in `MicrosoftAzureBuilder::from_env`, which delta-rs does not
+/// call. An endpoint in `options` or in an `AZURE_*` variable takes precedence,
+/// and object_store still prefers any other configured credential.
+pub(crate) fn add_identity_endpoint(
+    uri: &str,
+    options: &mut HashMap<String, String>,
+    env: impl Fn(&str) -> Option<String>,
+) {
+    const ENDPOINT_OPTIONS: [&str; 4] = [
+        "azure_msi_endpoint",
+        "azure_identity_endpoint",
+        "identity_endpoint",
+        "msi_endpoint",
+    ];
+    let is_azure = uri.split_once("://").is_some_and(|(scheme, _)| {
+        matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "az" | "adl" | "azure" | "abfs" | "abfss"
+        )
+    });
+    if !is_azure
+        || options
+            .keys()
+            .any(|key| ENDPOINT_OPTIONS.contains(&key.to_ascii_lowercase().as_str()))
+        || ["AZURE_MSI_ENDPOINT", "AZURE_IDENTITY_ENDPOINT"]
+            .iter()
+            .any(|name| env(name).is_some())
+    {
+        return;
+    }
+    if let Some(endpoint) = env("IDENTITY_ENDPOINT").filter(|endpoint| !endpoint.is_empty()) {
+        options.insert("azure_msi_endpoint".to_string(), endpoint);
+    }
+}
+
+#[cfg(test)]
+mod identity_endpoint_tests {
+    use super::add_identity_endpoint;
+    use std::collections::HashMap;
+
+    #[test]
+    fn identity_endpoint_is_the_default_azure_msi_endpoint() {
+        const ENDPOINT: &str = "http://localhost:42356/msi/token";
+        let uri = "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/t";
+        let options = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let added = options(&[("azure_msi_endpoint", ENDPOINT)]);
+        let cases = [
+            (
+                uri,
+                options(&[]),
+                vec![("IDENTITY_ENDPOINT", ENDPOINT)],
+                added.clone(),
+            ),
+            (
+                "AZ://c/t",
+                options(&[]),
+                vec![("IDENTITY_ENDPOINT", ENDPOINT)],
+                added,
+            ),
+            (
+                "s3://bucket/t",
+                options(&[]),
+                vec![("IDENTITY_ENDPOINT", ENDPOINT)],
+                options(&[]),
+            ),
+            (uri, options(&[]), vec![], options(&[])),
+            (
+                uri,
+                options(&[]),
+                vec![("IDENTITY_ENDPOINT", "")],
+                options(&[]),
+            ),
+            (
+                uri,
+                options(&[("MSI_ENDPOINT", "http://explicit")]),
+                vec![("IDENTITY_ENDPOINT", ENDPOINT)],
+                options(&[("MSI_ENDPOINT", "http://explicit")]),
+            ),
+            (
+                uri,
+                options(&[]),
+                vec![
+                    ("IDENTITY_ENDPOINT", ENDPOINT),
+                    ("AZURE_IDENTITY_ENDPOINT", "http://env"),
+                ],
+                options(&[]),
+            ),
+        ];
+        for (uri, mut actual, env, expected) in cases {
+            add_identity_endpoint(uri, &mut actual, |name| {
+                env.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            });
+            assert_eq!(actual, expected, "for {uri} with {env:?}");
+        }
+    }
 }
 
 /// `what` for the table at `uri`, with the error `error` of a library call.

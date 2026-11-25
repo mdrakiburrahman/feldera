@@ -342,6 +342,7 @@ public class SqlToRelCompiler implements IWritesLogs {
         this.connectionConfig = new CalciteConnectionConfigImpl(connConfigProp);
         this.parserConfig = SqlParser.config()
                 .withLex(Lex.ORACLE)
+                .withIdentifierMaxLength(1024)
                 // Our own parser factory
                 .withParserFactory(DbspParserImpl.FACTORY)
                 .withUnquotedCasing(UNQUOTED_CASING)
