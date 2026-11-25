@@ -147,3 +147,28 @@ get it included:
   * `test-java-nightly.yml`
   * `test-java.yml`
   * `test-unit.yml`
+
+## Enterprise compiler derivative
+
+`enterprise-compiler.Dockerfile` builds a private compiler-server for the
+Feldera Enterprise Helm chart from the licensed
+`public.ecr.aws/feldera/compiler-server:0.389.0` image. It keeps the vendor
+compiler, entrypoint, user and Enterprise crates. It replaces only the Delta
+connector sources, the Delta transport types and the SQL compiler jar with this
+branch's versions, then reruns the vendor precompile. The API server, Kubernetes
+runner and pipeline executor stay official. The build fails unless this branch's
+`Cargo.lock` matches the base image's.
+
+```bash
+(cd sql-to-dbsp-compiler && CALCITE_BUILD_DIR=./calcite bash build.sh -pl SQL-compiler)
+mkdir -p build
+cp sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar build/
+docker build -f deploy/enterprise-compiler.Dockerfile \
+  --build-arg REVISION="$(git rev-parse HEAD)" \
+  -t <private-registry>/feldera/compiler-server:"$(git rev-parse --short=12 HEAD)"-ent0.389.0 .
+```
+
+Push the result only to a private registry, and reference it by digest.
+Stock 0.389.0 components parse `ignore_changes` and `ignore_deletes` as
+strings, so Delta connector configurations must give them as `"true"` or
+`"false"`. This branch accepts both string and boolean values.
