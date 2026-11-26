@@ -125,6 +125,25 @@ fn is_default<T: Default + Eq>(t: &T) -> bool {
     *t == T::default()
 }
 
+fn deserialize_bool_or_string<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrString {
+        Bool(bool),
+        String(String),
+    }
+
+    match BoolOrString::deserialize(deserializer)? {
+        BoolOrString::Bool(value) => Ok(value),
+        BoolOrString::String(value) => value.parse().map_err(|_| {
+            serde::de::Error::invalid_value(serde::de::Unexpected::Str(&value), &"true or false")
+        }),
+    }
+}
+
 fn is_default_lookup_chunk_size(n: &ConfigSize) -> bool {
     *n == default_lookup_chunk_size()
 }
@@ -555,10 +574,24 @@ pub struct DeltaTableReaderConfig {
     /// Table read mode.
     pub mode: DeltaTableIngestMode,
 
-    /// While following, skip commits that only remove files. Reject commits that both add and
-    /// remove data.
+    /// While following, skip file removals and insert all live rows from each data-changing Add.
+    /// Rewrites can re-emit rows that were already ingested. Takes precedence over `ignore_deletes`.
     /// Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
-    #[serde(default, skip_serializing_if = "is_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "is_default",
+        deserialize_with = "deserialize_bool_or_string"
+    )]
+    pub ignore_changes: bool,
+
+    /// While following, skip commits that only remove files. Reject commits that both add and
+    /// remove data unless `ignore_changes` is also enabled.
+    /// Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
+    #[serde(
+        default,
+        skip_serializing_if = "is_default",
+        deserialize_with = "deserialize_bool_or_string"
+    )]
     pub ignore_deletes: bool,
 
     /// Transaction mode.
@@ -953,32 +986,41 @@ fn test_delta_change_feed_excludes_cdc_mode() {
 
 #[cfg(test)]
 #[test]
-fn test_delta_ignore_deletes_requires_file_following() {
+fn test_delta_ignore_policies_require_file_following() {
     use serde_json::json;
 
-    for (mode, cdf, expected_error) in [
-        ("snapshot", "off", "snapshot_and_follow"),
-        ("cdc", "off", "snapshot_and_follow"),
-        ("follow", "auto", "change_feed"),
-        ("snapshot_and_follow", "require", "change_feed"),
-    ] {
-        let raw =
-            json!({"uri": "memory://", "mode": mode, "change_feed": cdf, "ignore_deletes": true});
-        let config: DeltaTableReaderConfig = serde_json::from_value(raw).unwrap();
-        let error = config.validate().unwrap_err();
-        assert!(
-            error.contains("ignore_deletes") && error.contains(expected_error),
-            "{error}"
-        );
+    for option in ["ignore_changes", "ignore_deletes"] {
+        for (mode, cdf, expected_error) in [
+            ("snapshot", "off", "snapshot_and_follow"),
+            ("cdc", "off", "snapshot_and_follow"),
+            ("follow", "auto", "change_feed"),
+            ("snapshot_and_follow", "require", "change_feed"),
+        ] {
+            for value in [json!(true), json!("true")] {
+                let mut raw = json!({"uri": "memory://", "mode": mode, "change_feed": cdf});
+                raw[option] = value;
+                let config: DeltaTableReaderConfig = serde_json::from_value(raw).unwrap();
+                assert!(config.object_store_config.is_empty());
+                let error = config.validate().unwrap_err();
+                assert!(
+                    error.contains(option) && error.contains(expected_error),
+                    "{error}"
+                );
+            }
+        }
+
+        let mut raw = json!({"uri": "memory://", "mode": "follow"});
+        raw[option] = json!("true");
+        let config: DeltaTableReaderConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.change_feed(), DeltaTableChangeFeed::Off);
+
+        raw[option] = json!("false");
+        let config: DeltaTableReaderConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!config.ignore_changes && !config.ignore_deletes);
+        raw[option] = json!("yes");
+        assert!(serde_json::from_value::<DeltaTableReaderConfig>(raw).is_err());
     }
-    let config: DeltaTableReaderConfig = serde_json::from_value(
-        json!({"uri": "memory://", "mode": "snapshot_and_follow", "ignore_deletes": true}),
-    )
-    .unwrap();
-    assert!(config.ignore_deletes);
-    assert!(config.object_store_config.is_empty());
-    assert!(config.validate().is_ok());
-    assert_eq!(config.change_feed(), DeltaTableChangeFeed::Off);
 }
 
 #[cfg(test)]
@@ -1267,8 +1309,12 @@ impl DeltaTableReaderConfig {
     /// Reject settings the connector cannot act on, so a misconfigured pipeline
     /// fails at startup naming the setting rather than at the first read.
     pub fn validate(&self) -> Result<(), String> {
-        if self.ignore_deletes {
-            let option = "ignore_deletes";
+        if self.ignore_changes || self.ignore_deletes {
+            let option = if self.ignore_changes {
+                "ignore_changes"
+            } else {
+                "ignore_deletes"
+            };
             if !self.follow() || self.is_cdc() {
                 return Err(format!(
                     "'{option}' is only valid in 'follow' and 'snapshot_and_follow' modes"
@@ -1329,8 +1375,8 @@ impl DeltaTableReaderConfig {
     /// A configured value always wins: the override sets the default, it does
     /// not replace an explicit choice.
     pub fn change_feed(&self) -> DeltaTableChangeFeed {
-        // This policy operates on file actions, even if the global CDF default is enabled.
-        if self.ignore_deletes {
+        // These policies operate on file actions, even if the global CDF default is enabled.
+        if self.ignore_changes || self.ignore_deletes {
             return self.change_feed.unwrap_or(DeltaTableChangeFeed::Off);
         }
         self.change_feed.unwrap_or_else(default_change_feed)

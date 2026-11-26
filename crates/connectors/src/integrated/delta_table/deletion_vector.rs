@@ -383,6 +383,7 @@ pub(crate) async fn filtered_parquet_table(
     store: Arc<dyn ObjectStore>,
     files: Vec<MaskedFile>,
     logical_schema: ReadSchema,
+    matching: ColumnMatch,
     mode: ReadMode,
     max_partitions: usize,
 ) -> AnyResult<Arc<dyn TableProvider>> {
@@ -394,6 +395,7 @@ pub(crate) async fn filtered_parquet_table(
                 store: Arc::clone(&store),
                 files: Arc::new(files),
                 schema: logical_schema.clone(),
+                matching,
                 mode,
             }) as Arc<dyn PartitionStream>
         })
@@ -447,6 +449,8 @@ struct MaskedParquetPartition {
     /// The Delta logical schema; may differ from a file's own schema under
     /// schema evolution.
     schema: ReadSchema,
+    /// How a file's columns pair with `schema`'s.
+    matching: ColumnMatch,
     /// Which rows to read, relative to each file's bitmap.
     mode: ReadMode,
 }
@@ -473,12 +477,35 @@ pub(super) fn field_id(field: &Field) -> Option<&str> {
         .map(String::as_str)
 }
 
-/// Index a field list by field id, skipping fields without one.
-pub(super) fn field_index_by_id(fields: &Fields) -> HashMap<&str, usize> {
+/// How a data file's columns pair with the read schema's.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ColumnMatch {
+    /// By field id, then by name: a `delta.columnMapping.mode = 'id'` table,
+    /// whose files may name a column logically, or an unmapped one.
+    FieldId,
+    /// By name alone: a `delta.columnMapping.mode = 'name'` table. Delta
+    /// resolves its columns by physical name, and the field ids a writer stamps
+    /// on its files need not be the table's.
+    Name,
+}
+
+impl ColumnMatch {
+    /// The id to pair `field` by, or `None` to pair it by name.
+    fn id(self, field: &Field) -> Option<&str> {
+        match self {
+            ColumnMatch::FieldId => field_id(field),
+            ColumnMatch::Name => None,
+        }
+    }
+}
+
+/// Index a field list by the ids `matching` pairs fields by, skipping fields
+/// without one.
+pub(super) fn field_index_by_id(fields: &Fields, matching: ColumnMatch) -> HashMap<&str, usize> {
     fields
         .iter()
         .enumerate()
-        .filter_map(|(i, f)| field_id(f).map(|id| (id, i)))
+        .filter_map(|(i, f)| matching.id(f).map(|id| (id, i)))
         .collect()
 }
 
@@ -486,13 +513,14 @@ pub(super) fn field_index_by_id(fields: &Fields) -> HashMap<&str, usize> {
 ///
 /// Matches by field id, then by name. A name match is accepted only against a
 /// file column carrying no id of its own, since one carrying a different id is
-/// a different column.
+/// a different column. [`ColumnMatch::Name`] matches by name alone.
 ///
 /// # Arguments
 ///
 /// * `file` - the data file's schema, to search.
 /// * `by_id` - `file`'s fields indexed by field id, from [`field_index_by_id`].
 /// * `want` - the field to find.
+/// * `matching` - how to pair the fields.
 ///
 /// # Returns
 ///
@@ -501,12 +529,13 @@ pub(super) fn source_index(
     file: &Schema,
     by_id: &HashMap<&str, usize>,
     want: &Field,
+    matching: ColumnMatch,
 ) -> Option<usize> {
-    match field_id(want) {
+    match matching.id(want) {
         Some(id) => by_id.get(id).copied().or_else(|| {
             file.fields()
                 .iter()
-                .position(|f| field_id(f).is_none() && f.name() == want.name())
+                .position(|f| matching.id(f).is_none() && f.name() == want.name())
         }),
         None => file.index_of(want.name()).ok(),
     }
@@ -561,6 +590,7 @@ fn container_element(data_type: &DataType) -> Option<&FieldRef> {
 ///
 /// * `array` - the file's column.
 /// * `target` - the type the read schema declares for it.
+/// * `matching` - how to pair struct children.
 /// * `file` - the data file's path, for errors.
 /// * `column` - the column's name, for errors.
 ///
@@ -571,13 +601,15 @@ fn container_element(data_type: &DataType) -> Option<&FieldRef> {
 fn realign_container(
     array: &ArrayRef,
     target: &DataType,
+    matching: ColumnMatch,
     file: Option<&str>,
     column: &str,
 ) -> Result<Option<ArrayRef>, DataFusionError> {
     let Some(element) = container_element(target) else {
         return Ok(None);
     };
-    let realigned = |values: &ArrayRef| realign_array(values, element.data_type(), file, column);
+    let realigned =
+        |values: &ArrayRef| realign_array(values, element.data_type(), matching, file, column);
     let rebuild_error =
         |e: arrow::error::ArrowError| conversion_error(file, column, array.data_type(), target, e);
 
@@ -604,7 +636,7 @@ fn realign_container(
     } else if let Some(source) = array.as_any().downcast_ref::<MapArray>() {
         // A map's element is its entries struct, which holds the key and value.
         let entries: ArrayRef = Arc::new(source.entries().clone());
-        let entries = realign_array(&entries, element.data_type(), file, column)?;
+        let entries = realign_array(&entries, element.data_type(), matching, file, column)?;
         let Some(entries) = entries.as_any().downcast_ref::<StructArray>() else {
             return Ok(None);
         };
@@ -632,19 +664,22 @@ fn realign_container(
 /// differently, so a struct is rebuilt child by child: each target child takes
 /// the source child of the same field id, or an id-less one of the same name,
 /// or, in an unmapped struct where no side carries ids, the child at the same
-/// position. A target child the file lacks is null-filled. A list or map is
-/// rebuilt around its realigned elements, since a struct inside one needs that
-/// same matching; `cast` handles the rest.
+/// position. [`ColumnMatch::Name`] takes the child of the same name alone. A
+/// target child the file lacks is null-filled. A list or map is rebuilt around
+/// its realigned elements, since a struct inside one needs that same matching;
+/// `cast` handles the rest.
 ///
 /// # Arguments
 ///
 /// * `array` - the file's column.
 /// * `target` - the type the read schema declares for it.
+/// * `matching` - how to pair struct children.
 /// * `file` - the data file's path, for errors.
 /// * `column` - the column's name, dotted for a nested child, for errors.
 pub(super) fn realign_array(
     array: &ArrayRef,
     target: &DataType,
+    matching: ColumnMatch,
     file: Option<&str>,
     column: &str,
 ) -> Result<ArrayRef, DataFusionError> {
@@ -655,7 +690,7 @@ pub(super) fn realign_array(
     if array.data_type() == target {
         return Ok(Arc::clone(array));
     }
-    if let Some(rebuilt) = realign_container(array, target, file, column)? {
+    if let Some(rebuilt) = realign_container(array, target, matching, file, column)? {
         // The rebuild keeps the file's container kind, so a target that spells
         // it differently needs one more cast, of the offsets alone.
         return if rebuilt.data_type() == target {
@@ -670,7 +705,7 @@ pub(super) fn realign_array(
     let Some(source) = array.as_any().downcast_ref::<StructArray>() else {
         return cast_to_target(array);
     };
-    let src_idx_by_id = field_index_by_id(source.fields());
+    let src_idx_by_id = field_index_by_id(source.fields(), matching);
     // Position is for an unmapped struct alone: once any target field carries an
     // id, the source child at the same position may belong to another field.
     let target_has_ids = target_fields.iter().any(|f| field_id(f).is_some());
@@ -681,19 +716,21 @@ pub(super) fn realign_array(
             // Match by id, then by name, but only against a child that carries
             // no id of its own: a child naming a different id means it, and
             // taking it would read one column's values under another's name.
-            let idx = field_id(tf)
+            let idx = matching
+                .id(tf)
                 .and_then(|id| src_idx_by_id.get(id).copied())
                 .or_else(|| {
                     source
                         .fields()
                         .iter()
-                        .position(|sf| field_id(sf).is_none() && sf.name() == tf.name())
+                        .position(|sf| matching.id(sf).is_none() && sf.name() == tf.name())
                 })
                 .or_else(|| (!target_has_ids).then_some(pos));
             match idx.and_then(|i| source.columns().get(i)) {
                 Some(child) => realign_array(
                     child,
                     tf.data_type(),
+                    matching,
                     file,
                     &format!("{column}.{}", tf.name()),
                 ),
@@ -709,27 +746,29 @@ pub(super) fn realign_array(
         .map_err(|e| conversion_error(file, column, array.data_type(), target, e))
 }
 
-/// Project `batch` onto `logical_schema`, matching columns by field id (falling
-/// back to name), rebuilding nested shapes and casting leaves, and null-filling
-/// columns the file lacks. Field-id matching handles `columnMapping.mode=id`
-/// tables, whose files name columns logically rather than by physical `col-<id>`.
+/// Project `batch` onto `logical_schema`, matching columns as `matching` says,
+/// rebuilding nested shapes and casting leaves, and null-filling columns the
+/// file lacks. Field-id matching handles `columnMapping.mode=id` tables, whose
+/// files name columns logically rather than by physical `col-<id>`.
 ///
 /// Partition columns are absent here (Delta stores them in `partitionValues`,
 /// not in the file); the caller adds them back as constants.
 fn project_to_logical(
     batch: &RecordBatch,
     logical_schema: &SchemaRef,
+    matching: ColumnMatch,
     file: &str,
 ) -> Result<RecordBatch, DataFusionError> {
     let num_rows = batch.num_rows();
     let file_schema = batch.schema();
-    let file_idx_by_id = field_index_by_id(file_schema.fields());
+    let file_idx_by_id = field_index_by_id(file_schema.fields(), matching);
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(logical_schema.fields().len());
     for field in logical_schema.fields().iter() {
-        let col = match source_index(&file_schema, &file_idx_by_id, field) {
+        let col = match source_index(&file_schema, &file_idx_by_id, field, matching) {
             Some(idx) => realign_array(
                 batch.column(idx),
                 field.data_type(),
+                matching,
                 Some(file),
                 field.name(),
             )?,
@@ -750,15 +789,16 @@ fn project_to_logical(
 }
 
 /// Build the [`ProjectionMask`] selecting the root file columns `logical_schema`
-/// wants, matched by field id (falling back to name); the rest are never decoded.
+/// wants, matched as `matching` says; the rest are never decoded.
 fn logical_projection_mask(
     builder: &ParquetRecordBatchStreamBuilder<ObjectStoreReader>,
     logical_schema: &SchemaRef,
+    matching: ColumnMatch,
 ) -> ProjectionMask {
     let want_ids: HashSet<&str> = logical_schema
         .fields()
         .iter()
-        .filter_map(|f| field_id(f))
+        .filter_map(|f| matching.id(f))
         .collect();
     let roots = builder
         .schema()
@@ -766,7 +806,7 @@ fn logical_projection_mask(
         .iter()
         .enumerate()
         .filter(|(_, field)| {
-            field_id(field).is_some_and(|id| want_ids.contains(id))
+            matching.id(field).is_some_and(|id| want_ids.contains(id))
                 || logical_schema.column_with_name(field.name()).is_some()
         })
         .map(|(idx, _)| idx);
@@ -823,6 +863,7 @@ impl PartitionStream for MaskedParquetPartition {
         let store = Arc::clone(&self.store);
         let files = Arc::clone(&self.files);
         let logical_schema = Arc::clone(self.schema.schema());
+        let matching = self.matching;
         let mode = self.mode;
 
         let stream = try_stream! {
@@ -856,7 +897,7 @@ impl PartitionStream for MaskedParquetPartition {
                     metadata,
                 );
                 // Decode only the columns the logical schema names.
-                let mask = logical_projection_mask(&builder, &logical_schema);
+                let mask = logical_projection_mask(&builder, &logical_schema, matching);
                 // Pick rows inside the decoder: skip the flagged rows (apply a DV) or
                 // keep only them (read a DV delta).
                 let selection = bitmap_to_selection(&file.bitmap, total_rows, mode);
@@ -871,7 +912,7 @@ impl PartitionStream for MaskedParquetPartition {
                     let batch = batch.map_err(|e| DataFusionError::External(
                         format!("error reading Parquet file '{path}': {e}").into()))?;
                     if batch.num_rows() > 0 {
-                        yield project_to_logical(&batch, &logical_schema, path.as_ref())?;
+                        yield project_to_logical(&batch, &logical_schema, matching, path.as_ref())?;
                     }
                 }
             }
@@ -988,7 +1029,14 @@ mod tests {
         // A `List` target over a `LargeList` file also exercises the coercion
         // the rebuild leaves to `cast`.
         let target = ArrowDataType::List(element(ArrowDataType::Struct(target_fields)));
-        let out = realign_array(&list, &target, Some(TEST_FILE), "history").unwrap();
+        let out = realign_array(
+            &list,
+            &target,
+            ColumnMatch::FieldId,
+            Some(TEST_FILE),
+            "history",
+        )
+        .unwrap();
         assert_eq!(out.data_type(), &target);
         let out = out.as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(
@@ -1014,9 +1062,15 @@ mod tests {
             ArrowDataType::Utf8,
             false,
         )));
-        let error = realign_array(&source, &target, Some(TEST_FILE), "items")
-            .expect_err("a null element must not pass into a NOT NULL element type")
-            .to_string();
+        let error = realign_array(
+            &source,
+            &target,
+            ColumnMatch::FieldId,
+            Some(TEST_FILE),
+            "items",
+        )
+        .expect_err("a null element must not pass into a NOT NULL element type")
+        .to_string();
         assert!(error.contains("cannot read column 'items'"), "{error}");
         assert!(error.contains(TEST_FILE), "{error}");
         assert!(error.contains("cannot contain nulls"), "{error}");
@@ -1037,7 +1091,14 @@ mod tests {
 
         let target =
             ArrowDataType::List(Arc::new(ArrowField::new("item", ArrowDataType::Utf8, true)));
-        let out = realign_array(&source, &target, Some(TEST_FILE), "items").unwrap();
+        let out = realign_array(
+            &source,
+            &target,
+            ColumnMatch::FieldId,
+            Some(TEST_FILE),
+            "items",
+        )
+        .unwrap();
         assert_eq!(out.data_type(), &target);
         assert_eq!(out.len(), 2);
     }
@@ -1092,7 +1153,8 @@ mod tests {
             ),
         ]));
 
-        let out = project_to_logical(&batch, &read_schema, TEST_FILE).unwrap();
+        let out =
+            project_to_logical(&batch, &read_schema, ColumnMatch::FieldId, TEST_FILE).unwrap();
         assert_eq!(out.schema().field(1).name(), "col-8");
         let op = out
             .column(1)
@@ -1147,7 +1209,14 @@ mod tests {
             ),
         ]));
 
-        let out = realign_array(&source, &target, Some(TEST_FILE), "after").unwrap();
+        let out = realign_array(
+            &source,
+            &target,
+            ColumnMatch::FieldId,
+            Some(TEST_FILE),
+            "after",
+        )
+        .unwrap();
         let out = out.as_any().downcast_ref::<StructArray>().unwrap();
         let present = out
             .column(0)
@@ -1179,7 +1248,14 @@ mod tests {
             "2",
         )]));
 
-        let out = realign_array(&source, &target, Some(TEST_FILE), "after").unwrap();
+        let out = realign_array(
+            &source,
+            &target,
+            ColumnMatch::FieldId,
+            Some(TEST_FILE),
+            "after",
+        )
+        .unwrap();
         assert_eq!(
             first_child_value(&out),
             "t1",
@@ -1205,7 +1281,14 @@ mod tests {
             "5",
         )]));
 
-        let out = realign_array(&source, &target, Some(TEST_FILE), "after").unwrap();
+        let out = realign_array(
+            &source,
+            &target,
+            ColumnMatch::FieldId,
+            Some(TEST_FILE),
+            "after",
+        )
+        .unwrap();
         let out = out.as_any().downcast_ref::<StructArray>().unwrap();
         assert!(
             out.column(0).is_null(0),
@@ -1241,7 +1324,14 @@ mod tests {
             ArrowField::new("beta", ArrowDataType::Utf8, true),
         ]));
 
-        let out = realign_array(&source, &target, Some(TEST_FILE), "after").unwrap();
+        let out = realign_array(
+            &source,
+            &target,
+            ColumnMatch::FieldId,
+            Some(TEST_FILE),
+            "after",
+        )
+        .unwrap();
         let out = out.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(
             out.column(0)
@@ -1278,7 +1368,8 @@ mod tests {
             "5",
         )]));
 
-        let out = project_to_logical(&batch, &read_schema, TEST_FILE).unwrap();
+        let out =
+            project_to_logical(&batch, &read_schema, ColumnMatch::FieldId, TEST_FILE).unwrap();
         assert!(
             out.column(0).is_null(0),
             "id 10's values must not be read as id 5"
@@ -1306,9 +1397,15 @@ mod tests {
             "2",
         )]));
 
-        let err = realign_array(&source, &target, Some(TEST_FILE), "after")
-            .expect_err("Utf8 does not cast to FixedSizeBinary")
-            .to_string();
+        let err = realign_array(
+            &source,
+            &target,
+            ColumnMatch::FieldId,
+            Some(TEST_FILE),
+            "after",
+        )
+        .expect_err("Utf8 does not cast to FixedSizeBinary")
+        .to_string();
 
         // The nested child, not just the top-level column.
         assert!(err.contains("'after.col-2'"), "{err}");
@@ -1592,6 +1689,7 @@ mod tests {
             store,
             files,
             declared,
+            ColumnMatch::FieldId,
             ReadMode::NotInBitmap,
             MAX_PARTITIONS,
         )
@@ -1690,6 +1788,7 @@ mod tests {
                 bitmap: RoaringTreemap::new(),
             }],
             declared.clone(),
+            ColumnMatch::FieldId,
             ReadMode::NotInBitmap,
             1,
         )
@@ -1778,6 +1877,7 @@ mod tests {
                 bitmap: deleted,
             }],
             logical.clone(),
+            ColumnMatch::FieldId,
             ReadMode::NotInBitmap,
             1,
         )
@@ -1869,6 +1969,7 @@ mod tests {
                 bitmap: RoaringTreemap::from_iter([0u64, 2]),
             }],
             logical.clone(),
+            ColumnMatch::FieldId,
             ReadMode::NotInBitmap,
             1,
         )
@@ -1945,6 +2046,7 @@ mod tests {
                 bitmap: selected,
             }],
             logical.clone(),
+            ColumnMatch::FieldId,
             ReadMode::InBitmap,
             1,
         )
@@ -2032,6 +2134,7 @@ mod tests {
                     bitmap: RoaringTreemap::from_iter(bitmap_rows.iter().map(|&row| row as u64)),
                 }],
                 declared.clone(),
+                ColumnMatch::FieldId,
                 mode,
                 1,
             )

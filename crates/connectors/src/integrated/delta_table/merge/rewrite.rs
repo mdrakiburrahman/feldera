@@ -25,7 +25,7 @@ use tracing::debug;
 
 use super::super::ReadSchema;
 use super::super::deletion_vector::{
-    MaskedFile, ReadMode, filtered_parquet_table, read_deletion_vector,
+    ColumnMatch, MaskedFile, ReadMode, filtered_parquet_table, read_deletion_vector,
 };
 use super::super::output::{TARGET_FILE_SIZE, bounded_writer_config};
 use super::commit_actions;
@@ -391,6 +391,7 @@ async fn rewrite_files(
         table.object_store(),
         masked,
         ReadSchema::new(&file_schema),
+        ColumnMatch::FieldId,
         ReadMode::NotInBitmap,
         // Read in physical order: splitting buys nothing here.
         1,

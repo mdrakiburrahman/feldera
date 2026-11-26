@@ -1,28 +1,109 @@
-//! Resolving a [`ListingTable`]'s columns by Delta field id.
+//! Resolving a Delta table's columns in its data files the way its column
+//! mapping mode says.
 //!
 //! Under `delta.columnMapping.mode = 'id'` the log names a column `col-<id>`,
 //! but an Iceberg writer leaves the logical name in the data file. DataFusion
 //! pairs a file's columns with the table schema by name alone, so such a column
-//! reads as NULL. This adapter rewrites each column reference to the name the
-//! file actually uses, found by field id.
+//! reads as NULL. [`FieldIdAdapterFactory`] rewrites each column reference of a
+//! [`ListingTable`] to the name the file actually uses, found by field id.
+//!
+//! Under `delta.columnMapping.mode = 'name'` the files name every column
+//! physically, but their field ids are whatever their writer stamped, which
+//! need not be the log's. [`NameMappedSnapshot`] reads such a table's snapshot
+//! by name alone.
 //!
 //! [`ListingTable`]: datafusion::datasource::listing::ListingTable
 
 use crate::integrated::delta_table::deletion_vector::{
-    field_index_by_id, realign_array, source_index,
+    ColumnMatch, field_index_by_id, realign_array, source_index,
 };
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
+use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{DataFusionError, Result, ScalarValue, exec_err};
-use datafusion::logical_expr::ColumnarValue;
+use datafusion::datasource::TableType;
+use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder};
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::logical_expr::{ColumnarValue, Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{CastExpr, Column, lit};
-use datafusion::physical_expr_adapter::{PhysicalExprAdapter, PhysicalExprAdapterFactory};
+use datafusion::physical_expr_adapter::{
+    DefaultPhysicalExprAdapterFactory, PhysicalExprAdapter, PhysicalExprAdapterFactory,
+};
+use datafusion::physical_plan::ExecutionPlan;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
+/// A `delta.columnMapping.mode = 'name'` table's snapshot provider, reading
+/// each data file's columns by physical name.
+///
+/// The provider delta-rs builds pairs a file's columns with the table's by
+/// Parquet field id first, taking the column mapping id as the one to find. A
+/// writer that numbers a file's columns its own way, such as contiguously past
+/// an omitted partition column, then has one column read another's values.
+/// Delta resolves a name-mapped column by physical name, so every file scan
+/// under this provider pairs its columns by name, as DataFusion does by
+/// default. A file whose ids agree with the log reads the same either way.
+#[derive(Debug)]
+pub(super) struct NameMappedSnapshot {
+    inner: Arc<dyn TableProvider>,
+}
+
+impl NameMappedSnapshot {
+    pub(super) fn new(inner: Arc<dyn TableProvider>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl TableProvider for NameMappedSnapshot {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner
+            .scan(state, projection, filters, limit)
+            .await?
+            .transform_up(|plan| {
+                let Some(config) = plan
+                    .downcast_ref::<DataSourceExec>()
+                    .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+                    .filter(|config| config.expr_adapter_factory.is_some())
+                else {
+                    return Ok(Transformed::no(plan));
+                };
+                let config = FileScanConfigBuilder::from(config.clone())
+                    .with_expr_adapter(Some(Arc::new(DefaultPhysicalExprAdapterFactory) as _))
+                    .build();
+                Ok(Transformed::yes(
+                    DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>
+                ))
+            })
+            .data()
+    }
+}
 
 /// Hands every file scanned by one [`ListingTable`] its own [`FieldIdAdapter`].
 ///
@@ -79,7 +160,7 @@ struct FieldIdAdapter {
 
 impl PhysicalExprAdapter for FieldIdAdapter {
     fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
-        let by_id = field_index_by_id(self.physical_file_schema.fields());
+        let by_id = field_index_by_id(self.physical_file_schema.fields(), ColumnMatch::FieldId);
         expr.transform(|expr| match expr.downcast_ref::<Column>() {
             Some(column) => self.rewrite_column(Arc::clone(&expr), column, &by_id),
             None => Ok(Transformed::no(expr)),
@@ -129,7 +210,12 @@ impl FieldIdAdapter {
                 index,
             ))));
         };
-        let Some(index) = source_index(&self.physical_file_schema, by_id, want) else {
+        let Some(index) = source_index(
+            &self.physical_file_schema,
+            by_id,
+            want,
+            ColumnMatch::FieldId,
+        ) else {
             // A column added after the file was written reads as NULL, which is
             // what it holds for those rows.
             if !want.is_nullable() {
@@ -243,6 +329,7 @@ impl PhysicalExpr for RealignExpr {
         Ok(ColumnarValue::Array(realign_array(
             &array,
             self.target.data_type(),
+            ColumnMatch::FieldId,
             None,
             &self.column,
         )?))

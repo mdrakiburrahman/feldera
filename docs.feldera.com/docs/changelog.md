@@ -11,6 +11,9 @@ Source edition can be found on github.
 ## Unreleased
 
 - Delta Lake sources support `ignore_deletes` to retain rows when source files expire.
+- Delta name-mapped reads resolve physical names even when writers assign different Parquet field IDs.
+- Delta file following supports `ignore_changes` to retain removals and re-ingest data-changing adds.
+- SQL identifiers may be up to 1024 characters; inline window results have unknown expression lineage.
 
 ## v0.391.0
 
