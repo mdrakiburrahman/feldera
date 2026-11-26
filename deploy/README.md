@@ -115,6 +115,44 @@ echo "amd64 manifest: $MANIFEST"
 docker buildx imagetools inspect --raw "$IMAGE_REPOSITORY@$MANIFEST" | jq -r '.config.digest'
 ```
 
+### Use a source-built compiler with Enterprise Helm 0.391.0
+
+The compiler, not the API server, produces the pipeline binary and links its
+Delta reader. `build-enterprise-compiler.sh` takes six public Rust source files
+and the SQL compiler sources from the current **committed** revision. It builds
+the jar with the 0.391.0 Maven project version, leaving the official compiler
+executable, Rust lockfile, Enterprise crates and entrypoint in the pinned
+licensed image. It then repeats the vendor precompile with those sources.
+This tests selected changes on the release ABI, not all of `main` on Enterprise.
+
+Run in a non-shallow clone with the public v0.391.0 commit available, using
+Java 21, Maven and Docker Buildx. Publish only to a **private** registry that
+the cluster can pull from:
+
+```bash
+export IMAGE="registry.example.com/private/compiler-server:$(git rev-parse --short=12 HEAD)"
+bash deploy/build-enterprise-compiler.sh
+docker push "$IMAGE"
+docker buildx imagetools inspect "$IMAGE"
+```
+
+Keep the official chart and its `felderaVersion` at 0.391.0. Its shared
+repository value affects all components. Instead, use a Helm post-renderer
+that runs Kustomize on the rendered manifest with this `images` entry
+(substitute the pushed index digest):
+
+```yaml
+images:
+  - name: public.ecr.aws/feldera/compiler-server
+    newName: registry.example.com/private/compiler-server
+    digest: sha256:<index-digest>
+```
+
+Use the same `--post-renderer` on install and upgrade. Check the `helm template`
+output: only compiler-server should use the private digest; api-server,
+kubernetes-runner and pipeline-executor stay official. Pass the Delta follow
+flags as strings through stock components (see the Delta source docs).
+
 # How to add a new package to the Docker images
 
 Let's say you discover that a new dependency (that can be installed

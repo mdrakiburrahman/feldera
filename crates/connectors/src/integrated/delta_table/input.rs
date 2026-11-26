@@ -2,9 +2,9 @@ use crate::catalog::{ArrowStream, InputCollectionHandle};
 use crate::format::InputBuffer;
 use crate::integrated::DistributedInput;
 use crate::integrated::delta_table::deletion_vector::{
-    MaskedFile, ReadMode, filtered_parquet_table, read_deletion_vector,
+    ColumnMatch, MaskedFile, ReadMode, filtered_parquet_table, read_deletion_vector,
 };
-use crate::integrated::delta_table::field_id_adapter::FieldIdAdapterFactory;
+use crate::integrated::delta_table::field_id_adapter::{FieldIdAdapterFactory, NameMappedSnapshot};
 use crate::integrated::delta_table::table_error_text;
 use crate::integrated::delta_table::{
     ReadSchema, add_identity_endpoint, delta_input_serde_config, register_storage_handlers,
@@ -3293,7 +3293,26 @@ impl DeltaTableInputEndpointInner {
                 .map_err(|e| {
                     ControllerError::input_transport_error(&self.endpoint_name, true, e)
                 })?,
-            None => provider,
+            None => {
+                let mode = table
+                    .snapshot()
+                    .map_err(|e| {
+                        ControllerError::input_transport_error(
+                            &self.endpoint_name,
+                            true,
+                            anyhow!("error accessing Delta snapshot: {e}"),
+                        )
+                    })?
+                    .snapshot()
+                    .table_properties()
+                    .column_mapping_mode;
+                match mode {
+                    Some(ColumnMappingMode::Name) => {
+                        Arc::new(NameMappedSnapshot::new(provider)) as Arc<dyn TableProvider>
+                    }
+                    _ => provider,
+                }
+            }
         };
         self.datafusion
             .register_table("snapshot", provider)
@@ -4141,17 +4160,36 @@ impl DeltaTableInputEndpointInner {
         let used_column_names = self.used_columns();
         let used_columns: Vec<&str> = used_column_names.iter().map(String::as_str).collect();
 
-        if self.config.ignore_deletes
-            && actions
-                .iter()
-                .any(|a| matches!(a, Action::Add(add) if add.data_change))
-            && actions
-                .iter()
-                .any(|a| matches!(a, Action::Remove(remove) if remove.data_change))
-        {
-            bail!(
-                "Delta table version {version} rewrites data, which is not supported with 'ignore_deletes'"
-            );
+        if self.config.ignore_changes || self.config.ignore_deletes {
+            if !self.config.ignore_changes
+                && actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Add(add) if add.data_change))
+                && actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Remove(remove) if remove.data_change))
+            {
+                bail!(
+                    "Delta table version {version} rewrites data, which is not supported with 'ignore_deletes'; use 'ignore_changes' to re-ingest rewritten rows"
+                );
+            }
+
+            // A same-path deletion-vector rewrite uses only the new Add's vector.
+            for action in actions {
+                if matches!(action, Action::Add(add) if add.data_change) {
+                    self.process_action(
+                        action,
+                        version,
+                        table,
+                        &used_columns,
+                        input_stream,
+                        receiver,
+                        start_transaction.clone(),
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
         }
 
         // TODO: consider processing all Add actions and all Remove actions in one
@@ -4211,9 +4249,6 @@ impl DeltaTableInputEndpointInner {
         // data-change pairs, so a metadata-only action never matches.
         for action in actions {
             if let Action::Remove(remove) = action {
-                if self.config.ignore_deletes {
-                    continue;
-                }
                 let newly_deleted = dv_deltas
                     .get(remove.path.as_str())
                     .map(|(newly_deleted, _)| newly_deleted);
@@ -5044,10 +5079,15 @@ impl DeltaTableInputEndpointInner {
             })
             .collect::<AnyResult<Vec<_>>>()?;
 
+        let matching = match self.column_mapping_mode()? {
+            Some(ColumnMappingMode::Name) => ColumnMatch::Name,
+            _ => ColumnMatch::FieldId,
+        };
         filtered_parquet_table(
             table.log_store().object_store(),
             files,
             read_schema,
+            matching,
             mode,
             self.datafusion.copied_config().target_partitions(),
         )

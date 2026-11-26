@@ -71,6 +71,27 @@ public class ParserTests {
     }
 
     @Test
+    public void longQuotedIdentifiers() throws SqlParseException {
+        String prefix = "x".repeat(128);
+        String first = prefix + "a";
+        String second = prefix + "b".repeat(896);
+        SqlToRelCompiler compiler = this.getCompiler();
+        List<ParsedStatement> statements = compiler.parseStatements(
+                "CREATE TABLE T(\"" + first + "\" INTEGER, \"" + second + "\" VARCHAR);" +
+                "CREATE VIEW V AS SELECT \"" + first + "\", \"" + second + "\" FROM T;");
+        var sources = new SourceFileContents();
+        compiler.compile(statements.get(0), sources);
+        RelNode view = compiler.compile(statements.get(1), sources)
+                .to(CreateViewStatement.class).getRel();
+        Assert.assertEquals(List.of(first, second), view.getRowType().getFieldNames());
+        Assert.assertEquals(SqlTypeName.INTEGER, view.getRowType().getFieldList().get(0).getType().getSqlTypeName());
+        Assert.assertEquals(SqlTypeName.VARCHAR, view.getRowType().getFieldList().get(1).getType().getSqlTypeName());
+        SqlParseException error = Assert.assertThrows(SqlParseException.class,
+                () -> compiler.parse("CREATE TABLE T(\"" + "x".repeat(1025) + "\" INTEGER)"));
+        Assert.assertTrue(error.getMessage().contains("1024"));
+    }
+
+    @Test
     public void ddlTest() throws SqlParseException {
         SqlToRelCompiler calcite = this.getCompiler();
         String ddl = "CREATE TABLE T (\n" +

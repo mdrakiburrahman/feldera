@@ -1434,8 +1434,14 @@ export type DeltaTableReaderConfig = {
    */
   filter?: string | null
   /**
+   * While following, skip file removals and insert all live rows from each data-changing Add.
+   * Rewrites can re-emit rows that were already ingested. Takes precedence over `ignore_deletes`.
+   * Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
+   */
+  ignore_changes?: boolean
+  /**
    * While following, skip commits that only remove files. Reject commits that both add and
-   * remove data.
+   * remove data unless `ignore_changes` is also enabled.
    * Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.
    */
   ignore_deletes?: boolean

@@ -32,6 +32,9 @@ To build the compiler run:
 
 The build process downloads and builds a recent (not yet-released)
 version of the Apache Calcite project, then builds the SQL compiler.
+The source build applies `compat/window-expression-lineage.patch` to the pinned
+Calcite checkout. Inline window results report unknown lineage, matching
+Calcite's handling of `Window` outputs; ordinary column lineage is preserved.
 
 If you want to skip the Calcite build you can instead execute:
 
