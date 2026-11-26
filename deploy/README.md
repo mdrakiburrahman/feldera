@@ -147,3 +147,61 @@ get it included:
   * `test-java-nightly.yml`
   * `test-java.yml`
   * `test-unit.yml`
+
+## Enterprise compiler derivative
+
+The `dev/mdrrahman/onelake` branch owns this build recipe. Its older runtime
+remains unchanged: do not overlay the checkout onto the Enterprise image.
+`build-enterprise-compiler.sh` builds an isolated context from public source
+commit [`1d8dbfbc79559ebee6c2ed2ed7db076eca7aedc9`](https://github.com/mdrakiburrahman/feldera/commit/1d8dbfbc79559ebee6c2ed2ed7db076eca7aedc9),
+the tested fork port on upstream 0.389.0
+(`551711962cef54e581a98febb129b4c8fd360874`). The full SHA, not a moving
+compatibility branch, is the dependency pin. That port contains:
+
+- Delta physical-name reads, including deletion-vector projection, and the
+  fork's file-budget and follow/ignore policies.
+- Boolean-or-string parsing for the ignore policies.
+- The SQL compiler's long-identifier support and Calcite window-expression
+  lineage patch, including the existing focused regression tests.
+
+`enterprise-compiler.Dockerfile` derives from the digest-pinned official
+`compiler-server:0.389.0`. It checks `Cargo.lock` against the vendor's, copies
+the compatible public connector/types sources and rebuilt SQL compiler jar,
+and reruns the vendor precompile with cache-preserving timestamps. The vendor
+compiler executable, entrypoint, environment, ubuntu user, `/home/ubuntu`
+working directory, license checks and proprietary Enterprise crates remain
+unchanged. No proprietary source is exported or committed.
+
+Build in the Feldera devcontainer, with Java 21, Maven, Python 3 and Docker
+Buildx available. Commit and push the recipe before building. The script can
+be called from any directory and fetches the pinned public commit if missing.
+It does not use existing jars, modify the checkout or publish automatically.
+
+```bash
+bash deploy/build-enterprise-compiler.sh
+IMAGE="arcdataanalyticsacr.azurecr.io/feldera/compiler-server:$(git rev-parse --short=12 HEAD)-ent0.389.0"
+# Authenticate to this private ACR separately, without putting tokens in commands.
+docker push "$IMAGE"
+docker buildx imagetools inspect "$IMAGE"
+docker image inspect "$IMAGE" --format '{{json .Config.Labels}}'
+```
+
+Record both the pushed OCI index and linux/amd64 manifest digests, then pin the
+compiler image as `arcdataanalyticsacr.azurecr.io/feldera/compiler-server@sha256:...`.
+`org.opencontainers.image.revision` records the **onelake build revision**;
+`io.feldera.compiler.public-source-revision` records the **compatible runtime
+source revision**. These intentionally differ. Never publish this derivative
+to GHCR or another public registry. The existing AKS kubelet has `AcrPull` on
+this ACR; no new pull secret or role assignment is needed for this cluster.
+
+Only override the Helm chart's compiler-server image. Keep the official
+0.389.0 API server, Kubernetes runner and pipeline executor. Retain the chart
+entrypoint, arguments and probes, the 100Gi compiler PVC, and the recommended
+compiler requests of 16 CPU and 32000Mi memory.
+
+Stock 0.389.0 components pass `ignore_changes` and `ignore_deletes` as strings:
+use `"true"` or `"false"` in connector configurations. The pinned runtime
+parses and executes these flags. Multi-host execution with the default
+non-distributed inputs needs no `transaction_mode` change; a distributed
+`snapshot_and_follow` input requires a mode other than `none`, such as
+`snapshot`.
