@@ -168,8 +168,8 @@ pub mod test;
 /// [`CircuitThread::step`] stores `step + 1` before it collects input, so the
 /// step an input reader is feeding is one less. A controller that has
 /// initiated none is feeding nothing, which is what `None` says; a reader only
-/// ever asks while handling a [`InputReaderCommand::Queue`], which the
-/// controller issues from inside a step.
+/// ever asks while handling a [`Queue`](crate::transport::InputReaderCommand::Queue)
+/// command, which the controller issues from inside a step.
 fn current_step_of(initiated: Step) -> Option<Step> {
     initiated.checked_sub(1)
 }
@@ -312,7 +312,8 @@ impl ControllerBuilder {
     /// If `config` includes storage configuration, this opens the storage,
     /// so that it can be used before building the controller.
     ///
-    /// Use [build](Self::build) to finish building the controller.
+    /// Use one of the `open_*` methods, such as [`Self::open_latest_checkpoint`],
+    /// then [`ControllerInit::init`] to finish building the controller.
     ///
     /// # Arguments
     ///
@@ -689,7 +690,7 @@ pub type RebalanceCallbackFn = Box<dyn FnOnce(Result<(), ControllerError>) + Sen
 
 pub type StartCompactionCallbackFn = Box<dyn FnOnce(Result<(), ControllerError>) + Send>;
 
-/// A command that [Controller] can send to [Controller::circuit_thread].
+/// A command that [Controller] can send to [CircuitThread].
 ///
 /// There is no type for a command reply.  Instead, the command implementation
 /// uses a callback embedded in the command to reply.
@@ -2016,7 +2017,7 @@ impl Controller {
         );
         metrics.histogram(
             "storage_write_latency_seconds",
-            "Write latency for storage blocks in seconds",
+            "Latency in seconds of writes to storage, each of which carries one or more blocks.",
             labels,
             &HistogramDiv::new(WRITE_LATENCY_MICROSECONDS.snapshot(), 1_000_000.0),
         );
@@ -2041,7 +2042,7 @@ impl Controller {
         );
         metrics.histogram(
             "storage_write_block_bytes",
-            "Sizes in bytes of blocks written to storage.",
+            "Sizes in bytes of writes to storage, each of which carries one or more blocks.",
             labels,
             &WRITE_BLOCKS_BYTES.snapshot(),
         );
@@ -4032,7 +4033,7 @@ impl CircuitThread {
     /// holds the bootstrap circuit's commit progress while it is committing (the
     /// backfill transaction, then the synchronization transaction) and is `None`
     /// otherwise. The phase is reported separately, set atomically at each phase
-    /// transition (see [`GlobalControllerMetrics::concurrent_bootstrap_phase`]).
+    /// transition (see [`stats::GlobalControllerMetrics::concurrent_bootstrap_phase`]).
     fn report_concurrent_bootstrap_progress(&mut self) {
         let (update, display) = {
             let updates = self.concurrent_bootstrap_updates.get_or_insert_default();
@@ -6283,6 +6284,58 @@ enum Action {
     SyncCheckpoint(uuid::Uuid),
 }
 
+/// The push that the push timer of a pipeline makes next.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct TimedPush {
+    /// The checkpoint to push.
+    checkpoint: uuid::Uuid,
+
+    /// When the timer pushes it.
+    at: Instant,
+}
+
+impl TimedPush {
+    /// Returns the push that the push timer makes next, if any.
+    ///
+    /// [StepTrigger::trigger] decides both whether to push and how long to
+    /// park from this value, so that it never parks until a push that it will
+    /// not make: a deadline in the past makes the park return at once, and
+    /// the circuit thread spins until something else changes. A host of a
+    /// multihost pipeline makes no timed pushes, because its coordinator
+    /// starts the pushes of all hosts.
+    ///
+    /// # Arguments
+    ///
+    /// * `interval` - the time between automatic pushes, if any.
+    /// * `last_checkpoint` - the newest checkpoint of the pipeline.
+    /// * `last_sync` - the newest checkpoint that the pipeline pushed.
+    /// * `push_requested` - whether a push has been requested already.
+    /// * `coordinated` - whether a coordinator steps the pipeline.
+    ///
+    /// # Returns
+    ///
+    /// The newest checkpoint and when to push it, or `None` if the timer has
+    /// nothing to push.
+    fn next(
+        interval: Option<Duration>,
+        last_checkpoint: &LastCheckpoint,
+        last_sync: &LastCheckpoint,
+        push_requested: bool,
+        coordinated: bool,
+    ) -> Option<Self> {
+        let interval = interval?;
+        let checkpoint = last_checkpoint.id?;
+        if coordinated || push_requested || checkpoint.is_nil() || last_sync.id == Some(checkpoint)
+        {
+            return None;
+        }
+        Some(Self {
+            checkpoint,
+            at: last_sync.timestamp + interval,
+        })
+    }
+}
+
 impl StepTrigger {
     /// Returns a new [StepTrigger].
     fn new(controller: Arc<ControllerInner>) -> Self {
@@ -6316,7 +6369,7 @@ impl StepTrigger {
     /// - Whether we're currently `replaying`.
     /// - Whether the pipeline is currently `bootstrapping`.
     /// - Whether a checkpoint has already been requested.
-    /// - The current [CoordinationRequest] and the current step.
+    /// - The current [StepRequest] and the current step.
     ///
     /// Returns the action for the controller to take.
     #[allow(clippy::too_many_arguments)]
@@ -6344,10 +6397,15 @@ impl StepTrigger {
             None
         };
 
-        // Time of the next checkpoint sync.
-        let next_checkpoint_sync = self
-            .sync_interval
-            .map(|interval| last_sync.timestamp + interval);
+        // The push that the push timer makes next. One value decides both
+        // whether to push and how long to park; see [TimedPush::next].
+        let timed_push = TimedPush::next(
+            self.sync_interval,
+            &last_checkpoint,
+            &last_sync,
+            sync_checkpoint_requested,
+            coordination_request.is_some(),
+        );
 
         let now = Instant::now();
 
@@ -6378,13 +6436,10 @@ impl StepTrigger {
             Some(Action::Step)
         } else if timer_expired(next_checkpoint, now) && !checkpoint_requested {
             Some(Action::Checkpoint)
-        } else if timer_expired(next_checkpoint_sync, now)
-            && !sync_checkpoint_requested
-            && let Some(chk) = last_checkpoint.id
-            && !chk.is_nil()
-            && Some(chk) != last_sync.id
+        } else if let Some(push) = timed_push
+            && now >= push.at
         {
-            Some(Action::SyncCheckpoint(chk))
+            Some(Action::SyncCheckpoint(push.checkpoint))
         } else if self.controller.status.unset_step_requested() {
             // This is after checking the checkpoint timer so that step requests
             // can't indefinitely delay a checkpoint.
@@ -6414,7 +6469,11 @@ impl StepTrigger {
                     // so the step waits for `min_batch_size_records`.
                     self.buffer_timeout = now.checked_add(self.max_buffering_delay);
                 }
-                let wakeup = [self.buffer_timeout, next_checkpoint]
+                // A checkpoint that waits for the push timer needs a wakeup of
+                // its own: the next checkpoint can be far away, and an idle
+                // pipeline has no other reason to wake up.
+                let next_push = timed_push.map(|push| push.at);
+                let wakeup = [self.buffer_timeout, next_checkpoint, next_push]
                     .into_iter()
                     .flatten()
                     .min();
@@ -6462,8 +6521,8 @@ pub struct ControllerInit {
 
     /// The pipeline configuration.
     ///
-    /// This will differ from the one passed into [ControllerInit::new] if a
-    /// checkpoint is read, in which case this fields is computed by combining both configs.
+    /// This will differ from the one passed into [`ControllerBuilder::new`] if a
+    /// checkpoint is read, in which case this field is computed by combining both configs.
     pipeline_config: PipelineConfig,
 
     /// Initial counter for `total_processed_records`.
@@ -7063,11 +7122,10 @@ impl ControllerInit {
 
     /// Create a new I/O controller using config in `self`.
     ///
-    /// Creates a new instance of `Controller` that wraps `circuit`, with input
-    /// and output endpoints specified by the configuration passed to
-    /// [new](Self:new)`.  The controller is created with all endpoints in a
-    /// paused state.  Call [`Self::start`] to unpause the endpoints and start
-    /// ingesting data.
+    /// Creates a new instance of [`Controller`] using `circuit_factory`, with input
+    /// and output endpoints specified by [`Self::pipeline_config`]. The controller
+    /// is created with all endpoints in a paused state. Call [`Controller::start`]
+    /// to unpause the endpoints and start ingesting data.
     ///
     /// # Arguments
     ///
@@ -8514,7 +8572,7 @@ pub struct ControllerInner {
     /// The host that writes each output relation of a multihost pipeline, as the coordinator
     /// assigns them.  The part of a distributed output connector on its stream's host is the
     /// connector's leader (see [output_leader]).  Each checkpoint records it (see
-    /// [ControllerInner::checkpoint_output_assignment]).
+    /// [Self::output_assignment_for_checkpoint]).
     output_assignment: BTreeMap<String, usize>,
 
     /// The leader of each distributed output connector on this host, by connector name.
@@ -9449,7 +9507,7 @@ impl ControllerInner {
             .copied()
             .unwrap_or_default();
         let role = if host == leader_host {
-            let leader = Arc::new(CommitLeader::new(self.layout.n_hosts()));
+            let leader = Arc::new(CommitLeader::new(self.layout.n_hosts(), leader_host));
             self.output_leaders
                 .lock()
                 .unwrap()

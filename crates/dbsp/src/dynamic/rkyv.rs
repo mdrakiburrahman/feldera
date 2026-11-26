@@ -1,10 +1,19 @@
 use super::{AsAny, Comparable, DowncastTrait, OrdRepr};
 use crate::{
+    Error,
+    circuit::checkpointer::checkpoint_invalid_data_error,
     derive_comparison_traits,
-    storage::file::{DbspSerializer, Deserializer},
+    storage::{
+        buffer_cache::FBuf,
+        file::{DbspSerializer, Deserializer},
+    },
 };
 use rkyv::{Archive, Archived, Deserialize, Fallible, Serialize, archived_value};
-use std::{cmp::Ordering, marker::PhantomData, mem::transmute};
+use std::{
+    cmp::Ordering,
+    marker::PhantomData,
+    mem::{size_of, transmute},
+};
 
 /// Trait for DBData that can be deserialized with [`rkyv`].
 ///
@@ -63,6 +72,19 @@ pub trait DeserializableDyn {
         let mut deserializer = Deserializer::default();
         unsafe { self.deserialize_from_bytes_with(bytes, pos, &mut deserializer) };
     }
+
+    /// Deserialize `self` from `bytes`, which holds a value that
+    /// [`SerializeDyn::serialize`] wrote as the root (last) object of the
+    /// buffer.  `bytes` does not need to be aligned.
+    ///
+    /// Returns an error if `bytes` is too short to hold the root object.  This
+    /// does not validate the archive.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` must hold a valid serialized value of the concrete type that
+    /// `self` points to, as its root object.
+    unsafe fn deserialize_root(&mut self, bytes: &[u8]) -> Result<(), Error>;
 }
 
 impl<T> SerializeDyn for T
@@ -91,6 +113,31 @@ where
 
             *self = archived.deserialize(deserializer).unwrap();
         }
+    }
+
+    unsafe fn deserialize_root(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        // rkyv writes the root object last, so it is at the end of the
+        // buffer.  This is the same position that `rkyv::archived_root` uses.
+        let Some(pos) = bytes.len().checked_sub(size_of::<Archived<Self>>()) else {
+            return Err(checkpoint_invalid_data_error(
+                "deserialize root object",
+                format!(
+                    "{} bytes is too short for a {}-byte root object",
+                    bytes.len(),
+                    size_of::<Archived<Self>>()
+                ),
+            ));
+        };
+
+        // Copy into an aligned buffer, because rkyv requires alignment.
+        let mut aligned = FBuf::new();
+        aligned.extend_from_slice(bytes);
+        // SAFETY: `aligned` is aligned for any archived type.  `pos` is where
+        // the root object starts, and rkyv aligned the root object for its
+        // type when it wrote it.  The caller guarantees that the root object
+        // is a valid `Archived<Self>`.
+        unsafe { self.deserialize_from_bytes(&aligned, pos) };
+        Ok(())
     }
 }
 

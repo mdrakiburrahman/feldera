@@ -315,6 +315,11 @@ pub(crate) struct ServerState {
     // of tags, so using String is fine.
     rate_limiter: TokenBucketRateLimiter<String>,
 
+    /// Whether a multihost coordinator drives this pipeline, so that the server serves the
+    /// `/coordination` routes. Only a host of a multihost pipeline starts with the desired
+    /// status [RuntimeDesiredStatus::Coordination].
+    has_coordinator: bool,
+
     coordination_activate: Mutex<Option<CoordinationActivate>>,
 
     /// Leaf lock.
@@ -430,6 +435,7 @@ impl ServerState {
             pull_state: Default::default(),
             rate_limiter,
             samply_state: Default::default(),
+            has_coordinator: desired_status == RuntimeDesiredStatus::Coordination,
             coordination_activate: Default::default(),
             input_choices: Default::default(),
             leases: Default::default(),
@@ -439,8 +445,10 @@ impl ServerState {
         }
     }
 
-    fn for_error(error: ControllerError, deployment_id: Uuid) -> Self {
-        Self::new(
+    /// The state of a pipeline that failed to initialize. A host of a multihost pipeline
+    /// (`has_coordinator`) keeps its `/coordination` routes, so the coordinator sees the error.
+    fn for_error(error: ControllerError, deployment_id: Uuid, has_coordinator: bool) -> Self {
+        let state = Self::new(
             PipelinePhase::InitializationError(Arc::new(error)),
             String::default(),
             RuntimeDesiredStatus::Paused,
@@ -450,7 +458,11 @@ impl ServerState {
             None,
             None,
             None,
-        )
+        );
+        Self {
+            has_coordinator,
+            ..state
+        }
     }
 
     /// Generate an appropriate error when the controller is `None`, which can
@@ -722,6 +734,7 @@ pub struct ServerArgs {
     /// plane (URI SAN `urn:feldera:control-plane`), this pipeline itself, which the
     /// multihost coordinator presents, and the `--extra-client-certificate-uris`. The private
     /// CA verifies them: the runner appends its chain after the leaf in `--https-tls-cert-path`.
+    /// The `/coordination` routes admit only this pipeline.
     #[arg(
         long,
         default_value_t = false,
@@ -1147,7 +1160,11 @@ pub fn run_server(
     )
     .unwrap_or_else(|error| {
         error!("Initialization failed: {error}");
-        WebData::new(ServerState::for_error(error, args.deployment_id))
+        WebData::new(ServerState::for_error(
+            error,
+            args.deployment_id,
+            args.initial == RuntimeDesiredStatus::Coordination,
+        ))
     });
     // Also on a failed start, so a harness can load the next program.
     if let Some(loader) = program_loader
@@ -1788,20 +1805,82 @@ fn pipeline_peer_tls(args: &ServerArgs) -> PipelinePeerTls {
     tls
 }
 
-/// Refuses requests from callers other than the control plane, this pipeline and the listed
-/// external clients.
+/// Whether `req` is for one of the `/coordination` routes.
+fn is_coordination_request(req: &ServiceRequest) -> bool {
+    // The router matches the path after it decodes percent-encoded characters, so check that
+    // path and not the raw one, in which `/%63oordination/activate` would pass.
+    let path = req.match_info().as_str();
+    path == "/coordination" || path.starts_with("/coordination/")
+}
+
+/// Whether `client_auth` admits `caller` to a request, which is for a `/coordination` route if
+/// `coordination`. Only this pipeline, that is, its coordinator and its hosts, may use the
+/// `/coordination` routes.
+fn is_pipeline_request_allowed(
+    client_auth: &PipelineClientAuth,
+    caller: &Caller,
+    coordination: bool,
+) -> bool {
+    if coordination {
+        client_auth.is_allowed_to_coordinate(caller)
+    } else {
+        client_auth.is_allowed(caller)
+    }
+}
+
+/// Refuses the requests that [is_pipeline_request_allowed] does not allow.
 async fn authorize_pipeline_caller(
     client_auth: Option<Arc<PipelineClientAuth>>,
     req: ServiceRequest,
     next: Next<impl MessageBody>,
 ) -> Result<ServiceResponse<impl MessageBody>, ActixError> {
+    let coordination = is_coordination_request(&req);
     feldera_mtls::authorize(
         "pipeline",
-        |caller, _, _| client_auth.is_none_or(|client_auth| client_auth.is_allowed(caller)),
+        |caller, _, _| {
+            client_auth.is_none_or(|client_auth| {
+                is_pipeline_request_allowed(&client_auth, caller, coordination)
+            })
+        },
         req,
         next,
     )
     .await
+}
+
+/// Registers the `/coordination` routes, which only a pipeline with a coordinator serves.
+fn coordination_services(cfg: &mut web::ServiceConfig) {
+    cfg.service(coordination_activate_handler)
+        .service(coordination_status)
+        .service(coordination_step_request)
+        .service(coordination_step_status)
+        .service(coordination_checkpoint_status)
+        .service(coordination_checkpoint_prepare)
+        .service(coordination_checkpoint_release)
+        .service(coordination_checkpoint_complete)
+        .service(coordination_checkpoint_pull)
+        .service(coordination_checkpoint_pull_status)
+        .service(coordination_checkpoint_push)
+        .service(coordination_transaction_status)
+        .service(coordination_completion_status)
+        .service(coordination_adhoc_catalog)
+        .service(coordination_adhoc_lease)
+        .service(coordination_adhoc_scan)
+        .service(coordination_output_commit)
+        .service(coordination_labels_incomplete)
+        .service(coordination_input_choices)
+        .service(coordination_checkpoint_output_assignment)
+        .service(coordination_restart);
+}
+
+/// Refuses every `/coordination` route, for a pipeline without a coordinator. The coordinator
+/// reads 404 as a host that predates a route, so this is a distinct error.
+fn no_coordination_services(cfg: &mut web::ServiceConfig) {
+    async fn no_coordinator() -> Result<HttpResponse, PipelineError> {
+        Err(PipelineError::NoCoordinator)
+    }
+    cfg.route("/coordination", web::route().to(no_coordinator))
+        .route("/coordination/{tail:.*}", web::route().to(no_coordinator));
 }
 
 fn build_app<T>(app: App<T>, state: WebData<ServerState>) -> App<T>
@@ -1809,6 +1888,7 @@ where
     T: ServiceFactory<ServiceRequest, Config = (), Error = ActixError, InitError = ()>,
 {
     let program_load_enabled = state.program_load.get().is_some();
+    let has_coordinator = state.has_coordinator;
     let app = app
         .app_data(state)
         .route(
@@ -1866,28 +1946,14 @@ where
         .service(rebalance)
         .service(start_compaction)
         .service(patch_dynamic_config)
-        .service(coordination_activate_handler)
-        .service(coordination_status)
-        .service(coordination_step_request)
-        .service(coordination_step_status)
-        .service(coordination_checkpoint_status)
-        .service(coordination_checkpoint_prepare)
-        .service(coordination_checkpoint_release)
-        .service(coordination_checkpoint_complete)
-        .service(coordination_checkpoint_pull)
-        .service(coordination_checkpoint_pull_status)
-        .service(coordination_checkpoint_push)
-        .service(coordination_transaction_status)
-        .service(coordination_completion_status)
-        .service(coordination_adhoc_catalog)
-        .service(coordination_adhoc_lease)
-        .service(coordination_adhoc_scan)
-        .service(coordination_output_commit)
-        .service(coordination_labels_incomplete)
-        .service(coordination_input_choices)
-        .service(coordination_checkpoint_output_assignment)
-        .service(coordination_restart)
-        .service(clock_advance);
+        .service(clock_advance)
+        .configure(|cfg| {
+            if has_coordinator {
+                coordination_services(cfg);
+            } else {
+                no_coordination_services(cfg);
+            }
+        });
     if program_load_enabled {
         app.service(load_program)
     } else {
@@ -6435,6 +6501,253 @@ mod test_status {
     }
 }
 
+/// Who may use the `/coordination` routes.
+#[cfg(test)]
+mod test_coordination_access {
+    use super::{ServerState, build_app, is_coordination_request, is_pipeline_request_allowed};
+    use crate::{
+        ControllerError,
+        server::{InitializationState, PipelinePhase},
+    };
+    use actix_web::{
+        App,
+        dev::ServiceResponse,
+        http::StatusCode,
+        test::{TestRequest, call_service, init_service, read_body_json},
+        web::Data as WebData,
+    };
+    use feldera_mtls::{Caller, PipelineClientAuth, pipeline_certificate_uri};
+    use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
+    use uuid::Uuid;
+
+    fn state(desired_status: RuntimeDesiredStatus) -> ServerState {
+        ServerState::new(
+            PipelinePhase::Initializing(InitializationState::Starting),
+            String::default(),
+            desired_status,
+            BootstrapConfig::default(),
+            Uuid::new_v4(),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Only a host of a multihost pipeline, which starts in coordination, serves the
+    /// `/coordination` routes, also when it failed to initialize. Another pipeline refuses
+    /// them with 400 `NoCoordinator`, not 404, which the coordinator reads as a host that
+    /// predates a route.
+    #[actix_web::test]
+    async fn only_hosts_serve_coordination_routes() {
+        let error = || ControllerError::io_error("test", std::io::Error::other("test"));
+        for (state, serves) in [
+            (state(RuntimeDesiredStatus::Coordination), true),
+            (ServerState::for_error(error(), Uuid::new_v4(), true), true),
+            (state(RuntimeDesiredStatus::Running), false),
+            (state(RuntimeDesiredStatus::Paused), false),
+            (state(RuntimeDesiredStatus::Standby), false),
+            (
+                ServerState::for_error(error(), Uuid::new_v4(), false),
+                false,
+            ),
+        ] {
+            let app = init_service(build_app(App::new(), WebData::new(state))).await;
+            for path in [
+                "/coordination/checkpoint/pull_status",
+                "/%63oordination/checkpoint/pull_status",
+            ] {
+                let response = call_service(&app, TestRequest::get().uri(path).to_request()).await;
+                if serves {
+                    assert_eq!(response.status(), StatusCode::OK, "{path}");
+                    continue;
+                }
+                assert_no_coordinator(response, path).await;
+            }
+            if !serves {
+                for path in [
+                    "/coordination",
+                    "/coordination/activate",
+                    "/coordination/x/y",
+                ] {
+                    let request = TestRequest::post().uri(path).to_request();
+                    assert_no_coordinator(call_service(&app, request).await, path).await;
+                }
+            }
+        }
+    }
+
+    async fn assert_no_coordinator(response: ServiceResponse, path: &str) {
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        let body: serde_json::Value = read_body_json(response).await;
+        assert_eq!(body["error_code"], "NoCoordinator", "{path}: {body}");
+    }
+
+    /// With client certificates, only the pipeline itself may use the `/coordination` routes,
+    /// also when the path is percent-encoded. The other routes admit the control plane and
+    /// the listed external clients too.
+    #[test]
+    fn only_the_pipeline_may_coordinate() {
+        const OWN: Uuid = Uuid::from_u128(0xa);
+        const SIDECAR: &str = "urn:example:sidecar";
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.clone().self_signed(&ca_key).unwrap();
+        let mut leaf_params = CertificateParams::default();
+        leaf_params.subject_alt_names = vec![SanType::URI(
+            pipeline_certificate_uri(OWN).try_into().unwrap(),
+        )];
+        let leaf = leaf_params
+            .signed_by(
+                &KeyPair::generate().unwrap(),
+                &Issuer::new(ca_params, ca_key),
+            )
+            .unwrap();
+        let auth = PipelineClientAuth::from_chain(
+            &[leaf.der().clone(), ca.der().clone()],
+            &[SIDECAR.to_string()],
+        )
+        .unwrap();
+
+        let own = Caller::Pipeline(OWN);
+        let control_plane = Caller::ControlPlane;
+        let sidecar = Caller::External(SIDECAR.to_string());
+        let other = Caller::Pipeline(Uuid::from_u128(0xb));
+        #[rustfmt::skip]
+        let table = [
+            // path                              own    control sidecar other
+            ("/coordination/activate",           [true, false, false, false]),
+            ("/%63oordination/activate",         [true, false, false, false]),
+            ("/coordination",                    [true, false, false, false]),
+            ("/stats",                           [true, true,  true,  false]),
+            ("/coordinationx",                   [true, true,  true,  false]),
+        ];
+        for (path, expected) in table {
+            let req = TestRequest::post().uri(path).to_srv_request();
+            for (caller, expected) in [&own, &control_plane, &sidecar, &other]
+                .iter()
+                .zip(expected)
+            {
+                assert_eq!(
+                    is_pipeline_request_allowed(&auth, caller, is_coordination_request(&req)),
+                    expected,
+                    "{caller:?} {path}"
+                );
+            }
+        }
+    }
+
+    /// Through the real middleware and a TLS connection with client certificates, only the
+    /// pipeline itself may use the `/coordination` routes, also when the path is
+    /// percent-encoded, and the control plane still reaches the other routes.
+    #[actix_web::test]
+    async fn middleware_admits_only_the_pipeline_to_coordination_routes() {
+        use super::authorize_pipeline_caller;
+        use actix_web::{HttpServer, middleware::from_fn};
+        use feldera_mtls::CONTROL_PLANE_CERTIFICATE_URI;
+        use rcgen::{ExtendedKeyUsagePurpose, KeyUsagePurpose};
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use std::sync::Arc;
+
+        crate::ensure_default_crypto_provider();
+        const OWN: Uuid = Uuid::from_u128(0xa);
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.clone().self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let issue = |san: SanType, usage: ExtendedKeyUsagePurpose| {
+            let mut params = CertificateParams::default();
+            params.subject_alt_names = vec![san];
+            params.extended_key_usages = vec![usage];
+            let key = KeyPair::generate().unwrap();
+            let cert = params.signed_by(&key, &issuer).unwrap();
+            (
+                cert.der().clone(),
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+        };
+        let uri = |uri: &str| SanType::URI(uri.try_into().unwrap());
+
+        // The server presents a certificate for `localhost` and verifies clients against the
+        // CA, as a pipeline server does with its own certificate chain.
+        let (own_cert, _) = issue(
+            uri(&pipeline_certificate_uri(OWN)),
+            ExtendedKeyUsagePurpose::ClientAuth,
+        );
+        let client_auth =
+            Arc::new(PipelineClientAuth::from_chain(&[own_cert, ca.der().clone()], &[]).unwrap());
+        let (server_cert, server_key) = issue(
+            SanType::DnsName("localhost".try_into().unwrap()),
+            ExtendedKeyUsagePurpose::ServerAuth,
+        );
+        let server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(client_auth.verifier.clone())
+            .with_single_cert(vec![server_cert, ca.der().clone()], server_key)
+            .unwrap();
+
+        let state = WebData::new(state(RuntimeDesiredStatus::Coordination));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = HttpServer::new(move || {
+            let client_auth = Some(client_auth.clone());
+            build_app(
+                App::new().wrap(from_fn(move |req, next| {
+                    authorize_pipeline_caller(client_auth.clone(), req, next)
+                })),
+                state.clone(),
+            )
+        })
+        .on_connect(Caller::record)
+        .workers(1)
+        .listen_rustls_0_23(listener, server_config)
+        .unwrap()
+        .run();
+        let server_handle = server.handle();
+        actix_web::rt::spawn(server);
+
+        let client = |san: SanType| {
+            let (cert, key) = issue(san, ExtendedKeyUsagePurpose::ClientAuth);
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.der().clone()).unwrap();
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_client_auth_cert(vec![cert], key)
+                .unwrap();
+            reqwest::Client::builder()
+                .use_preconfigured_tls(config)
+                .build()
+                .unwrap()
+        };
+        let own = client(uri(&pipeline_certificate_uri(OWN)));
+        let control_plane = client(uri(CONTROL_PLANE_CERTIFICATE_URI));
+        let other = client(uri(&pipeline_certificate_uri(Uuid::from_u128(0xb))));
+
+        let pull_status = "/coordination/checkpoint/pull_status";
+        let encoded = "/%63oordination/checkpoint/pull_status";
+        for (client, path, expected) in [
+            (&own, pull_status, 200),
+            (&own, encoded, 200),
+            (&control_plane, pull_status, 403),
+            (&control_plane, encoded, 403),
+            (&control_plane, "/", 200),
+            (&other, pull_status, 403),
+            (&other, "/", 403),
+        ] {
+            let response = client
+                .get(format!("https://localhost:{port}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), expected, "{path}");
+        }
+        server_handle.stop(false).await;
+    }
+}
+
 /// The server's side of `POST /testing/load`: program generations, the flag, and the
 /// ingress cache.
 #[cfg(test)]
@@ -7433,7 +7746,7 @@ pub mod test_http {
 
     /// A multihost pipeline refuses `send_snapshot`, on a connector in its configuration and on
     /// HTTP egress, because no host might have the whole view.
-    #[engine_test]
+    #[engine_test(requires(Multihost))]
     pub fn multihost_send_snapshot_is_refused(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -7489,7 +7802,7 @@ pub mod test_http {
     /// A distributed null output on 3 hosts runs on every host, and each host
     /// writes its own share of the view: every host gets some rows, and the
     /// shares add up to the view.
-    #[engine_test]
+    #[engine_test(requires(Multihost))]
     pub fn multihost_distributed_null_output(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -7554,7 +7867,7 @@ pub mod test_http {
     /// is one commit, and the table holds every row of the view, once.  The
     /// leader is on host 1, so that it is not the host that ingests.
     #[cfg(feature = "with-deltalake")]
-    #[engine_test]
+    #[engine_test(requires(Multihost))]
     pub fn multihost_distributed_delta_output(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -7648,7 +7961,7 @@ pub mod test_http {
     /// Lake output to a new table waits for the leader, on host 1, to create the table.  This
     /// test has no input connector, but it activates the hosts in the same order.
     #[cfg(feature = "with-deltalake")]
-    #[engine_test]
+    #[engine_test(requires(Multihost))]
     pub fn multihost_input_choices_before_outputs_initialize(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -7714,7 +8027,7 @@ pub mod test_http {
     /// distributed Delta Lake output refuses to start, the leader too, instead of waiting forever
     /// for reports that the other parts cannot send.
     #[cfg(feature = "with-deltalake")]
-    #[engine_test]
+    #[engine_test(requires(Multihost))]
     pub fn multihost_distributed_delta_needs_host_urls(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -7745,7 +8058,7 @@ pub mod test_http {
     /// can be.  The report here is for a step that the leader already finished, so the leader
     /// answers it at once.
     #[cfg(feature = "with-deltalake")]
-    #[engine_test]
+    #[engine_test(requires(Multihost))]
     pub fn multihost_distributed_delta_large_report(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -7781,7 +8094,7 @@ pub mod test_http {
     /// the table holds the files of all 3 parts and the next transaction
     /// version of the leader, in order, and the table holds every row once.
     #[cfg(feature = "with-deltalake")]
-    #[engine_test]
+    #[engine_test(requires(Multihost))]
     pub fn multihost_distributed_delta_many_transactions(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -7831,7 +8144,7 @@ pub mod test_http {
     /// connector runs on the host that the stream is assigned to, as before output connectors could
     /// be distributed, and writes every row once.
     #[cfg(feature = "with-deltalake")]
-    #[engine_test]
+    #[engine_test(requires(Multihost))]
     pub fn multihost_unsupported_distributed_output_runs_on_one_host(
         engine: &dyn PipelineTestEngine,
     ) {
@@ -7887,7 +8200,7 @@ pub mod test_http {
     /// reports fail at once, as transport errors of those parts, instead of retrying forever for a
     /// leader that does not come back.
     #[cfg(feature = "with-deltalake")]
-    #[engine_test]
+    #[engine_test(requires(Multihost))]
     pub fn multihost_distributed_delta_leader_stops(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -7933,7 +8246,7 @@ pub mod test_http {
     /// When the leader of a distributed Delta Lake output cannot commit, every
     /// part reports the error, and no part counts its rows as written.
     #[cfg(all(feature = "with-deltalake", unix))]
-    #[engine_test]
+    #[engine_test(requires(Multihost))]
     pub fn multihost_distributed_delta_commit_failure(engine: &dyn PipelineTestEngine) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -7987,7 +8300,7 @@ pub mod test_http {
 
     /// A 2-host pipeline restarts from its checkpoint with its state: after the restart, the
     /// hosts hold every row of the view from before it.
-    #[engine_test(requires(Storage, Checkpoints))]
+    #[engine_test(requires(Storage, Checkpoints, Multihost))]
     pub fn multihost_restart_from_checkpoint(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -8134,7 +8447,7 @@ pub mod test_http {
     /// Each time, the hosts hold every row of the view, where the layout says, and the view's
     /// output connector gets no row a second time.
     #[cfg(feature = "with-deltalake")]
-    #[engine_test(requires(Storage, Checkpoints))]
+    #[engine_test(requires(Storage, Checkpoints, Multihost))]
     pub fn multihost_view_integrals_layout_follows_checkpoint_and_switch(
         engine: &dyn PipelineTestEngine,
     ) {
@@ -8253,7 +8566,7 @@ pub mod test_http {
     /// bootstraps it and sends every row of the view to the table again.
     /// Later rows reach the table once.
     #[cfg(feature = "with-deltalake")]
-    #[engine_test(requires(Storage, Checkpoints))]
+    #[engine_test(requires(Storage, Checkpoints, Multihost))]
     pub fn multihost_output_becomes_distributed(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -8349,7 +8662,7 @@ pub mod test_http {
     /// Lake output after the restart, exactly as to one that is not
     /// distributed: in both cases the table ends with every row twice.
     #[cfg(feature = "with-deltalake")]
-    #[engine_test(requires(Storage, Checkpoints))]
+    #[engine_test(requires(Storage, Checkpoints, Multihost))]
     pub fn multihost_changed_view_resends_to_distributed_output(engine: &dyn PipelineTestEngine) {
         let mut tables = Vec::new();
         for distributed in [false, true] {
@@ -8440,7 +8753,7 @@ pub mod test_http {
     /// A restart that changes the layout of the views' state (`dev_tweaks.view_integrals`) refuses
     /// a concurrent bootstrap.  The views' state would be rebuilt in the background, and until
     /// cutover every view would read as empty.
-    #[engine_test(requires(Storage, Checkpoints))]
+    #[engine_test(requires(Storage, Checkpoints, Multihost))]
     pub fn multihost_layout_switch_refuses_concurrent_bootstrap(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -10176,7 +10489,7 @@ pub mod test_http {
             assert!(!result.unwrap());
 
             let error = ControllerError::io_error("test", std::io::Error::other("test"));
-            let state = ServerState::for_error(error, Uuid::new_v4());
+            let state = ServerState::for_error(error, Uuid::new_v4(), false);
             assert!(!checkpoint_before_exit(&state).await.unwrap());
         })
     }
@@ -10618,7 +10931,7 @@ pub mod test_http {
     }
 
     /// A host without storage has no checkpoints, so it reports an error for any checkpoint.
-    #[engine_test]
+    #[engine_test(requires(Multihost))]
     pub fn checkpoint_output_assignment_without_storage(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();
@@ -10637,7 +10950,7 @@ pub mod test_http {
     /// With the integrals of its views on all hosts, a 2-host pipeline can restart from its
     /// checkpoint with its view assigned to another host: the view's state does not depend on its
     /// host, so nothing is rebuilt, and after the restart the hosts hold every row of the view.
-    #[engine_test(requires(Storage, Checkpoints))]
+    #[engine_test(requires(Storage, Checkpoints, Multihost))]
     pub fn multihost_restart_with_view_on_another_host(engine: &dyn PipelineTestEngine) {
         actix_web::rt::System::new().block_on(async {
             ensure_default_crypto_provider();

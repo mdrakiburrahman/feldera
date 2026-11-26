@@ -49,6 +49,7 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPVariablePath;
 import org.dbsp.sqlCompiler.ir.expression.DBSPVariantExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPWindowBoundExpression;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLiteral;
+import org.dbsp.sqlCompiler.ir.statement.DBSPExpressionStatement;
 import org.dbsp.sqlCompiler.ir.statement.DBSPLetStatement;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeRawTuple;
@@ -58,6 +59,7 @@ import org.dbsp.util.Utilities;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -76,6 +78,10 @@ import java.util.Set;
 public class FindUsedFields extends SymbolicInterpreter<IUsedFields> {
     final ResolveReferences resolver;
 
+    /** The block still evaluates each Rust expression statement ({@code expr;}) before its tail.
+     * Keep the fields it reads, including operands that do not contribute to a result. */
+    private final Set<DBSPExpression> statementReads = new LinkedHashSet<>();
+
     public FindUsedFields(DBSPCompiler compiler) {
         super(compiler);
         this.resolver = new ResolveReferences(compiler, false);
@@ -87,6 +93,27 @@ public class FindUsedFields extends SymbolicInterpreter<IUsedFields> {
         IUsedFields symbolicValue = this.currentValue.get(decl);
         Utilities.enforce(symbolicValue != null);
         this.set(var, symbolicValue);
+        if (this.context.stream().anyMatch(DBSPExpressionStatement.class::isInstance))
+            this.recordStatementRead(var);
+    }
+
+    /** Follow a variable through its enclosing field selections and unary access operations.
+     * For {@code (*row).1.clone()}, record the clone, whose symbolic value uses column 1.
+     * Recording the inner dereference as a separate read would retain the entire row. */
+    private void recordStatementRead(DBSPVariablePath variable) {
+        DBSPExpression read = variable;
+        for (int i = this.context.size() - 1; i >= 0; i--) {
+            var parent = this.context.get(i);
+            if (parent instanceof DBSPFieldExpression || parent instanceof DBSPCustomOrdField ||
+                    parent instanceof DBSPDerefExpression || parent instanceof DBSPBorrowExpression ||
+                    parent instanceof DBSPCloneExpression || parent instanceof DBSPUnwrapExpression ||
+                    parent instanceof DBSPIsNullExpression) {
+                read = parent.to(DBSPExpression.class);
+            } else {
+                break;
+            }
+        }
+        this.statementReads.add(read);
     }
 
     @Override
@@ -419,6 +446,7 @@ public class FindUsedFields extends SymbolicInterpreter<IUsedFields> {
 
     @Override
     public void startVisit(IDBSPInnerNode node) {
+        this.statementReads.clear();
         this.resolver.apply(node);
         super.startVisit(node);
     }
@@ -434,6 +462,8 @@ public class FindUsedFields extends SymbolicInterpreter<IUsedFields> {
             empty.set(param, fum);
         }
         ParameterFieldUse found = used.getParameterUse();
+        for (var read : this.statementReads)
+            this.get(read).markParameterUse(found);
         // found may not contain some parameters at all; this union ensures that they are all there
         found.union(empty);
         return found;

@@ -582,10 +582,12 @@ public class MetadataTests extends BaseSQLTests {
                               "name" : "t",
                               "nullable" : false,
                               "precision" : -1,
-                              "type" : "VARCHAR"
+                              "type" : "VARCHAR",
+                              "case_sensitive" : false
                             } ],
                             "nullable" : true
-                          }
+                          },
+                          "case_sensitive" : false
                         } ],
                         "nullable" : true
                       },
@@ -1534,6 +1536,39 @@ public class MetadataTests extends BaseSQLTests {
         ObjectMapper mapper = Utilities.deterministicObjectMapper();
         JsonNode parsed = mapper.readTree(json);
         Assert.assertNotNull(parsed);
+    }
+
+    @Test
+    public void issue8025() throws IOException, SQLException {
+        String sql = """
+                CREATE TABLE "🐍t"(s VARCHAR);
+                CREATE VIEW V AS SELECT s || '🐍x' FROM "🐍t";""";
+        File file = createInputScript(sql);
+        File json = this.createTempJsonFile();
+        CompilerMessages messages = CompilerMain.execute("--dataflow", json.getPath(), "--noRust", file.getPath());
+        Assert.assertEquals(0, messages.exitCode);
+        ObjectMapper mapper = Utilities.deterministicObjectMapper();
+        JsonNode parsed = mapper.readTree(json);
+        Assert.assertEquals(mapper.valueToTree(Arrays.asList(sql.split("\n"))), parsed.get("sources"));
+        Set<String> tables = new HashSet<>();
+        for (JsonNode operator : parsed.get("mir"))
+            if (operator.has("table"))
+                tables.add(operator.get("table").asText());
+        Assert.assertTrue(tables.toString(), tables.contains("🐍t"));
+    }
+
+    /** The dataflow report escapes a view name that is a JSON key */
+    @Test
+    public void dataflowViewNameKey() throws IOException, SQLException {
+        String sql = """
+                CREATE TABLE T(x INT);
+                CREATE VIEW "🐍\\q" AS SELECT x FROM T;""";
+        File file = createInputScript(sql);
+        File json = this.createTempJsonFile();
+        CompilerMessages messages = CompilerMain.execute("--dataflow", json.getPath(), "--noRust", file.getPath());
+        Assert.assertEquals(0, messages.exitCode);
+        JsonNode parsed = Utilities.deterministicObjectMapper().readTree(json);
+        Assert.assertTrue(parsed.get("calcite_plan").has("🐍\\q"));
     }
 
     @Test
