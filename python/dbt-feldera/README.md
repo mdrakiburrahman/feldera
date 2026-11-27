@@ -256,13 +256,14 @@ vars:
 ```
 
 This materializes seed input tables and compares their full row multisets,
-including duplicates, with the selected CSVs before reuse. The running
-pipeline's SQL, UDFs, runtime configuration, and compilation profile must
-match. Changed or partially loaded seed data, a changed program, and
-`--full-refresh` fail with a cold-rebuild requirement; they are not updated
-in place. Enabling this mode for an existing pipeline also requires a cold
-rebuild because seed tables become materialized. Serialize builds and other
-writers to seed tables while checking.
+including duplicates, with the selected CSVs before reuse. If a nonempty seed's
+table is empty, the adapter re-submits it; nonempty changed or partially loaded
+seed data, a changed program, and `--full-refresh` fail with a cold-rebuild
+requirement rather than being updated in place. The running pipeline's SQL,
+UDFs, runtime configuration, and compilation profile must match. Enabling this
+mode for an existing pipeline also requires a cold rebuild because seed tables
+become materialized. Serialize builds and other writers to seed tables while
+checking.
 SQL assembly uses deterministic dependency ordering even with multiple dbt
 threads. This changes statement ordering compared with older adapter versions,
 so an existing pipeline whose program order differs needs a cold rebuild once.
