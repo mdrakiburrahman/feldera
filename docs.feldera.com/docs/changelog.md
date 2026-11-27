@@ -11,6 +11,9 @@ Source edition can be found on github.
 ## Unreleased
 
 - `CONCAT_WS` no longer inserts a separator before the first non-null string when earlier arguments are null.
+- Spark compatibility mode uses fractional integer division, nullable decimal overflow
+  and division by zero, non-ANSI string-to-integer casts, exact decimal `AVG`, and
+  HALF_UP decimal addition and subtraction.
 - The dbt-feldera adapter can safely reuse matching seed pipelines, verify seed row
   multisets, and accept only zero timestamp fractional digits beyond declared precision.
 - SQL accepts unquoted `date` identifiers and compiles nested `IN`/`NOT IN` predicates over `CASE` expressions.

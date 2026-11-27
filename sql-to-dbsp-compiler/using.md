@@ -210,7 +210,13 @@ Here is a description of the non-obvious command-line options:
      Currently setting this to 0 inhibits some Calcite-level optimizations.
      The default value is "2".
 
---sparkCompat: Use Spark-compatible SQL semantics, including nullable ROW fields by default. Explicit `NOT NULL` is preserved. Disabled by default, unless `FELDERA_SPARK_COMPAT` is `true` or `1` in the compiler process environment. The fork enterprise compiler image enables this default.
+--sparkCompat: Use Spark 3.5 non-ANSI SQL semantics, including nullable ROW fields by default.
+     Integral `/` produces `DOUBLE`; decimal arithmetic overflow and division by zero
+     produce `NULL`, while integer arithmetic overflow wraps. String-to-integer casts
+     trim whitespace and truncate fractional digits; invalid or out-of-range values
+     produce `NULL`. Decimal arithmetic and `AVG` round HALF_UP at the final result
+     scale. Decimal `AVG` retains an exact sum, checks Spark's widened sum precision,
+     and rounds once to `DECIMAL(min(p+4,38), min(s+4,38))`. Explicit `NOT NULL` is preserved. Disabled by default, unless `FELDERA_SPARK_COMPAT` is `true` or `1` in the compiler process environment. The fork enterprise compiler image enables this default.
 
 --streaming: Equivalent to adding the following property to all program tables:
      `'appendOnly' = 'true'`.

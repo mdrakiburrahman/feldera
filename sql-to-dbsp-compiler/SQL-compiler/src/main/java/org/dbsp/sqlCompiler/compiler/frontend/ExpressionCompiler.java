@@ -1185,7 +1185,7 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                     return makeBinaryExpression(node, type, DBSPOpcode.SPARK_DIV, sparkDecimalOperands(ops));
                 if (this.compiler.options.languageOptions.sparkCompat && type.is(DBSPTypeDouble.class)) {
                     List<DBSPExpression> doubles = Linq.map(ops,
-                            o -> o.cast(node, type.withMayBeNull(o.getType().mayBeNull), DBSPCastExpression.CastType.SqlUnsafe));
+                            o -> o.cast(node, DBSPTypeDouble.INSTANCE.withMayBeNull(o.getType().mayBeNull), DBSPCastExpression.CastType.SqlUnsafe));
                     return makeBinaryExpression(node, type, DBSPOpcode.DIV_NULL, doubles);
                 }
                 return makeBinaryExpression(node, type, DBSPOpcode.DIV, ops);

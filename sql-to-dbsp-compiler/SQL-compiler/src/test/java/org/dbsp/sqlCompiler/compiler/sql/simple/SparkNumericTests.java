@@ -179,4 +179,45 @@ public class SparkNumericTests extends SqlIoTest {
                  3 | NULL | NULL | NULL | NULL | NULL""");
     }
 
+
+    @Test
+    public void decimalAverageTiesAndRetractions() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(a DECIMAL(5,0));
+                CREATE VIEW V AS SELECT AVG(a) AS p, AVG(-a) AS n FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES (1)" + ",(0)".repeat(31), """
+                 p | n
+                -------
+                 0.0313 | -0.0313""");
+        ccs.step("REMOVE FROM T VALUES (1)", """
+                 p | n | weight
+                ----------------
+                 0.0313 | -0.0313 | -1
+                 0 | 0 | 1""");
+    }
+
+    @Test
+    public void decimalAverageWindow() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(id INT, a DECIMAL(5,0));
+                CREATE VIEW V AS SELECT id,
+                  AVG(a) OVER(ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS a FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES (1,1),(2,2),(3,3)", """
+                 id | a
+                --------
+                 1 | 1
+                 2 | 1.5
+                 3 | 2.5""");
+    }
+
+    @Test
+    public void fullScaleDecimalArithmetic() {
+        this.qs("""
+                SELECT CAST(.5 AS DECIMAL(38,38))*CAST(.5 AS DECIMAL(38,38)) AS p,
+                       CAST(1 AS DECIMAL(38,0)) % CAST(0 AS DECIMAL(38,0)) AS z;
+                 p | z
+                -------
+                 0.25 | NULL
+                (1 row)""");
+    }
 }
