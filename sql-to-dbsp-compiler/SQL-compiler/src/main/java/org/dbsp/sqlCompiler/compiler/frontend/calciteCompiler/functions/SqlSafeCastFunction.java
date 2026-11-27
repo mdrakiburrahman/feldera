@@ -32,6 +32,7 @@ import org.apache.calcite.sql.SqlSyntax;
 import org.apache.calcite.sql.SqlUtil;
 import org.apache.calcite.sql.SqlWriter;
 import org.apache.calcite.sql.parser.SqlParserPos;
+import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.type.SqlOperandCountRanges;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeMappingRule;
@@ -51,10 +52,12 @@ import static org.apache.calcite.util.Static.RESOURCE;
  * Only used for the SAFE_CAST operator.
  * The Calcite SAFE_CAST operator assumes recursively that element/key/value types are all nullable. */
 public class SqlSafeCastFunction extends CustomFunctions.NonOptimizedFunction {
-    public static final SqlSafeCastFunction INSTANCE = new SqlSafeCastFunction();
+    public static final SqlSafeCastFunction INSTANCE = new SqlSafeCastFunction(false);
+    public static final SqlSafeCastFunction SPARK_CAST = new SqlSafeCastFunction(true);
 
-    private SqlSafeCastFunction() {
-        super("SAFE_CAST", SqlKind.SAFE_CAST, returnTypeInference(),
+    private SqlSafeCastFunction(boolean sparkCast) {
+        super(sparkCast ? "CAST" : "SAFE_CAST", sparkCast ? SqlKind.CAST : SqlKind.SAFE_CAST,
+                returnTypeInference(sparkCast),
                 null, SqlFunctionCategory.SYSTEM, "casts#safe-casts",
                 "runtime_aggtest/illarg_tests/test_cast.py");
     }
@@ -142,9 +145,12 @@ public class SqlSafeCastFunction extends CustomFunctions.NonOptimizedFunction {
                 || SqlLiteral.valueMatchesType(format.getValue(), SqlTypeName.CHAR);
     }
 
-    static SqlReturnTypeInference returnTypeInference() {
+    static SqlReturnTypeInference returnTypeInference(boolean sparkCast) {
         return opBinding -> {
             assert opBinding.getOperandCount() <= 3;
+            if (sparkCast && !(SqlTypeUtil.isCharacter(opBinding.getOperandType(0)) &&
+                    SqlTypeUtil.isIntType(opBinding.getOperandType(1))))
+                return SqlStdOperatorTable.CAST.inferReturnType(opBinding);
             final RelDataType ret = deriveType(opBinding.getTypeFactory(), opBinding.getOperandType(0),
                     opBinding.getOperandType(1));
 

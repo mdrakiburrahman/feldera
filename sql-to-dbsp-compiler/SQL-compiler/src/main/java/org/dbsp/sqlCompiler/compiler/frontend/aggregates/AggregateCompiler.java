@@ -812,8 +812,27 @@ public class AggregateCompiler implements ICompilerComponent {
         }
     }
 
+    IAggregate sparkDecimalAverage() {
+        DBSPExpression value = this.getAggregatedValue();
+        DBSPTypeDecimal input = value.getType().to(DBSPTypeDecimal.class);
+        DBSPTypeUser state = new DBSPTypeUser(this.node, DBSPTypeCode.USER, "SparkDecimalAccumulator", false);
+        DBSPVariablePath acc = state.var();
+        DBSPExpression keep = this.filterArgument >= 0 ? this.filterArgument() : new DBSPBoolLiteral(true);
+        DBSPExpression step = new DBSPApplyExpression(this.node, "spark_decimal_avg_step", DBSPTypeVoid.INSTANCE,
+                acc.borrow(true), value.cast(this.node, input.withMayBeNull(true), DBSPCastExpression.CastType.SqlUnsafe),
+                this.compiler.weightVar, keep);
+        DBSPVariablePath finalState = state.var();
+        DBSPExpression finish = new DBSPApplyExpression(this.node, "spark_decimal_avg_finish", this.nullableResultType,
+                finalState, new DBSPI32Literal(Math.min(38, input.precision + 10)), new DBSPI32Literal(input.scale));
+        DBSPTypeUser semigroup = new DBSPTypeUser(this.node, SEMIGROUP, "SparkDecimalSemigroup", false);
+        return new NonLinearAggregate(this.node, state.constructor("default"), this.makeRowClosure(step, acc),
+                finish.closure(finalState), DBSPLiteral.none(this.nullableResultType), semigroup);
+    }
+
     IAggregate doAverage(SqlAvgAggFunction function) {
         Utilities.enforce(function.getKind() == SqlKind.AVG);
+        if (this.compiler.options.languageOptions.sparkCompat && this.getAggregatedValue().getType().is(DBSPTypeDecimal.class))
+            return this.sparkDecimalAverage();
         DBSPExpression postZero = DBSPLiteral.none(this.nullableResultType);
 
         if (this.linear()) {

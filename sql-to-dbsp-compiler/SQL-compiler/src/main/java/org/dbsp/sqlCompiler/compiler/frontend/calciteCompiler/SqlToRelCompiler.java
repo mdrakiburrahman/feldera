@@ -214,6 +214,8 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SparkArithmeticFunction;
+
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -1035,6 +1037,14 @@ public class SqlToRelCompiler implements IWritesLogs {
             if (newCall.getOperator().kind == SqlKind.SAFE_CAST ||
                     (this.sparkCompat && isDecimalCast(newCall))) {
                 return SqlSafeCastFunction.INSTANCE.createCall(call.getParserPosition(), newCall.getOperandList());
+            }
+            if (this.sparkCompat) {
+                if (newCall.getKind() == SqlKind.CAST)
+                    return SqlSafeCastFunction.SPARK_CAST.createCall(
+                            call.getParserPosition(), newCall.getOperandList());
+                SparkArithmeticFunction arithmetic = SparkArithmeticFunction.replacement(newCall.getOperator());
+                if (arithmetic != null)
+                    return arithmetic.createCall(call.getParserPosition(), newCall.getOperandList());
             }
             return newCall;
         }

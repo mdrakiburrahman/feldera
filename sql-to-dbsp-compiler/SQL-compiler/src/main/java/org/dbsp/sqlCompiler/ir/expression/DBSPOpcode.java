@@ -59,6 +59,9 @@ public enum DBSPOpcode {
     // Spark forms of MUL and DIV for DECIMAL values, which round HALF_UP to the result scale
     SPARK_MUL("spark_times", false),
     SPARK_DIV("spark_div", false),
+    SPARK_ADD("spark_plus", false),
+    SPARK_SUB("spark_minus", false),
+    SPARK_MOD("spark_mod", false),
     MOD("%", false),
     EQ("==", false),
     NEQ("!=", false),
@@ -159,6 +162,11 @@ public enum DBSPOpcode {
 
     /** True when applied to any null value the operator produces null.
      * A conservative approximation: always safe to say "false" */
+    public boolean isSparkDecimal() {
+        return this == SPARK_MUL || this == SPARK_DIV || this == SPARK_ADD ||
+                this == SPARK_SUB || this == SPARK_MOD;
+    }
+
     public boolean isStrict() {
         return switch (this) {
             case WRAP_BOOL, MAP_CONVERT, ARRAY_CONVERT, CONTROLLED_FILTER_GTE, AGG_LTE, AGG_GTE, AGG_ADD, AGG_MIN,
@@ -168,7 +176,7 @@ public enum DBSPOpcode {
                  SHORT_INTERVAL_TO_INTEGER, INTEGER_TO_SHORT_INTERVAL, INTEGER_TO_UUID, UUID_TO_INTEGER,
                  LONG_INTERVAL_TO_INTEGER, INTEGER_TO_LONG_INTERVAL, BINARY_TO_U64, U64_TO_BINARY,
                  BINARY_TO_U128, U128_TO_BINARY, BOOL_TO_INTEGER, INTEGER_TO_BOOL, RUST_INDEX, VARIANT_INDEX, MAP_INDEX,
-                 SQL_INDEX, XOR, BW_OR, MUL_WEIGHT, BW_AND, GTE, LTE, GT, LT, NEQ, EQ, MOD, DIV_NULL, DIV, MUL, SPARK_MUL, SPARK_DIV, SUB,
+                 SQL_INDEX, XOR, BW_OR, MUL_WEIGHT, BW_AND, GTE, LTE, GT, LT, NEQ, EQ, MOD, DIV_NULL, DIV, MUL, SPARK_MUL, SPARK_DIV, SPARK_ADD, SPARK_SUB, SPARK_MOD, SUB,
                  ADD, TYPEDBOX, IS_TRUE, IS_FALSE, NOT, UNARY_PLUS -> true;
             default -> throw new UnimplementedException();
         };

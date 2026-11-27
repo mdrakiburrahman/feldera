@@ -39,6 +39,7 @@ import org.apache.calcite.rex.RexSubQuery;
 import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.rex.RexVisitorImpl;
 import org.apache.calcite.sql.SqlKind;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SparkArithmeticFunction;
 import org.apache.calcite.sql.SqlSyntax;
 import org.apache.calcite.util.DateString;
 import org.apache.calcite.util.TimeString;
@@ -430,7 +431,7 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
     }
 
     @SuppressWarnings("unused")
-    /** True if a DECIMAL multiplication or division should use Spark's HALF_UP rounding. */
+    /** True if DECIMAL arithmetic should use Spark precision and overflow rules. */
     boolean isSparkDecimalArithmetic(DBSPType type, List<DBSPExpression> ops) {
         if (!this.compiler.options.languageOptions.sparkCompat || !type.is(DBSPTypeDecimal.class))
             return false;
@@ -533,7 +534,7 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
         // potentially insert casts on either operands, and on the result.
         DBSPType leftType = left.getType();
         DBSPType rightType = right.getType();
-        boolean anyNull = leftType.mayBeNull || rightType.mayBeNull;
+        boolean anyNull = leftType.mayBeNull || rightType.mayBeNull || opcode.isSparkDecimal();
         DBSPType typeWithNull = type.withMayBeNull(anyNull);
 
         Utilities.enforce(opcode != DBSPOpcode.DIV_NULL || type.mayBeNull,
@@ -1172,7 +1173,7 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
             return new DBSPStringLiteral(node, type, literal.value);
         }
         String operationName = call.op.kind.sql;
-        switch (call.op.kind) {
+        switch (call.op instanceof SparkArithmeticFunction arithmetic ? arithmetic.operation : call.op.kind) {
             case CHECKED_TIMES:
             case TIMES:
                 if (this.isSparkDecimalArithmetic(type, ops))
@@ -1182,14 +1183,25 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
             case DIVIDE:
                 if (this.isSparkDecimalArithmetic(type, ops))
                     return makeBinaryExpression(node, type, DBSPOpcode.SPARK_DIV, sparkDecimalOperands(ops));
+                if (this.compiler.options.languageOptions.sparkCompat && type.is(DBSPTypeDouble.class)) {
+                    List<DBSPExpression> doubles = Linq.map(ops,
+                            o -> o.cast(node, type.withMayBeNull(o.getType().mayBeNull), DBSPCastExpression.CastType.SqlUnsafe));
+                    return makeBinaryExpression(node, type, DBSPOpcode.DIV_NULL, doubles);
+                }
                 return makeBinaryExpression(node, type, DBSPOpcode.DIV, ops);
             case MOD:
+                if (this.isSparkDecimalArithmetic(type, ops))
+                    return makeBinaryExpression(node, type, DBSPOpcode.SPARK_MOD, sparkDecimalOperands(ops));
                 return makeBinaryExpression(node, type, DBSPOpcode.MOD, ops);
             case CHECKED_PLUS:
             case PLUS:
+                if (this.isSparkDecimalArithmetic(type, ops))
+                    return makeBinaryExpression(node, type, DBSPOpcode.SPARK_ADD, sparkDecimalOperands(ops));
                 return makeBinaryExpressions(node, type, DBSPOpcode.ADD, ops);
             case CHECKED_MINUS:
             case MINUS:
+                if (this.isSparkDecimalArithmetic(type, ops))
+                    return makeBinaryExpression(node, type, DBSPOpcode.SPARK_SUB, sparkDecimalOperands(ops));
                 return makeBinaryExpression(node, type, DBSPOpcode.SUB, ops);
             case LESS_THAN:
                 return makeBinaryExpression(node, type, DBSPOpcode.LT, ops);
@@ -1253,6 +1265,9 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                 }
                 DBSPCastExpression.CastType safe = call.op.kind == SqlKind.SAFE_CAST ?
                         DBSPCastExpression.CastType.SqlSafe : DBSPCastExpression.CastType.SqlUnsafe;
+                if (this.compiler.options.languageOptions.sparkCompat &&
+                        ops.get(0).getType().is(DBSPTypeString.class) && type.is(DBSPTypeInteger.class))
+                    safe = DBSPCastExpression.CastType.SqlSafe;
                 if (ops.get(0).getType().is(DBSPTypeVariant.class))
                     // Casts from variant types are always safe
                     safe = DBSPCastExpression.CastType.SqlSafe;

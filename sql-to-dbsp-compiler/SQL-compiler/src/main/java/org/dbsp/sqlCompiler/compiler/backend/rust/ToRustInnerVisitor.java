@@ -1582,6 +1582,10 @@ public class ToRustInnerVisitor extends InnerVisitor {
                     "_Spark" + sourceType.baseTypeWithSuffix();
         }
 
+        if (this.options.languageOptions.sparkCompat &&
+                destType.is(DBSPTypeInteger.class) && sourceType.code == DBSPTypeCode.STRING)
+            functionName = "cast_to_" + destType.baseTypeWithSuffix() + "_SparkString" + sourceType.nullableSuffix();
+
         if ((sourceType.is(DBSPTypeLongInterval.class) && code == DBSPTypeCode.INTERVAL_LONG) ||
             (sourceType.is(DBSPTypeShortInterval.class) && code == DBSPTypeCode.INTERVAL_SHORT)) {
             // The function depends on the units of the destination only
@@ -1943,8 +1947,7 @@ public class ToRustInnerVisitor extends InnerVisitor {
                                     expression.opcode == DBSPOpcode.DIV ||
                                     expression.opcode == DBSPOpcode.MOD ||
                                     expression.opcode == DBSPOpcode.DIV_NULL ||
-                                    expression.opcode == DBSPOpcode.SPARK_MUL ||
-                                    expression.opcode == DBSPOpcode.SPARK_DIV ||
+                                    expression.opcode.isSparkDecimal() ||
                                     expression.opcode == DBSPOpcode.ADD_SATURATING ||
                                     expression.opcode == DBSPOpcode.SUB_SATURATING ||
                                     expression.opcode == DBSPOpcode.MUL_SATURATING ||
