@@ -2,6 +2,7 @@ from unittest.mock import Mock, patch
 
 import agate
 import pytest
+import sqlglot
 from feldera.enums import PipelineStatus
 from sqlglot.errors import ParseError
 
@@ -132,8 +133,11 @@ def _info(outputs, inputs=None):
     }
 
 
-@pytest.mark.parametrize("clock", [False, True])
-def test_scratch_preserves_duplicates_nulls_and_cleans_up(clock):
+@pytest.mark.parametrize(
+    ("clock", "expected_sql"),
+    [(False, ""), (True, ""), (False, "WITH expected(id) AS (VALUES (1)) SELECT * FROM expected")],
+)
+def test_scratch_preserves_duplicates_nulls_and_cleans_up(clock, expected_sql):
     pipeline = Mock()
     pipeline.status.return_value = PipelineStatus.STOPPED
     actual_info = _info(["dbt_unit_actual"])
@@ -150,8 +154,11 @@ def test_scratch_preserves_duplicates_nulls_and_cleans_up(clock):
         patch("dbt.adapters.feldera.isolated_unit.PipelineStateManager._wait_for_compilation"),
     ):
         builder.return_value.create.return_value = pipeline
-        _, table = run_unit_test(Mock(), "select 1 as id", [{"id": 1}], "", lambda *_: "select 1 as id", "", "", "", 30)
+        _, table = run_unit_test(
+            Mock(), "select 1 as id", [{"id": 1}], expected_sql, lambda *_: "select 1 as id", "", "", "", 30
+        )
     assert len(table.rows) == 5
+    assert len(sqlglot.parse(pipeline.modify.call_args.kwargs["sql"])) == 2
     pipeline.start.assert_called_once_with()
     if clock:
         pipeline.pause.assert_called_once_with()

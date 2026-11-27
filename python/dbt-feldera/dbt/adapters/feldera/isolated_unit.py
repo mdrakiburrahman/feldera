@@ -170,8 +170,7 @@ def run_unit_test(
         expected = (
             "CREATE MATERIALIZED VIEW dbt_unit_expected AS "
             "WITH dbt_internal_unit_test_actual AS (SELECT * FROM dbt_unit_actual) "
-            + expected_sql.rstrip().rstrip(";")
-            + ";"
+            "SELECT * FROM (\n" + expected_sql.rstrip().rstrip(";") + "\n) AS dbt_unit_fixture;"
         )
         pipeline.modify(sql=actual_sql + "\n\n" + expected)
         PipelineStateManager._wait_for_compilation(pipeline, timeout)
