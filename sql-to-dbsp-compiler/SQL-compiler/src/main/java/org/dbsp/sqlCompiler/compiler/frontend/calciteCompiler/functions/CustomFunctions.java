@@ -990,6 +990,11 @@ public class CustomFunctions {
         return result;
     }
 
+    public boolean isUserDefined(String name) {
+        return this.udf.keySet().stream().anyMatch(f -> f.name().equalsIgnoreCase(name)) ||
+                this.aggregates.keySet().stream().anyMatch(f -> f.name().equalsIgnoreCase(name));
+    }
+
     @Nullable
     public ExternalFunction getUDF(ProgramIdentifier function) {
         return this.udf.get(function);

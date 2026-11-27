@@ -817,7 +817,7 @@ public class Regression2Tests extends SqlIoTest {
 
     @Test
     public void issue5821() {
-        this.statementsFailingInCompilation("""
+        this.getCCS("""
                 CREATE TABLE shipments (
                   shipment_id BIGINT,
                   warehouse_id BIGINT,
@@ -835,7 +835,7 @@ public class Regression2Tests extends SqlIoTest {
                 GROUP BY
                   warehouse_id,
                   TIMESTAMP_TRUNC(shipped_at, WEEK);
-                """, "Invalid number of arguments to function 'DATEDIFF'.");
+                """);
     }
 
     @Test
