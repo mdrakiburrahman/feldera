@@ -11,7 +11,8 @@ from __future__ import annotations
 from typing import List, Set
 
 import sqlglot
-from sqlglot import exp, generator
+from sqlglot import exp, generator, tokens
+from sqlglot import parser as sqlglot_parser
 from sqlglot.dialects.dialect import Dialect
 
 from dbt.adapters.feldera.sql_parser import SqlIntent, SqlParser
@@ -39,6 +40,44 @@ class FelderaDialect(Dialect):
             exp.DataType.Type.FLOAT: "REAL",
             exp.DataType.Type.INT: "INTEGER",
         }
+
+
+class FelderaDependencyDialect(FelderaDialect):
+    """Read relation dependencies without interpreting Calcite ROW field types."""
+
+    class Parser(sqlglot_parser.Parser):
+        def _parse_types(
+            self,
+            check_func: bool = False,
+            schema: bool = False,
+            allow_identifiers: bool = True,
+            with_collation: bool = False,
+        ) -> exp.Expression | None:
+            if not check_func and self._curr and self._curr.text.upper() == "ROW":
+                start = self._curr.start
+                self._advance()
+                self._match_l_paren()
+                depth = 1
+                while depth and self._curr:
+                    if self._curr.token_type == tokens.TokenType.L_PAREN:
+                        depth += 1
+                    elif self._curr.token_type == tokens.TokenType.R_PAREN:
+                        depth -= 1
+                    self._advance()
+                if depth:
+                    self.raise_error("Unclosed Calcite ROW type")
+                # The compiler validates the field schema; dependency extraction
+                # only needs the cast's value expression and the original type text.
+                result = exp.DataType(this=exp.DataType.Type.USERDEFINED, kind=self.sql[start : self._prev.end + 1])
+                while self._match(tokens.TokenType.ARRAY):
+                    result = exp.DataType(this=exp.DataType.Type.ARRAY, expressions=[result], nested=True)
+                return result
+            return super()._parse_types(
+                check_func=check_func,
+                schema=schema,
+                allow_identifiers=allow_identifiers,
+                with_collation=with_collation,
+            )
 
 
 _DIALECT: str = "felderadialect"

@@ -140,6 +140,24 @@ FROM {{ ref('orders') }}
 GROUP BY region, product_category
 ```
 
+For project-wide view output connectors, override the dispatched
+`default_view_connectors(model_name, schema)` macro in your project's
+`macros/` directory:
+
+```sql
+{% macro feldera__default_view_connectors(model_name, schema) %}
+  {{ return([{'transport': {'name': 'my_output_connector',
+                            'config': {'path': schema ~ '/' ~ model_name}}}]) }}
+{% endmacro %}
+```
+
+`model_name` is the unquoted relation identifier, including any dbt alias or
+version suffix; use it for sink paths to match the created view. The default
+returns an empty list. Explicit model `connectors` overrides the
+hook, including an empty list to disable output. Table models do not use it.
+dbt's `dispatch` configuration for the `dbt` namespace can control
+package search order.
+
 > [!NOTE]
 > Every view in Feldera is automatically incrementally maintained by the DBSP
 > engine. When inputs change, only affected output rows are recomputed — no
@@ -258,6 +276,10 @@ to seed tables while checking.
 vars:
   feldera_safe_seed_reuse: true
 ```
+
+SQL assembly uses deterministic dependency ordering even with multiple dbt
+threads. This changes statement ordering compared with older adapter versions,
+so an existing pipeline whose program order differs needs a cold rebuild once.
 
 ### Summary
 
