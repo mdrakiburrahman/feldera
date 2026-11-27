@@ -1,9 +1,16 @@
 //! Runtime primitives for the compiler's type-directed Spark JSON expressions.
-use crate::{Array, Date, F32, F64, Map, SqlDecimal, SqlString, Timestamp, TimestampTz};
+use crate::{
+    Array, Date, F32, F64, Map, SqlDecimal, SqlString, SqlVariant, Timestamp, TimestampTz,
+    from_json_string,
+};
+use feldera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
 use itertools::Itertools;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, Error, Unexpected},
+};
 use serde_json::value::RawValue;
-use std::collections::BTreeMap;
+use std::{cell::Cell, collections::BTreeMap, fmt::Write};
 
 type Object<'a> = BTreeMap<String, &'a RawValue>;
 
@@ -73,31 +80,106 @@ pub fn spark_json_scalar<T: DeserializeOwned>(json: Option<&RawValue>) -> Option
 }
 
 pub fn spark_json_text(json: Option<&RawValue>) -> Option<SqlString> {
-    let raw = json?.get();
+    spark_text(json?.get()).map(SqlString::from)
+}
+
+thread_local! {
+    pub(crate) static SPARK_TEXT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `from_json_string` whose VARCHAR fields take any JSON value, as Spark's `from_json` does.
+pub fn spark_from_json_string<T>(json: &str) -> Option<T>
+where
+    T: for<'de> DeserializeWithContext<'de, SqlSerdeConfig, SqlVariant>,
+{
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SPARK_TEXT.set(self.0);
+        }
+    }
+    let _restore = Restore(SPARK_TEXT.replace(true));
+    from_json_string(json)
+}
+
+pub(crate) fn deserialize_spark_text<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<SqlString, D::Error> {
+    let raw = <&RawValue>::deserialize(deserializer)?;
+    spark_text(raw.get())
+        .map(SqlString::from)
+        .ok_or_else(|| D::Error::invalid_value(Unexpected::Other(raw.get()), &"a string"))
+}
+
+/// Spark's StringType conversion: a JSON string yields its text, and any other value the JSON
+/// that Jackson's `copyCurrentStructure` writes for it.
+fn spark_text(raw: &str) -> Option<String> {
     match raw.as_bytes().first()? {
         b'n' => None,
         b'"' => serde_json::from_str(raw).ok(),
-        b'[' | b'{' => {
-            // RawValue is validated JSON. Strip only insignificant whitespace, retaining object
-            // member order, number precision and whitespace/escapes within quoted strings.
-            let mut out = String::with_capacity(raw.len());
-            let (mut quoted, mut escaped) = (false, false);
-            for c in raw.chars() {
-                if quoted || !c.is_ascii_whitespace() {
-                    out.push(c);
+        _ => jackson_json(raw),
+    }
+}
+
+/// Rewrites validated JSON as Jackson's generator does: compact, with members in input order,
+/// canonical integers, floats as Java doubles and strings re-escaped.
+fn jackson_json(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
                 }
-                if escaped {
-                    escaped = false;
-                } else if quoted && c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    quoted = !quoted;
+                i += 1;
+                let text: String = serde_json::from_str(&raw[start..i]).ok()?;
+                jackson_string(&text, &mut out);
+            }
+            b'-' | b'0'..=b'9' => {
+                while bytes
+                    .get(i)
+                    .is_some_and(|b| matches!(b, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'))
+                {
+                    i += 1;
+                }
+                let number = &raw[start..i];
+                if number.contains(['.', 'e', 'E']) {
+                    out.push_str(json_float(number.parse::<f64>().ok()?).str());
+                } else {
+                    out.push_str(if number == "-0" { "0" } else { number });
                 }
             }
-            Some(out.into())
+            b => {
+                if !b.is_ascii_whitespace() {
+                    out.push(b as char);
+                }
+                i += 1;
+            }
         }
-        _ => Some(SqlString::from_ref(raw)),
     }
+    Some(out)
+}
+
+fn jackson_string(text: &str, out: &mut String) {
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c < ' ' => write!(out, "\\u{:04X}", c as u32).unwrap(),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 mod path;
