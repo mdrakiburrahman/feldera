@@ -8,9 +8,11 @@ from sqlglot.errors import ParseError
 from dbt.adapters.contracts.connection import AdapterResponse
 from dbt.adapters.feldera.impl import FelderaAdapter
 from dbt.adapters.feldera.isolated_unit import (
+    _inspect,
     _normalize_expected_rows,
     _query_only,
     _sql_type,
+    _unit_runtime_config,
     run_unit_test,
 )
 from dbt.cli.main import dbtRunner
@@ -18,6 +20,60 @@ from dbt.cli.main import dbtRunner
 
 def test_char_output_type_preserves_width():
     assert _sql_type({"columntype": {"type": "CHAR", "precision": 5}}) == "CHAR(5)"
+
+
+def test_inspect_accepts_only_the_verified_intrinsic_now_input():
+    info = _info(["dbt_unit_actual"])
+    info["schema"]["inputs"] = [
+        {
+            "name": "now",
+            "case_sensitive": False,
+            "fields": [
+                {
+                    "name": "now",
+                    "case_sensitive": False,
+                    "columntype": {"type": "TIMESTAMP", "nullable": False, "precision": 6},
+                    "unused": False,
+                }
+            ],
+            "foreign_keys": [],
+            "materialized": False,
+        }
+    ]
+    pipeline = Mock()
+    pipeline.program_info.return_value = info
+    assert "dbt_unit_actual" in _inspect(pipeline, {"dbt_unit_actual"})
+    info["schema"]["inputs"][0]["fields"][0]["columntype"]["nullable"] = True
+    with pytest.raises(RuntimeError, match="input tables or connectors"):
+        _inspect(pipeline, {"dbt_unit_actual"})
+
+
+@pytest.mark.parametrize(
+    ("sizes", "expected"),
+    [
+        ({}, {"storage_mb_min": 200000, "storage_mb_max": 200000}),
+        ({"storage_mb_min": 1000, "storage_mb_max": 400000}, {"storage_mb_min": 200000, "storage_mb_max": 400000}),
+        ({"storage_min": "4Gi", "storage_max": "400G"}, {"storage_min": "200000M", "storage_max": "400G"}),
+    ],
+)
+def test_scratch_runtime_inherits_storage_without_mutating_project(sizes, expected):
+    from copy import deepcopy
+
+    source = {
+        "storage": {"compression": "default"},
+        "resources": {**sizes, "storage_class": "premium-v2", "volume_attributes_class": "iops-80000"},
+        "workers": 2,
+    }
+    before = deepcopy(source)
+    result = _unit_runtime_config(source)
+    assert result.to_dict()["storage"] == source["storage"]
+    assert result.to_dict()["resources"] == {
+        **expected,
+        "storage_class": "premium-v2",
+        "volume_attributes_class": "iops-80000",
+    }
+    assert result.workers == 2
+    assert source == before
 
 
 @pytest.mark.parametrize("precision", [None, -1, 0, "5", True])

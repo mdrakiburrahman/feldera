@@ -743,6 +743,7 @@ class FelderaAdapter(BaseAdapter):
         from dbt.adapters.feldera.isolated_unit import run_unit_test
 
         udf_sql, udf_rust, udf_toml = self._read_udfs(udf_sql_path, udf_rust_path, udf_toml_path)
+        credentials = self._get_credentials()
         return run_unit_test(
             self._get_client(),
             sql,
@@ -752,7 +753,8 @@ class FelderaAdapter(BaseAdapter):
             udf_sql,
             udf_rust,
             udf_toml,
-            self._get_credentials().timeout,
+            credentials.timeout,
+            runtime_config=credentials.runtime_config,
         )
 
     def _read_udfs(self, sql_path: str | None, rust_path: str | None, toml_path: str | None) -> tuple[str, str, str]:

@@ -1,6 +1,7 @@
 import re
 import time
 import uuid
+from copy import deepcopy
 from datetime import datetime
 
 import agate
@@ -16,7 +17,22 @@ from feldera.enums import CompilationProfile, PipelineStatus, ProgramStatus
 from feldera.pipeline import Pipeline
 from feldera.pipeline_builder import PipelineBuilder
 from feldera.rest.errors import FelderaAPIError
-from feldera.runtime_config import RuntimeConfig
+from feldera.runtime_config import Resources, RuntimeConfig, _parse_size_bytes
+
+_NOW_INPUT = {
+    "name": "now",
+    "case_sensitive": False,
+    "fields": [
+        {
+            "name": "now",
+            "case_sensitive": False,
+            "columntype": {"type": "TIMESTAMP", "nullable": False, "precision": 6},
+            "unused": False,
+        }
+    ],
+    "foreign_keys": [],
+    "materialized": False,
+}
 
 
 class _UnitDialect(Dialect):
@@ -49,7 +65,7 @@ def _wait_for_sql(pipeline, timeout):
 def _inspect(pipeline, expected_views):
     info = pipeline.program_info()
     schema = info["schema"]
-    if info["input_connectors"] or info["output_connectors"] or schema["inputs"]:
+    if info["input_connectors"] or info["output_connectors"] or schema["inputs"] not in ([], [_NOW_INPUT]):
         raise RuntimeError("Unit test scratch pipeline must not contain input tables or connectors")
     outputs = {view["name"]: view for view in schema["outputs"]}
     if set(outputs) != expected_views | {"error_view"}:
@@ -104,7 +120,23 @@ def _agate_type(column):
     raise ValueError(f"Unsupported unit test result type: {name}")
 
 
-def run_unit_test(client, sql, expected_rows, expected_sql, render_expected, udf_sql, udf_rust, udf_toml, timeout):
+def _unit_runtime_config(runtime_config):
+    config = deepcopy(runtime_config or {})
+    config.setdefault("workers", 1)
+    resources = config.setdefault("resources", {})
+    sizes = Resources(config=resources)
+    for old_key, new_key in (("storage_mb_min", "storage_min"), ("storage_mb_max", "storage_max")):
+        if _parse_size_bytes(getattr(sizes, new_key) or "0") < 200_000_000_000:
+            if new_key in resources:
+                resources[new_key] = "200000M"
+            else:
+                resources[old_key] = 200_000
+    return RuntimeConfig.from_dict(config)
+
+
+def run_unit_test(
+    client, sql, expected_rows, expected_sql, render_expected, udf_sql, udf_rust, udf_toml, timeout, runtime_config=None
+):
     _query_only(sql)
     name = "dbt_unit_" + uuid.uuid4().hex
     description = "dbt unit test " + uuid.uuid4().hex
@@ -120,7 +152,7 @@ def run_unit_test(client, sql, expected_rows, expected_sql, render_expected, udf
             udf_toml=udf_toml,
             description=description,
             compilation_profile=CompilationProfile.DEV,
-            runtime_config=RuntimeConfig.from_dict({"workers": 1}),
+            runtime_config=_unit_runtime_config(runtime_config),
         ).create(wait=False)
         _wait_for_sql(pipeline, timeout)
         actual = _inspect(pipeline, {"dbt_unit_actual"})["dbt_unit_actual"]

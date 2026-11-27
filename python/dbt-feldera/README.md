@@ -273,7 +273,10 @@ dbt unit tests run in uniquely named, connector-free scratch pipelines, not the
 workload pipeline. The adapter infers actual output types before rendering the
 expected query, preserves duplicate rows and nulls, and deletes each scratch
 pipeline after success or failure. Unit-only invocations do not deploy the
-workload pipeline.
+workload pipeline. Only the compiler's intrinsic `now` clock input is allowed;
+user input tables and all connectors are rejected. Scratch pipelines inherit
+the profile's `runtime_config`, including storage class and volume attributes,
+with minimum and maximum storage allocations raised to at least 200,000 MB.
 
 ### Safe seed reuse
 
