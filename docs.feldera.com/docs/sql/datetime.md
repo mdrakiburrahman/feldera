@@ -64,6 +64,10 @@ The following operations are available on dates:
 | <a id="make_date"></a>`MAKE_DATE(year, month, day)` | Three integer arguments | `DATE` | Creates a `DATE` from a year, month, and day; returns `NULL` if the result is not a valid date. | `MAKE_DATE(2020, 2, 1)` => `2020-02-01` |
 | <a id="date_timestampdiff"></a>`TIMESTAMPDIFF(*unit*, left, right)` | *unit*, `DATE`, `DATE` | `INTEGER` | Computes the difference (right - left) between two dates values and expresses the result in the specified time units. | `TIMESTAMPDIFF(HOUR, '2020-01-01', '2020-01-02')` => `24` |
 
+`SEQUENCE(start_date, end_date [, step])` returns an array from `start_date` through `end_date` (inclusive when reached).
+The default step is one day toward the end. An explicit interval must move in that direction; a day-time step must span at least a day.
+Year-month steps are relative to the original day of the month. A null argument returns `NULL`.
+
 The following abbreviations can be used as well:
 
 | Abbreviation | Same as | Notes |

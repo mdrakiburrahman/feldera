@@ -1724,7 +1724,27 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                             return expr;
                         return compilePolymorphicFunction(false, call, node, type, ops, 2);
                     }
+                    case "array_sort": {
+                        var array = ops.get(0);
+                        if (array.type.is(DBSPTypeNull.class))
+                            return this.warnAlwaysNull(node, type);
+                        if (ops.size() == 2)
+                            return new DBSPApplyExpression(node, "array_sort_by" + array.type.nullableUnderlineSuffix(),
+                                    type, array, ops.get(1));
+                        var elem = array.type.to(DBSPTypeArray.class).getElementType();
+                        if (!elem.mayBeNull)
+                            return new DBSPApplyExpression(node, "sort_array" + (array.type.mayBeNull ? "N" : ""),
+                                    type, array, new DBSPBoolLiteral(true));
+                        return new DBSPApplyExpression(node, "array_sort" + array.type.nullableUnderlineSuffix(),
+                                type, array);
+                    }
                     case "sequence": {
+                        if (type.to(DBSPTypeArray.class).getElementType().code == DATE) {
+                            String name = "date_sequence";
+                            if (ops.size() == 3)
+                                name += "_" + ops.get(2).type.to(DBSPTypeBaseType.class).shortName();
+                            return compileStrictFunction(true, name, node, type, ops, ops.size());
+                        }
                         for (int i = 0; i < ops.size(); i++)
                             this.ensureInteger(node, ops, i);
                         return compileFunction(call, node, type, ops, 2);

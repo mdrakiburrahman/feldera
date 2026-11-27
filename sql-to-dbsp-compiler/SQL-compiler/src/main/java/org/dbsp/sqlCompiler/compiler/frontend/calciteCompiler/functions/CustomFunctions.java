@@ -66,6 +66,7 @@ public class CustomFunctions {
         this.functions.add(ArrayPositionFunction.INSTANCE);
         this.functions.add(ArrayRemoveFunction.INSTANCE);
         this.functions.add(ArraySliceFunction.INSTANCE);
+        this.functions.add(ArraySortFunction.INSTANCE);
         this.functions.add(ArrayTransformFunction.INSTANCE);
         this.functions.add(ArrayUnion.INSTANCE);
         this.functions.add(ArraysOverlapFunction.INSTANCE);
@@ -406,6 +407,18 @@ public class CustomFunctions {
                             OperandTypes.ARRAY, OperandTypes.INTEGER, OperandTypes.INTEGER),
                     SqlFunctionCategory.USER_DEFINED_FUNCTION,
                     "array#array_slice", FunctionDocumentation.NO_FILE);
+        }
+    }
+
+    static class ArraySortFunction extends NonOptimizedFunction {
+        static final ArraySortFunction INSTANCE = new ArraySortFunction();
+
+        private ArraySortFunction() {
+            super("ARRAY_SORT", ArrayFilterFunction.FILTER_INFERENCE,
+                    OperandTypes.ARRAY.or(new ArrayLambdaOperandTypeChecker(
+                            "ARRAY_SORT(<ARRAY>, (left, right) -> INTEGER)", SqlTypeName.INTEGER, 2)),
+                    SqlFunctionCategory.USER_DEFINED_FUNCTION,
+                    "array#array_sort", FunctionDocumentation.NO_FILE);
         }
     }
 
@@ -854,17 +867,22 @@ public class CustomFunctions {
         }
     }
 
-    /** SEQUENCE(start, end) returns an array of integers from start to end (inclusive).
-     * The array is empty if start > end. */
     static class SequenceFunction extends NonOptimizedFunction {
         static final SequenceFunction INSTANCE = new SequenceFunction();
 
         private SequenceFunction() {
             super("SEQUENCE",
-                    ReturnTypes.INTEGER
-                            .andThen(SqlTypeTransforms.TO_ARRAY)
-                            .andThen(SqlTypeTransforms.TO_NULLABLE),
-                    family(SqlTypeFamily.INTEGER, SqlTypeFamily.INTEGER),
+                    binding -> {
+                        boolean date = binding.getOperandCount() == 3 || binding.collectOperandTypes()
+                                .stream().anyMatch(t -> t.getSqlTypeName() == SqlTypeName.DATE);
+                        return SqlTypeUtil.createArrayType(binding.getTypeFactory(),
+                                binding.getTypeFactory().createSqlType(date ? SqlTypeName.DATE : SqlTypeName.INTEGER),
+                                binding.collectOperandTypes().stream().anyMatch(RelDataType::isNullable));
+                    },
+                    family(SqlTypeFamily.INTEGER, SqlTypeFamily.INTEGER)
+                            .or(family(SqlTypeFamily.DATE, SqlTypeFamily.DATE))
+                            .or(family(SqlTypeFamily.DATE, SqlTypeFamily.DATE, SqlTypeFamily.INTERVAL_DAY_TIME))
+                            .or(family(SqlTypeFamily.DATE, SqlTypeFamily.DATE, SqlTypeFamily.INTERVAL_YEAR_MONTH)),
                     SqlFunctionCategory.USER_DEFINED_FUNCTION, "integer#sequence", FunctionDocumentation.NO_FILE);
         }
     }

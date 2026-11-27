@@ -446,6 +446,45 @@ where
 }
 
 #[doc(hidden)]
+pub fn array_sort_<T: Ord + Clone>(vector: Array<Option<T>>) -> Array<Option<T>> {
+    let mut data = Arc::unwrap_or_clone(vector);
+    data.sort_by(|a, b| a.is_none().cmp(&b.is_none()).then_with(|| a.cmp(b)));
+    data.into()
+}
+
+#[doc(hidden)]
+pub fn array_sortN<T: Ord + Clone>(vector: Option<Array<Option<T>>>) -> Option<Array<Option<T>>> {
+    vector.map(array_sort_)
+}
+
+#[doc(hidden)]
+pub fn array_sort_by_<T, R, F>(array: Array<T>, compare: F) -> Array<T>
+where
+    T: Clone,
+    R: Into<Option<i32>>,
+    F: Fn(&T, &T) -> R,
+{
+    let mut data = Arc::unwrap_or_clone(array);
+    data.sort_by(|a, b| {
+        compare(a, b)
+            .into()
+            .expect("ARRAY_SORT comparator returned NULL")
+            .cmp(&0)
+    });
+    data.into()
+}
+
+#[doc(hidden)]
+pub fn array_sort_byN<T, R, F>(array: Option<Array<T>>, compare: F) -> Option<Array<T>>
+where
+    T: Clone,
+    R: Into<Option<i32>>,
+    F: Fn(&T, &T) -> R,
+{
+    array.map(|v| array_sort_by_(v, compare))
+}
+
+#[doc(hidden)]
 pub fn array_max__<T>(vector: Array<T>) -> Option<T>
 where
     T: Ord + Clone,
