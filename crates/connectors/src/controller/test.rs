@@ -7990,6 +7990,81 @@ pub fn push_timer_wakes_only_a_pipeline_that_pushes_by_itself(engine: &dyn Pipel
     );
 }
 
+/// A host whose checkpoint barriers cleared after its coordinator asked it to
+/// step past them takes one step, because no input can trigger that request
+/// any more, then waits for barrier input again.
+#[engine_test]
+pub fn cleared_checkpoint_barriers_trigger_one_step(engine: &dyn PipelineTestEngine) {
+    init_test_logger();
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 1,
+        "clock_resolution_usecs": null,
+    }))
+    .unwrap();
+    let controller = engine
+        .controller(
+            &identity(&[None]),
+            &config,
+            Box::new(|e, _| panic!("error: {e}")),
+        )
+        .unwrap();
+    let inner = controller.inner.clone();
+    controller.stop().unwrap();
+    inner.status.unset_step_requested();
+
+    let mut trigger = StepTrigger::new(inner);
+    trigger.checkpoint_interval = None;
+    let last = LastCheckpoint {
+        timestamp: Instant::now(),
+        id: None,
+    };
+    let decide = |trigger: &mut StepTrigger, inputs: StepInputs| {
+        let selection = StepSelection {
+            inputs,
+            committed: HashSet::new(),
+        };
+        trigger.trigger(
+            last.clone(),
+            last.clone(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            &selection,
+            Some(StepRequest::new(5, StepAction::Trigger, inputs)),
+            5,
+        )
+    };
+
+    // A host that never had a barrier waits for one.
+    trigger.note_checkpoint_barriers(false);
+    assert_eq!(
+        decide(&mut trigger, StepInputs::CheckpointBarriers),
+        Action::Park(None)
+    );
+
+    // Its last barrier clears: one step, then wait again.
+    trigger.note_checkpoint_barriers(true);
+    trigger.note_checkpoint_barriers(false);
+    assert_eq!(
+        decide(&mut trigger, StepInputs::CheckpointBarriers),
+        Action::Step
+    );
+    trigger.note_checkpoint_barriers(false);
+    assert_eq!(
+        decide(&mut trigger, StepInputs::CheckpointBarriers),
+        Action::Park(None)
+    );
+
+    // Outside of stepping past barriers, cleared barriers trigger nothing.
+    trigger.note_checkpoint_barriers(true);
+    trigger.note_checkpoint_barriers(false);
+    assert_eq!(decide(&mut trigger, StepInputs::All), Action::Park(None));
+}
+
 /// Waits until `controller` takes no step for 1 s, so that the steps after
 /// `start()` are done, and returns the step count.
 fn wait_for_idle(controller: &Controller) -> u64 {
