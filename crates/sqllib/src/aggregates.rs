@@ -6,14 +6,16 @@
 use crate::{
     ByteArray, ConcatSemigroup, FromInteger, PairSemigroup, SqlDecimal, ToInteger, Weight,
 };
-use dbsp::algebra::{F32, F64, FirstLargeValue, HasOne, HasZero, SignedPrimInt, UnsignedPrimInt};
+use dbsp::algebra::{
+    F32, F64, FirstLargeValue, HasOne, HasZero, Semigroup, SignedPrimInt, UnsignedPrimInt,
+};
 use dbsp::operator::dynamic::aggregate::MaxSemigroup;
 use dbsp::utils::Tup2;
 use num::PrimInt;
 use num_traits::CheckedAdd;
 use std::cmp::Ord;
 use std::fmt::{Debug, Display};
-use std::marker::Copy;
+use std::marker::{Copy, PhantomData};
 
 type PercentileValues = Vec<Tup2<F64, Weight>>;
 #[doc(hidden)]
@@ -1211,6 +1213,24 @@ where
 }
 
 universal_aggregate!(agg_min, T where T: Ord + Clone + Debug);
+
+/// Combines partial SQL MIN results, treating NULL as an empty accumulator.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct MinOptSemigroup<T>(PhantomData<T>);
+
+impl<T> Semigroup<Option<T>> for MinOptSemigroup<T>
+where
+    T: Ord + Clone,
+{
+    fn combine(left: &Option<T>, right: &Option<T>) -> Option<T> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(left.min(right).clone()),
+            (None, right) => right.clone(),
+            (left, None) => left.clone(),
+        }
+    }
+}
 
 #[doc(hidden)]
 pub fn agg_max__<T>(left: T, right: T) -> T

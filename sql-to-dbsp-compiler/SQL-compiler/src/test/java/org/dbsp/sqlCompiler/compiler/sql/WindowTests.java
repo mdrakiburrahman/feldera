@@ -11,6 +11,49 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class WindowTests extends ScottBaseTests {
+    @Test
+    public void nullableWindowMin() {
+        for (String frame : List.of("ROWS", "RANGE")) {
+            var ccs = this.getCCS("""
+                    CREATE TABLE r (g VARCHAR, k INT %2$s, s BOOLEAN);
+                    CREATE MATERIALIZED VIEW v AS
+                    SELECT k,
+                        MIN(CASE WHEN s THEN k END) OVER future AS m,
+                        MIN(CASE WHEN s THEN k END) OVER suffix AS suffix_min,
+                        MIN(CASE WHEN s THEN k END) OVER prefix AS prefix_min,
+                        MIN(CASE WHEN s THEN k END) OVER bounded AS bounded_min,
+                        MIN(CASE WHEN s THEN k END) OVER whole AS whole_min,
+                        MAX(CASE WHEN s THEN k END) OVER future AS max_future,
+                        COUNT(CASE WHEN s THEN k END) OVER future AS count_future,
+                        g
+                    FROM r
+                    WINDOW
+                        future AS (PARTITION BY g ORDER BY k %1$s
+                            BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING),
+                        suffix AS (PARTITION BY g ORDER BY k %1$s
+                            BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING),
+                        prefix AS (PARTITION BY g ORDER BY k %1$s
+                            BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+                        bounded AS (PARTITION BY g ORDER BY k %1$s
+                            BETWEEN 1 PRECEDING AND 1 FOLLOWING),
+                        whole AS (PARTITION BY g ORDER BY k %1$s
+                            BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING);
+                    """.formatted(frame, frame.equals("RANGE") ? "NOT NULL" : "")).withStringTrim();
+            ccs.stepWeightOne("""
+                    INSERT INTO r VALUES ('a', 0, FALSE), ('a', 1, FALSE),
+                                        ('a', 2, TRUE), ('a', 3, FALSE),
+                                        ('b', 0, FALSE), ('b', 1, NULL);""", """
+                     k | m    | suffix_min | prefix_min | bounded_min | whole_min | max_future | count_future | g
+                    ---------------------------------------------------------------------------------------------------
+                     0 | 2    | 2          | NULL       | NULL        | 2         | 2          | 1            | a
+                     1 | 2    | 2          | NULL       | 2           | 2         | 2          | 1            | a
+                     2 | NULL | 2          | NULL       | 2           | 2         | NULL       | 0            | a
+                     3 | NULL | NULL       | 2          | 2           | 2         | NULL       | 0            | a
+                     0 | NULL | NULL       | NULL       | NULL        | NULL      | NULL       | 0            | b
+                     1 | NULL | NULL       | NULL       | NULL        | NULL      | NULL       | 0            | b""");
+        }
+    }
+
     record PermutationTest(
             String[] aggregates,
             String fixedColumn,
