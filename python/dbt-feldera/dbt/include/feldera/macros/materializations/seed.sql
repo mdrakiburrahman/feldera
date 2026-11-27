@@ -14,6 +14,7 @@
     {%- set table_name = model.name -%}
     {%- set column_override = model['config'].get('column_types', {}) -%}
     {%- set quote_seed_column = model['config'].get('quote_columns', none) -%}
+    {%- set stored = model['config'].get('stored', false) -%}
 
     {# Build column definitions from agate table schema #}
     {%- set column_defs = [] -%}
@@ -30,7 +31,7 @@
         CREATE TABLE "{{ table_name }}" (
             {{ column_defs | join(', ') }}
         )
-        {% if var('feldera_safe_seed_reuse', false) %}
+        {% if stored or var('feldera_safe_seed_reuse', false) %}
         WITH ('materialized' = 'true')
         {% endif %}
     {%- endset -%}
@@ -87,7 +88,7 @@
             {% set state.failed = true %}
         {% endif %}
     {% endfor %}
-    {% if var('feldera_safe_seed_reuse', false) and state.failed %}
+    {% if var('feldera_safe_seed_reuse', false) and state.deploy and state.failed %}
         {{ exceptions.raise_compiler_error("Safe seed reuse refuses to deploy after a failed or skipped node") }}
     {% endif %}
     {% if state.deploy %}

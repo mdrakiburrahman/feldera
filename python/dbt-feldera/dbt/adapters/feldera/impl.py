@@ -1,6 +1,8 @@
 import logging
+import math
 import re
 from collections import Counter
+from decimal import Decimal
 from pathlib import Path
 from typing import FrozenSet, List, Optional, Set, Tuple
 
@@ -28,13 +30,10 @@ _pipeline_state = PipelineStateManager()
 _INT_TYPES = frozenset({"INT", "INTEGER", "SMALLINT", "TINYINT", "BIGINT"})
 """Integer types that should be cast via ``int()``."""
 
-_DECIMAL_TYPES = frozenset({"DECIMAL", "NUMERIC", "DOUBLE", "REAL"})
-"""Numeric types preserved as strings for exact representation.
+_DECIMAL_TYPES = frozenset({"DECIMAL", "NUMERIC"})
+"""Fixed-point numeric types preserved as strings for exact representation."""
 
-Includes both fixed-point (DECIMAL, NUMERIC) and IEEE floating-point
-(DOUBLE, REAL) types. All are serialized as strings to avoid precision
-loss during JSON ingress.
-"""
+_FLOAT_TYPES = frozenset({"DOUBLE", "REAL", "FLOAT"})
 
 # ── Catalog metadata columns ─────────────────────────────────────────
 
@@ -119,6 +118,8 @@ class FelderaAdapter(BaseAdapter):
         # Check if any values have decimal parts
         for row in agate_table.rows:
             val = row[col_idx]
+            if isinstance(val, Decimal) and not val.is_finite():
+                continue
             if val is not None and val != int(val):
                 return "DOUBLE"
         return "BIGINT"
@@ -735,19 +736,40 @@ class FelderaAdapter(BaseAdapter):
         if not FelderaAdapter._seed_rows_present(pipeline, table_name, expected_rows):
             raise RuntimeError(f"Seed data differs for '{table_name}'; a cold rebuild is required")
 
+    @available
+    def run_isolated_unit_test(
+        self, sql, expected_rows, expected_sql, render_expected, udf_sql_path, udf_rust_path, udf_toml_path
+    ):
+        from dbt.adapters.feldera.isolated_unit import run_unit_test
+
+        udf_sql, udf_rust, udf_toml = self._read_udfs(udf_sql_path, udf_rust_path, udf_toml_path)
+        credentials = self._get_credentials()
+        return run_unit_test(
+            self._get_client(),
+            sql,
+            expected_rows,
+            expected_sql,
+            render_expected,
+            udf_sql,
+            udf_rust,
+            udf_toml,
+            credentials.timeout,
+            runtime_config=credentials.runtime_config,
+        )
+
     def _read_udfs(self, sql_path: str | None, rust_path: str | None, toml_path: str | None) -> tuple[str, str, str]:
         def read_file(path: str | None) -> str:
             return (Path(self.config.project_root) / path).read_text(encoding="utf-8") if path else ""
 
         return read_file(sql_path), read_file(rust_path), read_file(toml_path)
 
-    @staticmethod
-    def _convert_agate_rows(agate_table: agate.Table, column_types: dict | None = None) -> list:
+    @classmethod
+    def _convert_agate_rows(cls, agate_table: agate.Table, column_types: dict | None = None) -> list:
         """
         Convert agate table rows to JSON-serializable dicts for HTTP ingress:
 
-        1. If a ``column_types`` override exists for a column, build a
-           typed caster (int, float, str, bool) based on the SQL type.
+        1. Encode inferred or explicitly configured floating-point columns as
+           JSON numbers. Use explicit overrides for other typed conversions.
 
         2. Apply the caster.  On failure, fall through to step 3.
 
@@ -763,14 +785,22 @@ class FelderaAdapter(BaseAdapter):
         :param column_types: Optional dict mapping column name to SQL type string.
         :return: A list of dicts with properly-typed values.
         """
-        from decimal import Decimal
+        from dbt.adapters.feldera.sqlglot_parser import parser
 
         column_types = column_types or {}
         column_names = agate_table.column_names
 
-        def _make_caster(sql_type: str):
-            from dbt.adapters.feldera.sqlglot_parser import parser
+        def _cast_boolean(value):
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in ("true", "t", "yes", "y", "1"):
+                    return True
+                if normalized in ("false", "f", "no", "n", "0"):
+                    return False
+                return None
+            return bool(value) if value is not None else None
 
+        def _make_caster(sql_type: str):
             upper = parser.sql_type_base_name(sql_type)
             if upper in _INT_TYPES:
                 return lambda v: int(v) if v is not None else None
@@ -778,13 +808,18 @@ class FelderaAdapter(BaseAdapter):
                 # Preserve exact representation as string for JSON ingress.
                 return lambda v: str(v) if v is not None else None
             if upper in _BOOL_TYPES:
-                return lambda v: bool(v) if v is not None else None
+                return _cast_boolean
             # Everything else — convert to string
             return lambda v: str(v) if v is not None else None
 
         casters = {}
-        for col_name in column_names:
+        float_columns = set()
+        for i, col_name in enumerate(column_names):
             sql_type = column_types.get(col_name)
+            inferred_type = sql_type or cls.convert_type(agate_table, i)
+            if inferred_type and parser.sql_type_base_name(inferred_type) in _FLOAT_TYPES:
+                float_columns.add(col_name)
+                continue
             if sql_type:
                 casters[col_name] = _make_caster(sql_type)
 
@@ -795,6 +830,16 @@ class FelderaAdapter(BaseAdapter):
                 value = row[i]
                 if value is None:
                     row_dict[col_name] = None
+                    continue
+
+                if col_name in float_columns:
+                    if isinstance(value, Decimal) and not value.is_finite():
+                        row_dict[col_name] = None
+                        continue
+                    converted = float(value)
+                    if not math.isfinite(converted):
+                        raise ValueError(f"Non-finite floating point value for seed column '{col_name}'")
+                    row_dict[col_name] = converted
                     continue
 
                 caster = casters.get(col_name)

@@ -140,6 +140,24 @@ FROM {{ ref('orders') }}
 GROUP BY region, product_category
 ```
 
+For project-wide view output connectors, override the dispatched
+`default_view_connectors(model_name, schema)` macro in your project's
+`macros/` directory:
+
+```sql
+{% macro feldera__default_view_connectors(model_name, schema) %}
+  {{ return([{'transport': {'name': 'my_output_connector',
+                            'config': {'path': schema ~ '/' ~ model_name}}}]) }}
+{% endmacro %}
+```
+
+`model_name` is the unquoted relation identifier, including any dbt alias or
+version suffix; use it for sink paths to match the created view. The default
+returns an empty list. Explicit model `connectors` overrides the
+hook, including an empty list to disable output. Table models do not use it.
+dbt's `dispatch` configuration for the `dbt` namespace can control
+package search order.
+
 > [!NOTE]
 > Every view in Feldera is automatically incrementally maintained by the DBSP
 > engine. When inputs change, only affected output rows are recomputed — no
@@ -243,6 +261,25 @@ dbt seed                # push seed data
 dbt seed --full-refresh # stop, clear storage, redeploy, then push
 ```
 
+For ad-hoc queries, set `stored: true` on table models or seeds independently
+of safe seed reuse. Floating-point seed columns are submitted as JSON numbers;
+explicit `DECIMAL` columns retain their exact decimal text. Explicit boolean
+columns parse trimmed, case-insensitive `true/t/yes/y/1` and `false/f/no/n/0`;
+other strings, including empty strings, become SQL `NULL`.
+
+### Unit tests
+
+dbt unit tests run in uniquely named, connector-free scratch pipelines, not the
+workload pipeline. The adapter infers actual output types before rendering the
+expected query, preserves duplicate rows and nulls, and deletes each scratch
+pipeline after success or failure. Unit-only invocations do not deploy the
+workload pipeline. Only the compiler's intrinsic `now` clock input is allowed;
+user input tables and all connectors are rejected. Scratch pipelines inherit
+the profile's `runtime_config`, including storage class and volume attributes,
+with minimum and maximum storage allocations raised to at least 200,000 MB.
+Clock-dependent fixtures pause after a processed clock update so actual and
+expected queries read a stable snapshot.
+
 ### Safe seed reuse
 
 Set `feldera_safe_seed_reuse: true` in dbt vars to materialize seed tables and
@@ -258,6 +295,10 @@ to seed tables while checking.
 vars:
   feldera_safe_seed_reuse: true
 ```
+
+SQL assembly uses deterministic dependency ordering even with multiple dbt
+threads. This changes statement ordering compared with older adapter versions,
+so an existing pipeline whose program order differs needs a cold rebuild once.
 
 ### Summary
 
