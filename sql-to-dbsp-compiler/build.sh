@@ -61,12 +61,14 @@ if [ "${CALCITE_BUILD_NEXT}" = "y" ]; then
     fi
 
     pushd "${CALCITE_BUILD_DIR}" >/dev/null
-    lineage_patch="${SCRIPT_DIR}/compat/window-expression-lineage.patch"
-    if git apply --check "${lineage_patch}" 2>/dev/null; then
-        git apply "${lineage_patch}"
-    else
-        git apply --reverse --check "${lineage_patch}"
-    fi
+    for name in window-expression-lineage spark-generator-grammar; do
+        patch_file="${SCRIPT_DIR}/compat/${name}.patch"
+        if git apply --check "${patch_file}" 2>/dev/null; then
+            git apply "${patch_file}"
+        else
+            git apply --reverse --check "${patch_file}"
+        fi
+    done
     jvm_version=$(./gradlew --version | sed -n 's/^Launcher JVM: *//p')
     case $jvm_version in
         19* | 20* | 21*) ;;

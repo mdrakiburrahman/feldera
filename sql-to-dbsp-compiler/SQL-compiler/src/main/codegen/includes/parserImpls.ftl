@@ -25,6 +25,22 @@ JoinType LeftSemiJoin() :
     <LEFT> <SEMI> <JOIN> { return JoinType.LEFT_SEMI_JOIN; }
 }
 
+SqlNode SparkLateralView(SqlNode input) :
+{
+    final Span s;
+    boolean outer = false;
+    SqlNode generator;
+    SqlIdentifier alias = null;
+    List<SqlNode> columns = new ArrayList<SqlNode>();
+}
+{
+    <LATERAL> { s = span(); } <VIEW> [ <OUTER> { outer = true; } ]
+    generator = NamedRoutineCall(SqlFunctionCategory.USER_DEFINED_FUNCTION, ExprContext.ACCEPT_SUB_QUERY)
+    [ alias = SimpleIdentifier() ]
+    [ <AS> AddSimpleIdentifiers(columns) ]
+    { return SparkGenerators.lateralView(s.end(this), input, generator, outer, alias, columns); }
+}
+
 SqlNode DateaddFunctionCall() :
 {
     final Span s;

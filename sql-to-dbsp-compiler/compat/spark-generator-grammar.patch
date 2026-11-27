@@ -1,0 +1,34 @@
+--- a/core/src/main/codegen/templates/Parser.jj
++++ b/core/src/main/codegen/templates/Parser.jj
+@@ -2270,10 +2270,20 @@
+ {
+     SqlNode e;
+     final SqlIdentifier id;
++<#if parser.selectAliasListMethod??>
++    SqlNodeList aliases;
++</#if>
+ }
+ {
+     e = SelectExpression()
+     (
++<#if parser.selectAliasListMethod??>
++        LOOKAHEAD(<AS> <LPAREN>)
++        <AS> aliases = ParenthesizedSimpleIdentifierList() {
++            list.add(${parser.selectAliasListMethod}(e, aliases));
++        }
++    |
++</#if>
+         [ <AS>
+             [ <MEASURE> {
+                     e = SqlInternalOperators.MEASURE.createCall(
+@@ -2580,6 +2590,10 @@
+             null);
+     }
+ |
++<#if parser.joinSuffixMethod??>
++    e2 = ${parser.joinSuffixMethod}(e) { return e2; }
++|
++</#if>
+     <OUTER> { joinType = JoinType.LEFT.symbol(getPos()); } <APPLY>
+     e2 = TableRef2(true) {
+         if (!this.conformance.isApplyAllowed()) {

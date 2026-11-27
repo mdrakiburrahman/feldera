@@ -1342,6 +1342,89 @@ pub fn minus_Date_Date_ShortInterval__(left: Date, right: ShortInterval) -> Date
 some_function2!(minus_Date_Date_ShortInterval, Date, ShortInterval, Date);
 
 #[doc(hidden)]
+pub fn date_sequence__(start: Date, end: Date) -> Array<Date> {
+    let direction = if start <= end { 1 } else { -1 };
+    date_sequence_ShortInterval___(
+        start,
+        end,
+        ShortInterval::from_microseconds(direction * MICROS_PER_DAY as i64),
+    )
+}
+
+some_function2!(date_sequence, Date, Date, Array<Date>);
+
+#[doc(hidden)]
+pub fn date_sequence_ShortInterval___(start: Date, end: Date, step: ShortInterval) -> Array<Date> {
+    let step = i128::from(step.microseconds());
+    let day = i128::from(MICROS_PER_DAY);
+    assert!(
+        step.abs() >= day,
+        "DATE SEQUENCE requires a step of at least one day"
+    );
+    assert!(
+        start == end || (start < end) == (step > 0),
+        "DATE SEQUENCE step points away from end"
+    );
+    let mut current = i128::from(start.days()) * day;
+    let stop = i128::from(end.days()) * day;
+    let mut dates = Vec::new();
+    while (step > 0 && current <= stop) || (step < 0 && current >= stop) {
+        dates.push(Date::from_days(current.div_euclid(day) as i32));
+        current += step;
+    }
+    dates.into()
+}
+
+crate::some_function3!(
+    date_sequence_ShortInterval,
+    Date,
+    Date,
+    ShortInterval,
+    Array<Date>
+);
+
+#[doc(hidden)]
+pub fn date_sequence_LongInterval___(start: Date, end: Date, step: LongInterval) -> Array<Date> {
+    let step = step.months();
+    assert!(step != 0, "DATE SEQUENCE requires a nonzero step");
+    assert!(
+        start == end || (start < end) == (step > 0),
+        "DATE SEQUENCE step points away from end"
+    );
+    let start = start.to_date();
+    let end = end.to_date();
+    let mut dates = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        // Add from the original day, so Jan 31, Feb 29 is followed by Mar 31.
+        let months = Months::new(offset);
+        let next = if step > 0 {
+            start.checked_add_months(months)
+        } else {
+            start.checked_sub_months(months)
+        };
+        let Some(next) = next else { break };
+        if (step > 0 && next > end) || (step < 0 && next < end) {
+            break;
+        }
+        dates.push(Date::from_date(next));
+        let Some(next_offset) = offset.checked_add(step.unsigned_abs()) else {
+            break;
+        };
+        offset = next_offset;
+    }
+    dates.into()
+}
+
+crate::some_function3!(
+    date_sequence_LongInterval,
+    Date,
+    Date,
+    LongInterval,
+    Array<Date>
+);
+
+#[doc(hidden)]
 pub fn plus_Date_Date_LongInterval__(left: Date, right: LongInterval) -> Date {
     let date = left.to_date();
     let months = Months::new(right.months().unsigned_abs());

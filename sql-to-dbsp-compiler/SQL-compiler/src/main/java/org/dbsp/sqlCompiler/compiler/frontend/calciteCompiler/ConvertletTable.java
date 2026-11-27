@@ -105,6 +105,7 @@ import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.CustomFunctions;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlSafeCastFunction;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SparkGeneratorRows;
 
 import static com.google.common.base.Preconditions.checkArgument;
 
@@ -154,6 +155,7 @@ public class ConvertletTable extends ReflectiveConvertletTable {
         addAlias(SqlLibraryOperators.BITOR_AGG, SqlStdOperatorTable.BIT_OR);
 
         // Register convertlets for specific objects.
+        registerOp(SparkGeneratorRows.STACK, SparkGeneratorRows::convertStack);
         registerOp(CAST, this::convertCast);
         registerOp(SqlSafeCastFunction.INSTANCE, this::convertCast);
         registerOp(SqlLibraryOperators.SAFE_CAST, this::convertCast);

@@ -8,6 +8,7 @@ data: {
 
     imports: [
       "org.apache.calcite.schema.ColumnStrategy"
+      "org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.SparkGenerators"
       "org.apache.calcite.sql.SqlCreate"
       "org.apache.calcite.sql.SqlDrop"
       "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlExtendedColumnDeclaration"
@@ -898,6 +899,8 @@ data: {
     ]
 
     # List of additional join types. Each is a method with no arguments.
+    joinSuffixMethod: "SparkLateralView"
+    selectAliasListMethod: "SparkGenerators.columnAliases"
     joinTypes: [
       "LeftSemiJoin"
     ]

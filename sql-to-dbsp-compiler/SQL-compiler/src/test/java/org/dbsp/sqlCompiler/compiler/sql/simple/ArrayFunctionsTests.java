@@ -502,6 +502,47 @@ public class ArrayFunctionsTests extends SqlIoTest {
     }
 
     @Test
+    public void testSparkArraySort() {
+        this.qst("""
+                SELECT array_sort(ARRAY [3, NULL, 1, NULL, 2]), array_sort(CAST(NULL AS INT ARRAY));
+                 sorted | absent
+                --------+--------
+                 {1, 2, 3, NULL, NULL} | NULL
+                (1 row)
+
+                SELECT array_sort(ARRAY [7, 2, 5], (a, b) -> b - a);
+                 sorted
+                --------
+                 {7, 5, 2}
+                (1 row)
+                """);
+    }
+
+    @Test
+    public void testDateSequence() {
+        this.qst("""
+                SELECT sequence(DATE '2024-03-01', DATE '2024-02-28');
+                 dates
+                -------
+                 {2024-03-01, 2024-02-29, 2024-02-28}
+                (1 row)
+
+                SELECT sequence(DATE '2024-02-27', DATE '2024-03-01', INTERVAL 2 DAY);
+                 dates
+                -------
+                 {2024-02-27, 2024-02-29}
+                (1 row)
+
+                SELECT sequence(DATE '2024-01-31', DATE '2024-03-31', INTERVAL 1 MONTH),
+                       sequence(CAST(NULL AS DATE), DATE '2024-03-01');
+                 dates | absent
+                -------+--------
+                 {2024-01-31, 2024-02-29, 2024-03-31} | NULL
+                (1 row)
+                """);
+    }
+
+    @Test
     public void testSortArray() {
         this.qst("""
                 SELECT sort_array(ARRAY [7, 1, 4, 3]);

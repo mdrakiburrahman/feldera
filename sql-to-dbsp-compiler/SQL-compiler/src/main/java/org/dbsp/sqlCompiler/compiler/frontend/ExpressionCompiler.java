@@ -1308,6 +1308,13 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
             case OTHER_FUNCTION: {
                 String opName = call.op.getName().toLowerCase();
                 switch (opName) {
+                    case "$explode_rows":
+                    case "$explode_outer_rows": {
+                        DBSPExpression input = ops.get(0);
+                        String method = opName.equals("$explode_rows") ? "spark_explode" : "spark_explode_outer";
+                        method += input.getType().is(DBSPTypeMap.class) ? "_map" : "_array";
+                        return new DBSPApplyExpression(node, method, type, input.someIfNeeded());
+                    }
                     case "xxhash": {
                         String opName1 = getCallName(call);
                         validateArgCount(node, opName1, ops.size(), 2);
@@ -1702,7 +1709,19 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                         String baseName = DBSPTypeVariant.legacyRepresentation() ? opName : opName + "_fv";
                         return compilePolymorphicFunction(false, baseName, node, type, ops, 1);
                     }
-                    case "to_json":
+                    case "named_struct":
+                        return SparkJsonCompiler.namedStruct(node, type, ops);
+                    case "from_json":
+                        return SparkJsonCompiler.fromJson(node, type, call.getType(), ops.get(0));
+                    case "get_json_object":
+                        return SparkJsonCompiler.getJsonObject(node, ops.get(0), ops.get(1));
+                    case "to_json": {
+                        DBSPExpression value = ops.get(0);
+                        if (value.type.is(DBSPTypeTuple.class) || value.type.is(DBSPTypeArray.class) || value.type.is(DBSPTypeMap.class))
+                            return SparkJsonCompiler.write(node, call.getOperands().get(0).getType(), value);
+                        DBSPExpression expr = this.strictnessCheck(ops, type);
+                        return expr != null ? expr : compilePolymorphicFunction(false, call, node, type, ops, 1);
+                    }
                     case "json_each_bigint":
                     case "json_each_string":
                     case "json_each_boolean":
@@ -1724,7 +1743,27 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                             return expr;
                         return compilePolymorphicFunction(false, call, node, type, ops, 2);
                     }
+                    case "array_sort": {
+                        var array = ops.get(0);
+                        if (array.type.is(DBSPTypeNull.class))
+                            return this.warnAlwaysNull(node, type);
+                        if (ops.size() == 2)
+                            return new DBSPApplyExpression(node, "array_sort_by" + array.type.nullableUnderlineSuffix(),
+                                    type, array, ops.get(1));
+                        var elem = array.type.to(DBSPTypeArray.class).getElementType();
+                        if (!elem.mayBeNull)
+                            return new DBSPApplyExpression(node, "sort_array" + (array.type.mayBeNull ? "N" : ""),
+                                    type, array, new DBSPBoolLiteral(true));
+                        return new DBSPApplyExpression(node, "array_sort" + array.type.nullableUnderlineSuffix(),
+                                type, array);
+                    }
                     case "sequence": {
+                        if (type.to(DBSPTypeArray.class).getElementType().code == DATE) {
+                            String name = "date_sequence";
+                            if (ops.size() == 3)
+                                name += "_" + ops.get(2).type.to(DBSPTypeBaseType.class).shortName();
+                            return compileStrictFunction(true, name, node, type, ops, ops.size());
+                        }
                         for (int i = 0; i < ops.size(); i++)
                             this.ensureInteger(node, ops, i);
                         return compileFunction(call, node, type, ops, 2);

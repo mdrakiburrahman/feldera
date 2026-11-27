@@ -84,6 +84,32 @@ will produce a collection whose columns are the fields of the
 structure, instead of a collection with a single structure-typed
 column.
 
+## Spark row generators
+
+`EXPLODE(array)` produces one column (`col`), even for an array of structs.
+`EXPLODE(map)` produces two columns (`key`, `value`). Duplicate array elements
+produce duplicate rows. Use a generator as a select-list item, or attach it to
+a table with `LATERAL VIEW` to reference generated columns in `WHERE` or a
+subsequent lateral view. `LATERAL VIEW OUTER` retains a single null-extended
+row for a null or empty collection; the inner form drops that row. A select
+list can contain one generator; use successive lateral views for more.
+
+```sql
+SELECT country, EXPLODE(cities) AS city FROM data;
+SELECT country, g.city FROM data AS d LATERAL VIEW OUTER EXPLODE(d.cities) g AS city;
+```
+
+`STACK(n, expr, ...)` produces exactly `n` rows. The positive integer literal
+`n` determines the number of columns: divide the number of expressions by `n`
+and round up. Values fill the columns from left to right, then the next row;
+missing values are `NULL`. Values in each column must have compatible types.
+The default column names are `col0`, `col1`, and so on.
+
+```sql
+SELECT STACK(2, 'a', 10, 'b') AS (label, amount);
+-- ('a', 10), ('b', NULL)
+```
+
 ## Comparison Operations on Arrays
 
 Comparison operations (`=`, `<>`, `!=`, `>`, `<`, `>=`, `<=`) in arrays occur **lexicographically**, from left to right. The elements are compared one by one until a difference is found. Arrays can be compared even if they are different in size.
@@ -138,5 +164,6 @@ equal, so `ARRAY[1, NULL] = ARRAY[1, NULL]` is `true`.  `>`, `<`,
 | <a id="union"></a>`ARRAY_UNION(` _left_, _right_ `)`                 | Returns `NULL` if any argument is `NULL`. Returns an array with all elements that are either in the _left_ array or the _right_ arrays, with no duplicates. The result is sorted in ascending order.                                                                                                                                   | `ARRAY_UNION(ARRAY [1, 2, 3], ARRAY [3,1,4])` => `[1,2,3,4]`        |
 | <a id="cardinality"></a>`CARDINALITY(` _array_ `)`                   | Returns the size of the _array_ expression (number of elements).                                                                                                                                                                                                                          | `CARDINALITY(ARRAY[2,3])` => 2                                      |
 | <a id="element"></a>`ELEMENT(` _array_ `)`                           | Returns the single element of an _array_ of any type. If the array has zero elements, returns `NULL`. If the array has more than one element, it causes a runtime exception.                                                                                                              | `ELEMENT(ARRAY[2])` => 2                                            |
+| <a id="array_sort"></a>`ARRAY_SORT(array [, comparator])` | Sorts in ascending order with nulls last. An optional `(left, right) -> INTEGER` comparator overrides this order; it must return a negative, zero, or positive integer, never `NULL`. A null array returns `NULL`. | `ARRAY_SORT(ARRAY [4, NULL, 1])` => `[1, 4, NULL]` |
 | <a id="sort"></a>`SORT_ARRAY(` _array_ `, [` _ascendingOrder_ `])`   | Returns a new array, sorted in ascending (_ascendingOrder_ is `true`) or descending order (_ascendingOrder_ is `false`) according to the natural ordering of the array elements. The default order is ascending if ascendingOrder is not specified. Null elements are considered to be the smallest. | `SORT_ARRAY(ARRAY [4, 7, 1, null])` => `[null, 1, 4, 7]`            |
 | <a id="transform"></a>`TRANSFORM(` _array_, _function_ `)`           | _function_ is a lambda expression with an argument that has the array element type. `TRANSFORM` returns a new array constructed by applying the function to every element of _array_. If _array_ is NULL, it returns NULL                                                                 | `TRANSFORM(ARRAY[1, 2, 3], x -> x % 2)` => `[1, 0, 1]`              |

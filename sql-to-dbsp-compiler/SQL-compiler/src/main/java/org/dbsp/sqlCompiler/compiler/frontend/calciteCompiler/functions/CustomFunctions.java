@@ -66,6 +66,7 @@ public class CustomFunctions {
         this.functions.add(ArrayPositionFunction.INSTANCE);
         this.functions.add(ArrayRemoveFunction.INSTANCE);
         this.functions.add(ArraySliceFunction.INSTANCE);
+        this.functions.add(ArraySortFunction.INSTANCE);
         this.functions.add(ArrayTransformFunction.INSTANCE);
         this.functions.add(ArrayUnion.INSTANCE);
         this.functions.add(ArraysOverlapFunction.INSTANCE);
@@ -101,6 +102,9 @@ public class CustomFunctions {
         this.functions.add(NowFunction.INSTANCE);
         this.functions.add(ParseDateFunction.INSTANCE);
         this.functions.add(ParseJsonFunction.INSTANCE);
+        this.functions.add(SparkJsonFunctions.FROM_JSON);
+        this.functions.add(SparkJsonFunctions.GET_JSON_OBJECT);
+        this.functions.add(SparkJsonFunctions.NAMED_STRUCT);
         this.functions.add(ParseTimeFunction.INSTANCE);
         this.functions.add(ParseTimestampFunction.INSTANCE);
         this.functions.add(RegexpReplaceFunction.INSTANCE);
@@ -409,6 +413,18 @@ public class CustomFunctions {
         }
     }
 
+    static class ArraySortFunction extends NonOptimizedFunction {
+        static final ArraySortFunction INSTANCE = new ArraySortFunction();
+
+        private ArraySortFunction() {
+            super("ARRAY_SORT", ArrayFilterFunction.FILTER_INFERENCE,
+                    OperandTypes.ARRAY.or(new ArrayLambdaOperandTypeChecker(
+                            "ARRAY_SORT(<ARRAY>, (left, right) -> INTEGER)", SqlTypeName.INTEGER, 2)),
+                    SqlFunctionCategory.USER_DEFINED_FUNCTION,
+                    "array#array_sort", FunctionDocumentation.NO_FILE);
+        }
+    }
+
     static class ArrayRemoveFunction extends NonOptimizedFunction {
         static final ArrayRemoveFunction INSTANCE = new ArrayRemoveFunction();
 
@@ -652,7 +668,7 @@ public class CustomFunctions {
         private ToJsonFunction() {
             super("TO_JSON",
                     ReturnTypes.VARCHAR.andThen(SqlTypeTransforms.FORCE_NULLABLE),
-                    OperandTypes.VARIANT,
+                    OperandTypes.VARIANT.or(OperandTypes.ARRAY).or(OperandTypes.MAP).or(new ExactTypeNameChecker(SqlTypeName.ROW)),
                     SqlFunctionCategory.STRING, "json#to_json", FunctionDocumentation.NO_FILE);
         }
     }
@@ -854,17 +870,22 @@ public class CustomFunctions {
         }
     }
 
-    /** SEQUENCE(start, end) returns an array of integers from start to end (inclusive).
-     * The array is empty if start > end. */
     static class SequenceFunction extends NonOptimizedFunction {
         static final SequenceFunction INSTANCE = new SequenceFunction();
 
         private SequenceFunction() {
             super("SEQUENCE",
-                    ReturnTypes.INTEGER
-                            .andThen(SqlTypeTransforms.TO_ARRAY)
-                            .andThen(SqlTypeTransforms.TO_NULLABLE),
-                    family(SqlTypeFamily.INTEGER, SqlTypeFamily.INTEGER),
+                    binding -> {
+                        boolean date = binding.getOperandCount() == 3 || binding.collectOperandTypes()
+                                .stream().anyMatch(t -> t.getSqlTypeName() == SqlTypeName.DATE);
+                        return SqlTypeUtil.createArrayType(binding.getTypeFactory(),
+                                binding.getTypeFactory().createSqlType(date ? SqlTypeName.DATE : SqlTypeName.INTEGER),
+                                binding.collectOperandTypes().stream().anyMatch(RelDataType::isNullable));
+                    },
+                    family(SqlTypeFamily.INTEGER, SqlTypeFamily.INTEGER)
+                            .or(family(SqlTypeFamily.DATE, SqlTypeFamily.DATE))
+                            .or(family(SqlTypeFamily.DATE, SqlTypeFamily.DATE, SqlTypeFamily.INTERVAL_DAY_TIME))
+                            .or(family(SqlTypeFamily.DATE, SqlTypeFamily.DATE, SqlTypeFamily.INTERVAL_YEAR_MONTH)),
                     SqlFunctionCategory.USER_DEFINED_FUNCTION, "integer#sequence", FunctionDocumentation.NO_FILE);
         }
     }

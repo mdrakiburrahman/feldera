@@ -10,6 +10,8 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- SQL supports Spark `EXPLODE` and `STACK` in projections and `LATERAL VIEW [OUTER]` clauses.
+- Added date `SEQUENCE`, `ARRAY_SORT`, `PERCENTILE_CONT`, `NAMED_STRUCT`, `FROM_JSON`, `GET_JSON_OBJECT`, and typed row/array/map support for `TO_JSON`.
 - URL inputs support read-only OneLake Files snapshots and following through ABFSS, with managed identity, recursive glob/time filtering, and checkpoint recovery.
 - Delta Lake sources support `ignore_deletes` to retain rows when source files expire.
 - Delta name-mapped reads resolve physical names even when writers assign different Parquet field IDs.

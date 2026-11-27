@@ -105,6 +105,7 @@ import org.apache.calcite.sql.SqlWriter;
 import org.apache.calcite.sql.dialect.OracleSqlDialect;
 import org.apache.calcite.sql.fun.SqlDatetimeSubtractionOperator;
 import org.apache.calcite.sql.fun.SqlLibraryOperators;
+import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParseException;
 import org.apache.calcite.sql.parser.SqlParser;
 import org.apache.calcite.sql.parser.SqlParserPos;
@@ -878,15 +879,20 @@ public class SqlToRelCompiler implements IWritesLogs {
         }
     }
 
-    /** Replace calls to Calcite's ARRAY_AGG with calls to {@link SqlArrayAggFunction} */
-    static class ReplaceArrayAgg extends SqlShuttle {
+    /** Replace aggregate operators that Calcite hard-codes in its parser. */
+    static class ReplaceAggregates extends SqlShuttle {
         @Override
         public @org.checkerframework.checker.nullness.qual.Nullable SqlNode visit(SqlCall call) {
             SqlCall newCall = Objects.requireNonNull((SqlCall) super.visit(call));
+            SqlOperator replacement;
             if (newCall.getOperator() == SqlLibraryOperators.ARRAY_AGG)
-                return SqlArrayAggFunction.INSTANCE.createCall(newCall.getFunctionQuantifier(),
-                        newCall.getParserPosition(), newCall.getOperandList());
-            return newCall;
+                replacement = SqlArrayAggFunction.INSTANCE;
+            else if (newCall.getOperator() == SqlStdOperatorTable.PERCENTILE_CONT)
+                replacement = CalciteFunctions.PERCENTILE_CONT;
+            else
+                return newCall;
+            return replacement.createCall(newCall.getFunctionQuantifier(),
+                    newCall.getParserPosition(), newCall.getOperandList());
         }
     }
 
@@ -917,7 +923,7 @@ public class SqlToRelCompiler implements IWritesLogs {
         node = Objects.requireNonNull(replace.visitNode(node));
         ReplaceSafeCasts replace1 = new ReplaceSafeCasts();
         node = Objects.requireNonNull(replace1.visitNode(node));
-        ReplaceArrayAgg replace2 = new ReplaceArrayAgg();
+        ReplaceAggregates replace2 = new ReplaceAggregates();
         node = Objects.requireNonNull(replace2.visitNode(node));
         return node;
     }
@@ -2144,6 +2150,7 @@ public class SqlToRelCompiler implements IWritesLogs {
     }
 
     RelRoot sqlToRel(SqlNode node) {
+        node = SparkGenerators.lower(node);
         SqlToRelConverter converter = this.getConverter();
         // Wrap the string literals with characters above U+FFFF in calls to a
         // fictitious function, to prevent Calcite from computing with Java

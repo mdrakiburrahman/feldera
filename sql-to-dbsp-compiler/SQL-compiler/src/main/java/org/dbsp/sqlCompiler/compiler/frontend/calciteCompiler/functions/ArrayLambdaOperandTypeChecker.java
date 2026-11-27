@@ -20,6 +20,7 @@ import static org.apache.calcite.sql.type.OperandTypes.ARRAY;
  * element type; the lambda body must have the required result type, when one is given. */
 class ArrayLambdaOperandTypeChecker implements SqlOperandTypeChecker {
     private final String signature;
+    private final int lambdaArity;
     /** Type the lambda body must have; null accepts any type */
     @Nullable
     private final SqlTypeName resultTypeName;
@@ -30,7 +31,12 @@ class ArrayLambdaOperandTypeChecker implements SqlOperandTypeChecker {
     }
 
     ArrayLambdaOperandTypeChecker(String signature, @Nullable SqlTypeName resultTypeName) {
+        this(signature, resultTypeName, 1);
+    }
+
+    ArrayLambdaOperandTypeChecker(String signature, @Nullable SqlTypeName resultTypeName, int lambdaArity) {
         this.signature = signature;
+        this.lambdaArity = lambdaArity;
         this.resultTypeName = resultTypeName;
     }
 
@@ -57,9 +63,10 @@ class ArrayLambdaOperandTypeChecker implements SqlOperandTypeChecker {
             componentType = callBinding.getTypeFactory().createSqlType(SqlTypeName.NULL);
         }
 
-        // The second operand is a function(array_element_type) -> result type
+        RelDataType[] parameters = new RelDataType[this.lambdaArity];
+        java.util.Arrays.fill(parameters, componentType);
         GenericLambdaTypeChecker lambdaChecker =
-                new GenericLambdaTypeChecker(this.signature, componentType);
+                new GenericLambdaTypeChecker(this.signature, parameters);
         if (!lambdaChecker.checkSingleOperandType(callBinding, callBinding.operand(1), 1, throwOnFailure))
             return false;
         return this.checkResultType(callBinding, throwOnFailure);

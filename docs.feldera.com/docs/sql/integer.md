@@ -81,7 +81,8 @@ run time errors.
   </tr>
   <tr>
     <td><a id="sequence"></a><code>SEQUENCE(start, end)</code></td>
-    <td>returns an array of integers from start to end (inclusive). If end &lt; start, an empty array is returned. If any of the arguments are NULL, NULL is returned.</td>
+    <td>Returns an array of integers from start to end (inclusive). If end &lt; start, an empty array is returned. If any argument is NULL, NULL is returned.
+        For date inputs and interval steps, see <a href="datetime.md#date-operations">Date operations</a>.</td>
   </tr>
 </table>
 

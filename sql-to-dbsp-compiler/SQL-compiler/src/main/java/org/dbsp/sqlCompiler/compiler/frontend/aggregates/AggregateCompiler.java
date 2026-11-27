@@ -48,6 +48,7 @@ import org.dbsp.sqlCompiler.compiler.errors.UnimplementedException;
 import org.dbsp.sqlCompiler.compiler.frontend.CalciteToDBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.frontend.ExpressionCompiler;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.CalciteFunctions;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlArrayAggFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlUserDefinedAggregationFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
@@ -479,7 +480,44 @@ public class AggregateCompiler implements ICompilerComponent {
                 node, zero, this.makeRowClosure(increment, accumulator), post, empty, semigroup));
     }
 
+    void processPercentile(boolean ordered) {
+        DBSPExpression value;
+        DBSPExpression fraction;
+        boolean descending = false;
+        if (ordered) {
+            List<RelFieldCollation> keys = this.call.getCollation().getFieldCollations();
+            if (keys.size() != 1)
+                throw new UnimplementedException("PERCENTILE_CONT requires WITHIN GROUP with one ORDER BY key", this.node);
+            RelFieldCollation key = keys.get(0);
+            descending = key.direction.isDescending();
+            value = this.eComp.inputIndex(this.node, key.getFieldIndex());
+            fraction = this.getAggregatedValue();
+        } else {
+            value = this.getAggregatedValue().field(0);
+            fraction = this.getAggregatedValue().field(1);
+        }
+        if (!value.getType().is(IsNumericType.class))
+            throw new CompilationError("PERCENTILE requires a numeric value", this.node);
+        value = value.cast(this.node, DBSPTypeDouble.NULLABLE_INSTANCE, DBSPCastExpression.CastType.SqlUnsafe);
+        fraction = fraction.cast(this.node, DBSPTypeDouble.INSTANCE, DBSPCastExpression.CastType.SqlUnsafe);
+        DBSPTypeUser state = new DBSPTypeUser(this.node, DBSPTypeCode.USER, "PercentileAccumulator", false);
+        DBSPVariablePath acc = state.var();
+        DBSPExpression keep = this.filterArgument >= 0 ? this.filterArgument() : new DBSPBoolLiteral(true);
+        DBSPExpression step = new DBSPApplyExpression(this.node, "percentile_step", DBSPTypeVoid.INSTANCE,
+                acc.borrow(true), value, fraction, this.compiler.weightVar, keep);
+        DBSPVariablePath finalState = state.var();
+        DBSPExpression finish = new DBSPApplyExpression(this.node, "percentile_finish", this.nullableResultType,
+                finalState, new DBSPBoolLiteral(descending));
+        DBSPTypeUser semigroup = new DBSPTypeUser(this.node, SEMIGROUP, "PercentileSemigroup", false);
+        this.setResult(new NonLinearAggregate(this.node, state.constructor("default"), this.makeRowClosure(step, acc),
+                finish.closure(finalState), DBSPLiteral.none(this.nullableResultType), semigroup));
+    }
+
     void processBasic(SqlBasicAggFunction function) {
+        if (function == CalciteFunctions.PERCENTILE_CONT || function == CalciteFunctions.PERCENTILE) {
+            this.processPercentile(function == CalciteFunctions.PERCENTILE_CONT);
+            return;
+        }
         // ARG_MAX(value, compared) or ARG_MIN(value, compared).
         // The first argument is the output, and has type `this.returnType`
         SqlKind kind = function.getKind();
