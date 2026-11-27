@@ -196,6 +196,40 @@ public class DeferCarriedColumnsTests extends SqlIoTest {
                          1  | x  | y  | z  | A  | B  | C  | E""");
     }
 
+    /** A chain headed by a ROWS window.  The window's rolling aggregate is indexed by the
+     * partition, which is not a key: fetching the payload back by the partition alone would
+     * repeat each row once per row of its partition. */
+    @Test
+    public void windowPartitionIsNotAKey() {
+        Rewritten rewritten = this.compile("""
+                CREATE TABLE runs(node INT, ts INT, x INT, a INT, b INT, c INT,
+                                  p1 VARCHAR, p2 VARCHAR, p3 VARCHAR);
+                CREATE VIEW v AS
+                WITH w AS (SELECT *, AVG(x) OVER (PARTITION BY node ORDER BY ts
+                                                  ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING) AS avg_x
+                           FROM runs)
+                SELECT w.node, w.ts, w.p1, w.p2, w.p3, w.avg_x, l1.v1, l2.v2, l3.v3
+                FROM w
+                LEFT JOIN l1 ON w.a = l1.k
+                LEFT JOIN l2 ON w.b = l2.k
+                LEFT JOIN l3 ON w.c = l3.k;""");
+        rewritten.ccs().stepWeightOne("""
+                        INSERT INTO runs VALUES (1, 1, 10, 10, 20, 30, 'a', 'b', 'c'),
+                                                (1, 2, 20, 10, 20, 30, 'd', 'e', 'f'),
+                                                (1, 3, 30, 10, 20, 30, 'g', 'h', 'i'),
+                                                (2, 1, 40, 99, 99, 99, 'j', 'k', 'l');
+                        INSERT INTO l1 VALUES (10, 'A');
+                        INSERT INTO l2 VALUES (20, 'B');
+                        INSERT INTO l3 VALUES (30, 'C');""",
+                """
+                         node | ts | p1 | p2 | p3 | avg_x | v1 | v2 | v3
+                        ------------------------------------------------
+                         1    | 1  | a  | b  | c  | NULL  | A  | B  | C
+                         1    | 2  | d  | e  | f  | 10    | A  | B  | C
+                         1    | 3  | g  | h  | i  | 15    | A  | B  | C
+                         2    | 1  | j  | k  | l  | NULL  |NULL|NULL|NULL""");
+    }
+
     /** A filter above the chain drops row 2; the column it reads is deferred like the others. */
     @Test
     public void droppedRowStaysDropped() {
