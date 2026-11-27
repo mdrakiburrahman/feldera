@@ -142,7 +142,7 @@ class FindComparisons {
 
         // The expression containing now() must be monotone
         MonotoneExpression me = this.mono.maybeGet(withNow);
-        if (me == null || !me.mayBeMonotone())
+        if (me == null || !me.mayBeMonotone() || !MonotoneTransferFunctions.typeCanBeMonotone(withNow.getType()))
             return false;
 
         DBSPOpcode opcode = leftHasNow ? RewriteNow.swappedOpcode(binary.opcode) : binary.opcode;

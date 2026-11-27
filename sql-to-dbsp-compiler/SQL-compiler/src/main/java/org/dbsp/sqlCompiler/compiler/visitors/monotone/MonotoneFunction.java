@@ -139,7 +139,9 @@ public abstract class MonotoneFunction {
             new FirstArgumentMonotoneFunction(
                     "tumble_(Timestamp|TimestampTz)#_ShortInterval(_Time|_ShortInterval)?", FAILS),
             new FirstArgumentMonotoneFunction("hop_start_timestamp", NEVER_FAILS),
-            new DateDiffMonotoneFunction("datediff_(day|hour|week|month|quarter|year)_Date_Date#"));
+            new DateDiffMonotoneFunction("datediff_(day|hour|week|month|quarter|year)_Date_Date#"),
+            new FormatDateMonotoneFunction(),
+            new SparkDigitsCastMonotoneFunction());
 
     /** The function called {@code name}, or Java null if it is never monotone. */
     @Nullable

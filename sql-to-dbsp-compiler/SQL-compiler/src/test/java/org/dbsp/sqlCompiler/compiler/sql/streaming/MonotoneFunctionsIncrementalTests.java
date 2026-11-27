@@ -1,6 +1,9 @@
 package org.dbsp.sqlCompiler.compiler.sql.streaming;
 
 import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainKeysOperator;
+import org.dbsp.sqlCompiler.compiler.CompilerOptions;
+import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.errors.CompilerMessages;
 import org.dbsp.sqlCompiler.compiler.sql.StreamingTestBase;
 import org.dbsp.sqlCompiler.compiler.sql.tools.CompilerCircuit;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
@@ -152,5 +155,43 @@ public class MonotoneFunctionsIncrementalTests extends StreamingTestBase {
                 CREATE VIEW V AS SELECT COUNT(*) AS c FROM T GROUP BY CAST(ts AS TYPE);""";
         this.expectRetainKeys(sql.replace("TYPE", "DATE"), 1);
         this.expectRetainKeys(sql.replace("TYPE", "TIME"), 0);
+    }
+
+    boolean inefficientNow(String sql, boolean sparkCompat) {
+        CompilerOptions options = this.testOptions();
+        options.languageOptions.sparkCompat = sparkCompat;
+        options.ioOptions.quiet = false;
+        DBSPCompiler compiler = new DBSPCompiler(options);
+        compiler.submitStatementsForCompilation(sql);
+        compiler.getFinalCircuit(false);
+        for (CompilerMessages.Message message : compiler.messages.messages)
+            if (message.errorType.equals("Inefficient pattern"))
+                return true;
+        return false;
+    }
+
+    /** An integer YYYYMMDD key compared with a date derived from NOW() printed as '%Y%m%d' is a
+     * temporal filter, also through the Spark cast.  A format that prints the day first is not. */
+    @Test
+    public void yyyymmddTemporalFilter() {
+        String sql = """
+                CREATE TABLE T (d INT);
+                CREATE VIEW V AS SELECT d FROM T
+                WHERE d >= CAST(FORMAT_DATE('%Y%m%d', CAST(NOW() AS DATE) - INTERVAL 1 DAY) AS INT);""";
+        Assert.assertTrue(this.inefficientNow(sql.replace("%Y%m%d", "%d%m%Y"), false));
+        Assert.assertFalse(this.inefficientNow(sql, false));
+        Assert.assertFalse(this.inefficientNow(sql, true));
+        var ccs = this.getCCS(sql);
+        ccs.step("""
+                INSERT INTO T VALUES (20240101), (20240102), (20240103);
+                INSERT INTO now VALUES ('2024-01-03 10:00:00');""", """
+                 d        | weight
+                -------------------
+                 20240102 | 1
+                 20240103 | 1""");
+        ccs.step("INSERT INTO now VALUES ('2024-01-04 00:00:00');", """
+                 d        | weight
+                -------------------
+                 20240102 | -1""");
     }
 }

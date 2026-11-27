@@ -51,6 +51,8 @@ import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTupleBase;
 import org.dbsp.sqlCompiler.ir.IsNumericLiteral;
 import org.dbsp.sqlCompiler.ir.type.IsNumericType;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeBool;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeInteger;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeString;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTime;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeIndexedZSet;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
@@ -436,6 +438,7 @@ public class MonotoneTransferFunctions extends TranslateVisitor<MonotoneExpressi
     public void postorder(DBSPLiteral expression) {
         if (!MonotoneTransferFunctions.typeCanBeMonotone(expression.getType())) {
             IMaybeMonotoneType nmt = NonMonotoneType.nonMonotone(expression.getType());
+            this.constantExpressions.add(expression);
             MonotoneExpression result = new MonotoneExpression(expression, nmt, null);
             this.set(expression, result);
             return;
@@ -761,6 +764,12 @@ public class MonotoneTransferFunctions extends TranslateVisitor<MonotoneExpressi
         return true;
     }
 
+    /** True if {@code type} is an integer type that holds every number of 8 digits. */
+    static boolean holdsEightDigits(DBSPType type) {
+        DBSPTypeInteger integer = type.as(DBSPTypeInteger.class);
+        return integer != null && integer.getWidth() >= 32;
+    }
+
     @Override
     public void postorder(DBSPCastExpression expression) {
         MonotoneExpression source = this.get(expression.source);
@@ -770,7 +779,8 @@ public class MonotoneTransferFunctions extends TranslateVisitor<MonotoneExpressi
         // and the cast preserves order.  A SAFE_CAST that can fail returns NULL among values,
         // which is not monotone for either position of NULL in the order.
         boolean outputTypeMayBeMonotone = typeCanBeMonotone(expression.getType());
-        boolean nullAmongValues = expression.safe.isSafe() && expression.canFail();
+        boolean digits = expression.source.getType().is(DBSPTypeString.class) && holdsEightDigits(expression.getType());
+        boolean nullAmongValues = expression.safe.isSafe() && expression.canFail() && !digits;
         boolean isMonotone = source.mayBeMonotone() && outputTypeMayBeMonotone && !nullAmongValues &&
                 castPreservesOrder(expression.source.getType(), expression.getType());
         if (isMonotone) {
@@ -783,6 +793,10 @@ public class MonotoneTransferFunctions extends TranslateVisitor<MonotoneExpressi
                 reduced = waterline.cast(expression.getNode(), type, DBSPCastExpression.CastType.SqlUnsafe);
             else if (DBSPCastExpression.hasSaturatingForm(waterline.getType(), type))
                 reduced = waterline.cast(expression.getNode(), type, DBSPCastExpression.CastType.Saturating);
+            else if (digits)
+                // The only monotone strings are dates printed as at most 8 digits by
+                // FormatDateMonotoneFunction; their numeric order is their lexicographic order
+                reduced = waterline.cast(expression.getNode(), type, DBSPCastExpression.CastType.SqlUnsafe);
             else
                 isMonotone = false;
         }
