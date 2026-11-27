@@ -32,6 +32,24 @@ public class TopKTests extends SqlIoTest {
     }
 
     @Test
+    public void nestedSearchWithRowNumber() {
+        var ccs = this.getCCS("""
+                CREATE TABLE t(e VARCHAR);
+                CREATE VIEW v AS WITH c AS (
+                    SELECT e, CASE WHEN e IN ('a', 'b', 'c') THEN 'X'
+                                   WHEN e = 'd' THEN 'Z' ELSE 'Y' END AS cloud FROM t)
+                SELECT ROW_NUMBER() OVER (ORDER BY cloud, e) AS k, e, cloud,
+                       cloud NOT IN (CAST('Y' AS VARCHAR), CAST('Z' AS VARCHAR)) AS f FROM c;
+                """).withStringTrim();
+        ccs.stepWeightOne("INSERT INTO t VALUES ('a'), ('d'), ('other')", """
+                 k | e     | cloud | f
+                -----------------------
+                 1 | a     | X     | true
+                 2 | other | Y     | false
+                 3 | d     | Z     | false""");
+    }
+
+    @Test
     public void testTopK() {
         // below ? is a parameter
         String paramQuery = """

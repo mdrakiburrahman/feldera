@@ -1125,6 +1125,10 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
 
     @Override
     public DBSPExpression visitCall(RexCall call) {
+        // A SEARCH can itself refer to an expression containing another SEARCH. Calcite
+        // expands only the outer call; visit the expansion before translating its operands.
+        if (call.getKind() == SqlKind.SEARCH)
+            return RexUtil.expandSearch(this.rexBuilder, null, call).accept(this);
         CalciteObject node = CalciteObject.create(this.context, call);
         DBSPType type = this.typeCompiler.convertType(node.getPositionRange(), call.getType(), false);
         // If type is NULL we can skip the call altogether...
@@ -2763,7 +2767,6 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                 .append("Compiling ")
                 .appendSupplier(expression::toString)
                 .newline();
-        expression = RexUtil.expandSearch(this.rexBuilder, null, expression);
         DBSPExpression result = expression.accept(this);
         if (result == null)
             throw new InternalCompilerError("Unexpected Calcite expression " + expression,

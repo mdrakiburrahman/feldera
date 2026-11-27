@@ -1484,6 +1484,9 @@ public class MetadataTests extends BaseSQLTests {
                       Followed by a path.  Path to the runtime to use.  Used in conjunction\s
                       with '--crates'.
                       Default: <empty string>
+                    --sparkCompat
+                      Use Spark-compatible SQL semantics
+                      Default: false
                     --streaming
                       Compiling a streaming program, where only inserts are allowed
                       Default: false
