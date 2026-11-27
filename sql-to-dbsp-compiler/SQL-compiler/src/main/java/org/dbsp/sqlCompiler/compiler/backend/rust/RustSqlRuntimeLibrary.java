@@ -84,6 +84,9 @@ public class RustSqlRuntimeLibrary {
         this.arithmeticFunctions.put(DBSPOpcode.DIV_NULL, DBSPOpcode.DIV_NULL.toString());
         this.arithmeticFunctions.put(DBSPOpcode.SPARK_MUL, DBSPOpcode.SPARK_MUL.toString());
         this.arithmeticFunctions.put(DBSPOpcode.SPARK_DIV, DBSPOpcode.SPARK_DIV.toString());
+        this.arithmeticFunctions.put(DBSPOpcode.SPARK_ADD, DBSPOpcode.SPARK_ADD.toString());
+        this.arithmeticFunctions.put(DBSPOpcode.SPARK_SUB, DBSPOpcode.SPARK_SUB.toString());
+        this.arithmeticFunctions.put(DBSPOpcode.SPARK_MOD, DBSPOpcode.SPARK_MOD.toString());
         this.arithmeticFunctions.put(DBSPOpcode.ADD_SATURATING, DBSPOpcode.ADD_SATURATING.toString());
         this.arithmeticFunctions.put(DBSPOpcode.SUB_SATURATING, DBSPOpcode.SUB_SATURATING.toString());
         this.arithmeticFunctions.put(DBSPOpcode.MUL_SATURATING, DBSPOpcode.MUL_SATURATING.toString());

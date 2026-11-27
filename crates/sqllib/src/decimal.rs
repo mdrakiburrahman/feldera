@@ -5,6 +5,7 @@ use crate::{
 };
 pub use feldera_fxp::DynamicDecimal;
 use feldera_fxp::Fixed;
+use num::{BigInt, Integer, Signed, ToPrimitive, Zero};
 
 pub type SqlDecimal<const P: usize, const S: usize> = Fixed<P, S>;
 
@@ -83,7 +84,26 @@ pub fn div_SqlDecimal_SqlDecimal<
 
 some_polymorphic_function2!(div [const P0: usize, const S0: usize, const P1: usize, const S1: usize, const P2: usize, const S2: usize], SqlDecimal, SqlDecimal<P0, S0>, SqlDecimal, SqlDecimal<P1, S1>, SqlDecimal<P2, S2>);
 
-/// Spark decimal multiplication: rounds HALF_UP to the result scale.
+fn spark_decimal_ratio<const P: usize, const S: usize>(
+    mut numerator: BigInt,
+    mut denominator: BigInt,
+    shift: i32,
+) -> Option<SqlDecimal<P, S>> {
+    if denominator.is_zero() {
+        return None;
+    }
+    if shift >= 0 {
+        numerator *= BigInt::from(10).pow(shift as u32);
+    } else {
+        denominator *= BigInt::from(10).pow(shift.unsigned_abs());
+    }
+    let (mut quotient, remainder) = numerator.div_rem(&denominator);
+    if remainder.abs() * 2 >= denominator.abs() {
+        quotient += numerator.signum() * denominator.signum();
+    }
+    SqlDecimal::new(quotient.to_i128()?, S as i32)
+}
+
 #[doc(hidden)]
 pub fn spark_times_SqlDecimal_SqlDecimal<
     const P0: usize,
@@ -95,19 +115,16 @@ pub fn spark_times_SqlDecimal_SqlDecimal<
 >(
     left: SqlDecimal<P0, S0>,
     right: SqlDecimal<P1, S1>,
-) -> SqlDecimal<P2, S2> {
-    left.checked_mul_generic_half_up::<P1, S1, P2, S2>(right)
-        .unwrap_or_else(|| {
-            panic!(
-                "Overflow in multiplication {}*{} cannot be represented as DECIMAL({P2}, {S2})",
-                left, right
-            )
-        })
+) -> Option<SqlDecimal<P2, S2>> {
+    spark_decimal_ratio(
+        BigInt::from(left.mantissa()) * right.mantissa(),
+        BigInt::from(1),
+        S2 as i32 - S0 as i32 - S1 as i32,
+    )
 }
 
-some_polymorphic_function2!(spark_times [const P0: usize, const S0: usize, const P1: usize, const S1: usize, const P2: usize, const S2: usize], SqlDecimal, SqlDecimal<P0, S0>, SqlDecimal, SqlDecimal<P1, S1>, SqlDecimal<P2, S2>);
+some_polymorphic_null_function2!(spark_times [const P0: usize, const S0: usize, const P1: usize, const S1: usize, const P2: usize, const S2: usize], SqlDecimal, SqlDecimal<P0, S0>, SqlDecimal, SqlDecimal<P1, S1>, SqlDecimal<P2, S2>);
 
-/// Spark decimal division: rounds HALF_UP to the result scale.
 #[doc(hidden)]
 pub fn spark_div_SqlDecimal_SqlDecimal<
     const P0: usize,
@@ -119,21 +136,150 @@ pub fn spark_div_SqlDecimal_SqlDecimal<
 >(
     left: SqlDecimal<P0, S0>,
     right: SqlDecimal<P1, S1>,
-) -> SqlDecimal<P2, S2> {
-    left.checked_div_generic_half_up::<P1, S1, P2, S2>(right)
-        .unwrap_or_else(|| {
-            if right == SqlDecimal::<P1, S1>::ZERO {
-                panic!("Attempt to divide by zero: {}/{}", left, right)
-            } else {
-                panic!(
-                    "Overflow in division {}/{} cannot be represented as DECIMAL({P2}, {S2})",
-                    left, right
-                )
-            }
-        })
+) -> Option<SqlDecimal<P2, S2>> {
+    spark_decimal_ratio(
+        BigInt::from(left.mantissa()),
+        BigInt::from(right.mantissa()),
+        S1 as i32 + S2 as i32 - S0 as i32,
+    )
 }
 
-some_polymorphic_function2!(spark_div [const P0: usize, const S0: usize, const P1: usize, const S1: usize, const P2: usize, const S2: usize], SqlDecimal, SqlDecimal<P0, S0>, SqlDecimal, SqlDecimal<P1, S1>, SqlDecimal<P2, S2>);
+some_polymorphic_null_function2!(spark_div [const P0: usize, const S0: usize, const P1: usize, const S1: usize, const P2: usize, const S2: usize], SqlDecimal, SqlDecimal<P0, S0>, SqlDecimal, SqlDecimal<P1, S1>, SqlDecimal<P2, S2>);
+
+fn spark_decimal_align<const P0: usize, const S0: usize, const P1: usize, const S1: usize>(
+    left: SqlDecimal<P0, S0>,
+    right: SqlDecimal<P1, S1>,
+) -> (BigInt, BigInt, usize) {
+    let scale = S0.max(S1);
+    (
+        BigInt::from(left.mantissa()) * BigInt::from(10).pow((scale - S0) as u32),
+        BigInt::from(right.mantissa()) * BigInt::from(10).pow((scale - S1) as u32),
+        scale,
+    )
+}
+
+#[doc(hidden)]
+pub fn spark_plus_SqlDecimal_SqlDecimal<
+    const P0: usize,
+    const S0: usize,
+    const P1: usize,
+    const S1: usize,
+    const P2: usize,
+    const S2: usize,
+>(
+    left: SqlDecimal<P0, S0>,
+    right: SqlDecimal<P1, S1>,
+) -> Option<SqlDecimal<P2, S2>> {
+    let (left, right, scale) = spark_decimal_align(left, right);
+    spark_decimal_ratio(left + right, BigInt::from(1), S2 as i32 - scale as i32)
+}
+
+some_polymorphic_null_function2!(spark_plus [const P0: usize, const S0: usize, const P1: usize, const S1: usize, const P2: usize, const S2: usize], SqlDecimal, SqlDecimal<P0, S0>, SqlDecimal, SqlDecimal<P1, S1>, SqlDecimal<P2, S2>);
+
+#[doc(hidden)]
+pub fn spark_minus_SqlDecimal_SqlDecimal<
+    const P0: usize,
+    const S0: usize,
+    const P1: usize,
+    const S1: usize,
+    const P2: usize,
+    const S2: usize,
+>(
+    left: SqlDecimal<P0, S0>,
+    right: SqlDecimal<P1, S1>,
+) -> Option<SqlDecimal<P2, S2>> {
+    let (left, right, scale) = spark_decimal_align(left, right);
+    spark_decimal_ratio(left - right, BigInt::from(1), S2 as i32 - scale as i32)
+}
+
+some_polymorphic_null_function2!(spark_minus [const P0: usize, const S0: usize, const P1: usize, const S1: usize, const P2: usize, const S2: usize], SqlDecimal, SqlDecimal<P0, S0>, SqlDecimal, SqlDecimal<P1, S1>, SqlDecimal<P2, S2>);
+
+#[doc(hidden)]
+pub fn spark_mod_SqlDecimal_SqlDecimal<
+    const P0: usize,
+    const S0: usize,
+    const P1: usize,
+    const S1: usize,
+    const P2: usize,
+    const S2: usize,
+>(
+    left: SqlDecimal<P0, S0>,
+    right: SqlDecimal<P1, S1>,
+) -> Option<SqlDecimal<P2, S2>> {
+    let (left, right, scale) = spark_decimal_align(left, right);
+    if right.is_zero() {
+        return None;
+    }
+    spark_decimal_ratio(left % right, BigInt::from(1), S2 as i32 - scale as i32)
+}
+
+some_polymorphic_null_function2!(spark_mod [const P0: usize, const S0: usize, const P1: usize, const S1: usize, const P2: usize, const S2: usize], SqlDecimal, SqlDecimal<P0, S0>, SqlDecimal, SqlDecimal<P1, S1>, SqlDecimal<P2, S2>);
+
+// Store the exact sum as sign and base-2^32 digits in DBSP's serializable tuple types.
+#[doc(hidden)]
+pub type SparkDecimalAccumulator = dbsp::utils::Tup3<bool, Vec<u32>, crate::Weight>;
+
+fn spark_decimal_sum(acc: &SparkDecimalAccumulator) -> BigInt {
+    BigInt::new(
+        if acc.0 {
+            num::bigint::Sign::Minus
+        } else {
+            num::bigint::Sign::Plus
+        },
+        acc.1.clone(),
+    )
+}
+
+fn spark_decimal_state(sum: BigInt, count: crate::Weight) -> SparkDecimalAccumulator {
+    let (sign, digits) = sum.to_u32_digits();
+    dbsp::utils::Tup3(sign == num::bigint::Sign::Minus, digits, count)
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct SparkDecimalSemigroup;
+
+impl dbsp::algebra::Semigroup<SparkDecimalAccumulator> for SparkDecimalSemigroup {
+    fn combine(
+        left: &SparkDecimalAccumulator,
+        right: &SparkDecimalAccumulator,
+    ) -> SparkDecimalAccumulator {
+        spark_decimal_state(
+            spark_decimal_sum(left) + spark_decimal_sum(right),
+            left.2 + right.2,
+        )
+    }
+}
+
+#[doc(hidden)]
+pub fn spark_decimal_avg_step<const P: usize, const S: usize>(
+    acc: &mut SparkDecimalAccumulator,
+    value: Option<SqlDecimal<P, S>>,
+    weight: crate::Weight,
+    keep: bool,
+) {
+    if let Some(value) = value
+        && keep
+    {
+        *acc = spark_decimal_state(
+            spark_decimal_sum(acc) + BigInt::from(value.mantissa()) * weight,
+            acc.2 + weight,
+        );
+    }
+}
+
+#[doc(hidden)]
+pub fn spark_decimal_avg_finish<const P: usize, const S: usize>(
+    acc: SparkDecimalAccumulator,
+    sum_precision: i32,
+    input_scale: i32,
+) -> Option<SqlDecimal<P, S>> {
+    let sum = spark_decimal_sum(&acc);
+    if acc.2 == 0 || sum.abs() >= BigInt::from(10).pow(sum_precision as u32) {
+        return None;
+    }
+    spark_decimal_ratio(sum, BigInt::from(acc.2), S as i32 - input_scale)
+}
 
 #[doc(hidden)]
 pub fn div_null_SqlDecimal_SqlDecimal<

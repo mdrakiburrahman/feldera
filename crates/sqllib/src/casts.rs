@@ -1608,6 +1608,24 @@ pub fn cast_to_sN_nullN(
 
 /////////// cast to integer
 
+fn spark_parse_integer(value: &str) -> Option<i64> {
+    let value = java_trim(value);
+    if value.is_empty() {
+        return None;
+    }
+    if let Some((integer, fraction)) = value.split_once('.') {
+        if !fraction.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        if matches!(integer, "" | "+" | "-") {
+            return Some(0);
+        }
+        integer.parse().ok()
+    } else {
+        value.parse().ok()
+    }
+}
+
 macro_rules! cast_to_i_i {
     ($result_type: ty, $arg_type_name: ident, $arg_type: ty) => {
         ::paste::paste! {
@@ -1734,6 +1752,16 @@ macro_rules! cast_to_i {
             }
 
             cast_function!($result_type, $result_type, s, SqlString);
+
+            #[doc(hidden)]
+            pub fn [< spark_cast_to_ $result_type _s >](value: SqlString) -> Option<$result_type> {
+                spark_parse_integer(value.str()).and_then(|v| <$result_type>::try_from(v).ok())
+            }
+
+            #[doc(hidden)]
+            pub fn [< spark_cast_to_ $result_type _sN >](value: Option<SqlString>) -> Option<$result_type> {
+                [< spark_cast_to_ $result_type _s >](value?)
+            }
 
             // From other integers
 

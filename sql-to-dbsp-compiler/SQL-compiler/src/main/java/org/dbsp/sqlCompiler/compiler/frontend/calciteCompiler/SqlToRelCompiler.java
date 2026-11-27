@@ -155,6 +155,7 @@ import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.CustomFu
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.ExternalFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlArrayAggFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlSafeCastFunction;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SparkArithmeticFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlUserDefinedAggregationFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.optimizer.CalciteOptimizer;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
@@ -806,7 +807,13 @@ public class SqlToRelCompiler implements IWritesLogs {
     }
 
     SqlOperatorTable createOperatorTable() {
+        List<SqlOperator> sparkOperators = new ArrayList<>();
+        if (this.options.languageOptions.sparkCompat) {
+            sparkOperators.addAll(SparkArithmeticFunction.functions());
+            sparkOperators.add(SqlSafeCastFunction.SPARK_CAST);
+        }
         return SqlOperatorTables.chain(
+                new CaseInsensitiveOperatorTable(sparkOperators),
                 CalciteFunctions.INSTANCE.getFunctions(),
                 new CaseInsensitiveOperatorTable(this.customFunctions.getInitialFunctions())
         );
@@ -1035,6 +1042,14 @@ public class SqlToRelCompiler implements IWritesLogs {
             if (newCall.getOperator().kind == SqlKind.SAFE_CAST ||
                     (this.sparkCompat && isDecimalCast(newCall))) {
                 return SqlSafeCastFunction.INSTANCE.createCall(call.getParserPosition(), newCall.getOperandList());
+            }
+            if (this.sparkCompat) {
+                if (newCall.getKind() == SqlKind.CAST)
+                    return SqlSafeCastFunction.SPARK_CAST.createCall(
+                            call.getParserPosition(), newCall.getOperandList());
+                SparkArithmeticFunction arithmetic = SparkArithmeticFunction.replacement(newCall.getOperator());
+                if (arithmetic != null)
+                    return arithmetic.createCall(call.getParserPosition(), newCall.getOperandList());
             }
             return newCall;
         }
