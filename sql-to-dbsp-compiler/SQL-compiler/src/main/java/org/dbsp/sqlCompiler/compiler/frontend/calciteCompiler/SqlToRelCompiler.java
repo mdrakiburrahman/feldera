@@ -23,6 +23,7 @@
 
 package org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler;
 
+import com.google.common.collect.ImmutableSet;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import org.apache.calcite.avatica.util.Casing;
@@ -116,6 +117,8 @@ import org.apache.calcite.sql.type.IntervalSqlType;
 import org.apache.calcite.sql.type.MapSqlType;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.sql.type.SqlTypeFamily;
+import org.apache.calcite.sql.type.SqlTypeCoercionRule;
+import org.apache.calcite.sql.type.SqlTypeMappingRule;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.type.SqlTypeUtil;
 import org.apache.calcite.sql.util.SqlBasicVisitor;
@@ -125,6 +128,7 @@ import org.apache.calcite.sql.validate.SqlConformance;
 import org.apache.calcite.sql.validate.SqlConformanceEnum;
 import org.apache.calcite.sql.validate.SqlDelegatingConformance;
 import org.apache.calcite.sql.validate.SqlValidator;
+import org.apache.calcite.sql.validate.SqlValidatorImpl;
 import org.apache.calcite.sql.validate.SqlValidatorUtil;
 import org.apache.calcite.sql2rel.ConvertToChecked;
 import org.apache.calcite.sql2rel.SqlToRelConverter;
@@ -812,6 +816,16 @@ public class SqlToRelCompiler implements IWritesLogs {
         this.rootSchema.add(name, schema);
     }
 
+    /** The default cast rules, also allowing BOOLEAN to be cast to exact numeric types. */
+    static final SqlTypeMappingRule TYPE_MAPPING_RULE;
+    static {
+        Map<SqlTypeName, ImmutableSet<SqlTypeName>> rules = new HashMap<>(SqlTypeCoercionRule.instance().getTypeMapping());
+        for (SqlTypeName name : List.of(SqlTypeName.TINYINT, SqlTypeName.SMALLINT, SqlTypeName.INTEGER,
+                SqlTypeName.BIGINT, SqlTypeName.DECIMAL))
+            rules.put(name, ImmutableSet.<SqlTypeName>builder().addAll(rules.get(name)).add(SqlTypeName.BOOLEAN).build());
+        TYPE_MAPPING_RULE = SqlTypeCoercionRule.instance(rules);
+    }
+
     static class Conformance extends SqlDelegatingConformance {
         protected Conformance(SqlConformance delegate) {
             super(delegate);
@@ -869,12 +883,17 @@ public class SqlToRelCompiler implements IWritesLogs {
                 Collections.singletonList(calciteCatalog.schemaName),
                 this.typeFactory,
                 this.connectionConfig);
-        this.validator = SqlValidatorUtil.newValidator(
+        this.validator = new SqlValidatorImpl(
                 newOperatorTable,
                 catalogReader,
                 this.typeFactory,
                 validatorConfig
-        );
+        ) {
+            @Override
+            public SqlTypeMappingRule getTypeMappingRule() {
+                return TYPE_MAPPING_RULE;
+            }
+        };
         this.converter = new FelderaSqlToRelConverter(
                 (type, query, schema, path) -> null,
                 this.validator,
@@ -2293,6 +2312,8 @@ public class SqlToRelCompiler implements IWritesLogs {
 
     RelRoot sqlToRel(SqlNode node) {
         node = SparkGenerators.lower(node);
+        node = SparkFunctions.rewrite(node, this.parserConfig, this.customFunctions::isUserDefined,
+                n -> this.postParsingProcess(n, false));
         SqlToRelConverter converter = this.getConverter();
         // Wrap the string literals with characters above U+FFFF in calls to a
         // fictitious function, to prevent Calcite from computing with Java

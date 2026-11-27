@@ -45,7 +45,7 @@ SqlNode DateaddFunctionCall() :
 {
     final Span s;
     final SqlOperator op;
-    final SqlIntervalQualifier unit;
+    final SqlNode first;
     final List<SqlNode> args;
     SqlNode e;
 }
@@ -56,9 +56,12 @@ SqlNode DateaddFunctionCall() :
     |   <DATEPART>  { op = SqlLibraryOperators.DATEPART; }
     )
     { s = span(); }
-    <LPAREN> unit = TimeUnitOrName() {
-        args = startList(unit);
-    }
+    <LPAREN>
+    (
+        LOOKAHEAD(TimeUnitOrName() <COMMA>) first = TimeUnitOrName()
+    |   first = Expression(ExprContext.ACCEPT_SUB_QUERY)
+    )
+    { args = startList(first); }
     (
         <COMMA> e = Expression(ExprContext.ACCEPT_SUB_QUERY) {
             args.add(e);
