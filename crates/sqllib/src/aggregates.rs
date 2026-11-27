@@ -3,13 +3,80 @@
 #![allow(clippy::let_and_return)]
 #![allow(clippy::unnecessary_cast)]
 
-use crate::{ByteArray, FromInteger, SqlDecimal, ToInteger, Weight};
+use crate::{
+    ByteArray, ConcatSemigroup, FromInteger, PairSemigroup, SqlDecimal, ToInteger, Weight,
+};
 use dbsp::algebra::{F32, F64, FirstLargeValue, HasOne, HasZero, SignedPrimInt, UnsignedPrimInt};
+use dbsp::operator::dynamic::aggregate::MaxSemigroup;
+use dbsp::utils::Tup2;
 use num::PrimInt;
 use num_traits::CheckedAdd;
 use std::cmp::Ord;
 use std::fmt::{Debug, Display};
 use std::marker::Copy;
+
+type PercentileValues = Vec<Tup2<F64, Weight>>;
+#[doc(hidden)]
+pub type PercentileAccumulator = Tup2<F64, PercentileValues>;
+#[doc(hidden)]
+pub type PercentileSemigroup =
+    PairSemigroup<F64, PercentileValues, MaxSemigroup<F64>, ConcatSemigroup<PercentileValues>>;
+
+#[doc(hidden)]
+pub fn percentile_step(
+    acc: &mut PercentileAccumulator,
+    value: Option<F64>,
+    fraction: F64,
+    weight: Weight,
+    keep: bool,
+) {
+    if let Some(value) = value
+        && keep
+        && weight != 0
+    {
+        assert!(weight > 0, "negative percentile input weight");
+        acc.0 = fraction;
+        acc.1.push(Tup2(value, weight));
+    }
+}
+
+#[doc(hidden)]
+pub fn percentile_finish(acc: PercentileAccumulator, descending: bool) -> Option<F64> {
+    let Tup2(fraction, mut values) = acc;
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable_by(|a, b| {
+        if descending {
+            b.0.cmp(&a.0)
+        } else {
+            a.0.cmp(&b.0)
+        }
+    });
+    // Locate the two adjacent ranks without materializing repeated rows.
+    let count: u128 = values.iter().map(|entry| entry.1 as u128).sum();
+    let rank = fraction.into_inner() * (count - 1) as f64;
+    let lower = (rank.floor() as u128).min(count - 1);
+    let upper = (rank.ceil() as u128).min(count - 1);
+    let mut end = 0;
+    let mut lo = None;
+    for Tup2(value, weight) in values {
+        end += weight as u128;
+        if end > lower {
+            let lo = *lo.get_or_insert(value);
+            if end > upper {
+                if lo == value || lower == upper {
+                    return Some(lo);
+                }
+                let t = rank.fract();
+                return Some(F64::new(
+                    (1.0 - t) * lo.into_inner() + t * value.into_inner(),
+                ));
+            }
+        }
+    }
+    unreachable!("both ranks must be below the total weight")
+}
 
 /// Holds some methods for wrapping values into unsigned values
 /// This is used by partitioned_rolling_aggregate

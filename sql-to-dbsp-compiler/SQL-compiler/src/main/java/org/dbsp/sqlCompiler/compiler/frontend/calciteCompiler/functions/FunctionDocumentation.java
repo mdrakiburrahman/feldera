@@ -156,7 +156,10 @@ public class FunctionDocumentation {
             implements FunctionDescription { }
 
     static final List<FunctionDescription> SYNTAX_CONSTRUCTS = List.of(
-            new SyntaxConstruct("PIVOT", "aggregates#pivots", false, NO_FILE));
+            new SyntaxConstruct("EXPLODE", "array#spark-row-generators", false, NO_FILE),
+            new SyntaxConstruct("LATERAL VIEW", "array#spark-row-generators", false, NO_FILE),
+            new SyntaxConstruct("PIVOT", "aggregates#pivots", false, NO_FILE),
+            new SyntaxConstruct("STACK", "array#spark-row-generators", false, NO_FILE));
 
     /** Generate documentation with an index of all functions supported */
     public static void generateIndex(String file) throws IOException {

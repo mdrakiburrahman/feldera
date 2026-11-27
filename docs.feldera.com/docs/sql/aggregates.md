@@ -33,6 +33,13 @@ SUM(col)`, you should write `SELECT SUM(CAST(col AS BIGINT))`.  This
 is particularly important for aggregates that return results quadratic
 in the size of input values, such as `VAR_*` or `REGR_*`.
 
+<a id="percentile_cont"></a>
+`PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY value [ASC | DESC])` returns the continuous
+percentile of non-null numeric values as a `DOUBLE`, or `NULL` when there are none.
+`p` is a numeric literal between 0 and 1 inclusive. For `n` values, the aggregate
+linearly interpolates at zero-based position `p * (n - 1)` in the specified order.
+`PERCENTILE(value, p)` uses ascending order.
+
 <table>
   <tr>
     <th>Aggregate</th>

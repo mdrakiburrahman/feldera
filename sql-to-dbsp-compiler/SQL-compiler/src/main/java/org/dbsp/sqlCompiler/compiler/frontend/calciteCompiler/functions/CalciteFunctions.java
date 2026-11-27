@@ -1,16 +1,21 @@
 package org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions;
 
 import org.apache.calcite.sql.SqlFunctionCategory;
+import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlOperatorTable;
 import org.apache.calcite.sql.SqlSyntax;
+import org.apache.calcite.sql.fun.SqlBasicAggFunction;
 import org.apache.calcite.sql.fun.SqlLibrary;
 import org.apache.calcite.sql.fun.SqlLibraryOperatorTableFactory;
 import org.apache.calcite.sql.fun.SqlLibraryOperators;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.sql.type.OperandTypes;
+import org.apache.calcite.sql.type.ReturnTypes;
 import org.apache.calcite.sql.util.SqlOperatorTables;
 import org.apache.calcite.sql.validate.SqlNameMatcher;
+import org.apache.calcite.util.Optionality;
 
 import javax.annotation.Nullable;
 import java.util.ArrayList;
@@ -40,6 +45,15 @@ public class CalciteFunctions implements FunctionDocumentation.FunctionRegistry 
     record Func(SqlOperator function, String functionName, SqlLibrary library,
                 String documentation, String testedBy, boolean aggregate)
             implements FunctionDocumentation.FunctionDescription { }
+
+    // Calcite's standard PERCENTILE_CONT returns the sort key type, truncating interpolation on integers.
+    public static final SqlBasicAggFunction PERCENTILE_CONT = SqlBasicAggFunction
+            .create(SqlKind.PERCENTILE_CONT, ReturnTypes.DOUBLE_FORCE_NULLABLE, OperandTypes.UNIT_INTERVAL_NUMERIC_LITERAL)
+            .withFunctionType(SqlFunctionCategory.SYSTEM).withGroupOrder(Optionality.MANDATORY)
+            .withPercentile(true).withAllowsFraming(false);
+    public static final SqlBasicAggFunction PERCENTILE = SqlBasicAggFunction
+            .create("PERCENTILE", SqlKind.OTHER_FUNCTION, ReturnTypes.DOUBLE_FORCE_NULLABLE,
+                    OperandTypes.NUMERIC_UNIT_INTERVAL_NUMERIC_LITERAL);
 
     final Func[] toLoad = {
             // Standard operators from SqlStdOperatorTable
@@ -221,6 +235,8 @@ public class CalciteFunctions implements FunctionDocumentation.FunctionRegistry 
                 runtime_aggtest/aggregate_tests3/test_{binary_max,un_int_max,varbinary_max}.py|
                 runtime_aggtest/aggregate_tests4/test_{array_max,map_max,varchar_max,varcharn_max}.py|
                 runtime_aggtest/aggregate_tests6/test_{interval_mths_max}.py""", true),
+            new Func(PERCENTILE_CONT, "PERCENTILE_CONT", SqlLibrary.SPARK, "aggregates#percentile_cont", FunctionDocumentation.NO_FILE, true),
+            new Func(PERCENTILE, "PERCENTILE", SqlLibrary.SPARK, "aggregates#percentile_cont", FunctionDocumentation.NO_FILE, true),
             new Func(SqlStdOperatorTable.MODE, "MODE", SqlLibrary.STANDARD, "aggregates#mode",
                     FunctionDocumentation.NO_FILE, true),
             new Func(SqlStdOperatorTable.MIN, "MIN", SqlLibrary.STANDARD, "aggregates#min,aggregates#window-min",
@@ -764,12 +780,11 @@ public class CalciteFunctions implements FunctionDocumentation.FunctionRegistry 
                 operators.add(func.function);
         }
         return SqlOperatorTables.chain(
-                // Every standard library function that CustomFunctions defines again must be hidden here.
-                // The lookup finds this table first, so otherwise the Calcite function is used.
-                // These are the JSON_* functions and ABS.
+                // Hide standard operators for which a later table supplies a replacement.
                 new HidingOperatorTable(
                         SqlLibraryOperatorTableFactory.INSTANCE.getOperatorTable(SqlLibrary.STANDARD),
-                        operator -> operator.getName().startsWith("JSON_") || operator == SqlStdOperatorTable.ABS),
+                        operator -> operator.getName().startsWith("JSON_") || operator == SqlStdOperatorTable.ABS
+                                || operator == SqlStdOperatorTable.PERCENTILE_CONT),
                 new CaseInsensitiveOperatorTable(
                         SpatialOperatorTable.instance().getOperatorList()),
                 new CaseInsensitiveOperatorTable(operators));

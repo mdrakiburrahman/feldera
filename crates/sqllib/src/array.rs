@@ -3,10 +3,53 @@
 use crate::error::{SqlResult, SqlRuntimeError};
 use crate::{ConcatSemigroup, Semigroup, Weight, some_function1, some_function2, some_function3};
 use dbsp::CmpFunc;
+use dbsp::utils::{Tup1, Tup2};
 use itertools::Itertools;
 use std::{collections::HashSet, fmt::Debug, hash::Hash, sync::Arc};
 
 pub type Array<T> = Arc<Vec<T>>;
+
+fn outer_rows<T>(rows: impl Iterator<Item = T>) -> Array<Option<T>> {
+    let mut rows: Vec<_> = rows.map(Some).collect();
+    if rows.is_empty() {
+        rows.push(None);
+    }
+    Arc::new(rows)
+}
+
+fn array_rows<T: Clone>(input: &Option<Array<T>>) -> impl Iterator<Item = Tup1<T>> + '_ {
+    input.iter().flat_map(|a| a.iter().cloned().map(Tup1))
+}
+
+fn map_rows<K: Clone, V: Clone>(
+    input: &Option<crate::Map<K, V>>,
+) -> impl Iterator<Item = Tup2<K, V>> + '_ {
+    input
+        .iter()
+        .flat_map(|m| m.iter().map(|(k, v)| Tup2(k.clone(), v.clone())))
+}
+
+#[doc(hidden)]
+pub fn spark_explode_array<T: Clone>(input: Option<Array<T>>) -> Array<Tup1<T>> {
+    Arc::new(array_rows(&input).collect())
+}
+
+#[doc(hidden)]
+pub fn spark_explode_map<K: Clone, V: Clone>(input: Option<crate::Map<K, V>>) -> Array<Tup2<K, V>> {
+    Arc::new(map_rows(&input).collect())
+}
+
+#[doc(hidden)]
+pub fn spark_explode_outer_array<T: Clone>(input: Option<Array<T>>) -> Array<Option<Tup1<T>>> {
+    outer_rows(array_rows(&input))
+}
+
+#[doc(hidden)]
+pub fn spark_explode_outer_map<K: Clone, V: Clone>(
+    input: Option<crate::Map<K, V>>,
+) -> Array<Option<Tup2<K, V>>> {
+    outer_rows(map_rows(&input))
+}
 
 /// Convert a Rust Vec to a SQL Array
 pub fn to_array<T>(data: Vec<T>) -> Array<T> {

@@ -102,6 +102,9 @@ public class CustomFunctions {
         this.functions.add(NowFunction.INSTANCE);
         this.functions.add(ParseDateFunction.INSTANCE);
         this.functions.add(ParseJsonFunction.INSTANCE);
+        this.functions.add(SparkJsonFunctions.FROM_JSON);
+        this.functions.add(SparkJsonFunctions.GET_JSON_OBJECT);
+        this.functions.add(SparkJsonFunctions.NAMED_STRUCT);
         this.functions.add(ParseTimeFunction.INSTANCE);
         this.functions.add(ParseTimestampFunction.INSTANCE);
         this.functions.add(RegexpReplaceFunction.INSTANCE);
@@ -665,7 +668,7 @@ public class CustomFunctions {
         private ToJsonFunction() {
             super("TO_JSON",
                     ReturnTypes.VARCHAR.andThen(SqlTypeTransforms.FORCE_NULLABLE),
-                    OperandTypes.VARIANT,
+                    OperandTypes.VARIANT.or(OperandTypes.ARRAY).or(OperandTypes.MAP).or(new ExactTypeNameChecker(SqlTypeName.ROW)),
                     SqlFunctionCategory.STRING, "json#to_json", FunctionDocumentation.NO_FILE);
         }
     }

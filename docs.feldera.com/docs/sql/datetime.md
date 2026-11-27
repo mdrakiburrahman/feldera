@@ -67,6 +67,7 @@ The following operations are available on dates:
 `SEQUENCE(start_date, end_date [, step])` returns an array from `start_date` through `end_date` (inclusive when reached).
 The default step is one day toward the end. An explicit interval must move in that direction; a day-time step must span at least a day.
 Year-month steps are relative to the original day of the month. A null argument returns `NULL`.
+Day-time arithmetic uses UTC, not a configurable Spark session time zone.
 
 The following abbreviations can be used as well:
 

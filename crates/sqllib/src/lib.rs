@@ -43,6 +43,9 @@ pub use operators::*;
 pub mod source;
 pub use source::*;
 #[doc(hidden)]
+pub mod spark_json;
+pub use spark_json::*;
+#[doc(hidden)]
 pub mod string;
 pub use string::*;
 #[doc(hidden)]

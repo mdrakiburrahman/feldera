@@ -10,7 +10,8 @@ trap 'rm -rf -- "$context"' EXIT
 
 delta=crates/connectors/src/integrated/delta_table
 git archive "$revision" -- deploy/enterprise-compiler.Dockerfile sql-to-dbsp-compiler \
-    crates/sqllib/src/{array,timestamp}.rs \
+    crates/sqllib/Cargo.toml crates/sqllib/src/{aggregates,array,lib,spark_json,timestamp}.rs \
+    crates/sqllib/src/spark_json/path.rs \
     "$delta.rs" "$delta"/{deletion_vector,field_id_adapter,input,merge/rewrite}.rs \
     crates/feldera-types/src/transport/delta_table.rs \
     crates/connectors/Cargo.toml crates/connectors/src/transport/url.rs \

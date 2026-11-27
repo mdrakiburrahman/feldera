@@ -434,6 +434,7 @@ rowStarItem
 
 The following forms of `SELECT` are supported:
 
+- `SELECT generator [ AS columnAlias | AS (columnAlias, ...) ]`: expand a collection or stack expressions into rows; see [Spark row generators](array.md#spark-row-generators).
 - `SELECT expr`: No `FROM` clause; implicitly assumes that the `SELECT` selects from a fixed table with 1 row
 - `SELECT * EXCLUDE(a, b) FROM T`: select all columns of table `T` except the ones named `a` and `b`
 - `SELECT * EXCEPT(a, b) FROM T`: `EXCEPT` is a synonym for `EXCLUDE`; this statement is equivalent to the previous statement
@@ -452,6 +453,11 @@ tableExpression
   |   tableExpression [ LEFT ] ASOF JOIN tableExpression MATCH_CONDITION '(' booleanExpression ')' joinCondition
   |   tableExpression CROSS JOIN tableExpression
   |   tableExpression [ CROSS | OUTER ] APPLY tableExpression
+  |   tableExpression LATERAL VIEW [ OUTER ] generator [ alias ] [ AS columnAlias [, columnAlias ]* ]
+
+generator
+  :   EXPLODE '(' expression ')'
+  |   STACK '(' positiveIntegerLiteral ',' expression [, expression ]* ')'
 
 joinCondition
   :   ON booleanExpression

@@ -142,7 +142,10 @@ the map corresponds to a field of the user-defined structure.
 | `TYPEOF(variant)`             | Argument must be a `VARIANT` value.  Returns a string describing the runtime type of the value |
 | `PARSE_JSON(string)`          | Parses a string that represents a JSON value and returns a `VARIANT` object; fails at runtime if the string is not valid JSON (more details [below](#parse_json)) |
 | `TRY_PARSE_JSON(string)`      | Like `PARSE_JSON`, but returns `NULL` if the string is not valid JSON (more details [below](#try_parse_json)) |
-| `TO_JSON(variant)`            | Argument must be a `VARIANT` value.  Returns a string that represents the serialization of a `VARIANT` value. If the value cannot be represented as JSON, the result is `NULL` (more details [below](#to_json)) |
+| `FROM_JSON(text, schema)`     | Parses JSON text as a typed row, array, or map using a literal Spark DDL [schema](#from_json). |
+| `NAMED_STRUCT(name, value, ...)` | Constructs a [row with named fields](#named_struct) in argument order. |
+| `GET_JSON_OBJECT(text, path)` | Extracts a [JSON value as text](#get_json_object). |
+| `TO_JSON(value)`              | Serializes a `VARIANT`, row, array, or string-keyed map to [JSON text](#to_json). |
 | `JSON_EACH_<type>(variant)`   | A family of functions; each extracts from a `VARIANT` holding a JSON object the fields whose values have a specified runtime type, as a `MAP` (more details [below](#json_each)) |
 | `JSON_OBJECT_KEYS(variant)`   | Returns the top-level keys of a `VARIANT` holding a JSON object, as a sorted `ARRAY` of strings (more details [below](#json_object_keys)) |
 | `JSON_KEYS(variant)`          | Returns the keys of all nested objects in a `VARIANT`, as a sorted `ARRAY` of dot-joined paths (more details [below](#json_keys)) |
@@ -195,9 +198,84 @@ SELECT TRY_PARSE_JSON('null') IS NULL;
 -- FALSE
 ```
 
+### `FROM_JSON`
+
+`FROM_JSON(text, schema)` returns a typed SQL value, not a `VARIANT`. Its schema
+must be a non-null string literal. For example:
+
+```sql
+SELECT FROM_JSON('{"eventType":"open"}', 'eventType STRING').eventType; -- open
+SELECT FROM_JSON('{"a":2}', 'MAP<STRING,STRING>')['a']; -- '2'
+SELECT FROM_JSON('[{"ID":"A","URL":"u"}]', 'array<struct<ID:string,URL:string>>');
+SELECT FROM_JSON('{"a b":[{"x`y":true}]}', 'STRUCT<`a b`: ARRAY<STRUCT<`x``y`: BOOLEAN>>>');
+```
+
+Use a comma-separated field list (`a STRING, b INT`), `STRUCT<name:type,...>`,
+`ARRAY<type>`, or `MAP<STRING,type>`. These types can nest. Scalar schema types
+are `STRING`, `BOOLEAN`, `TINYINT`/`BYTE`, `SMALLINT`/`SHORT`, `INT`/`INTEGER`,
+and `BIGINT`/`LONG`. Type names are case-insensitive; JSON member names match
+schema field names **case-sensitively**. Field names may be enclosed in backticks
+in both field lists and nested structs. Double a backtick inside a quoted name
+to represent one literal backtick. Missing fields are SQL `NULL`; extra
+fields are ignored. Null array elements and null map values are preserved.
+Non-string JSON values read into a `STRING` field are returned as JSON text.
+A value incompatible with a declared leaf type reads as SQL `NULL` at that
+leaf. This does not implement all Spark partial-record recovery behavior for
+malformed nested values.
+
+The reader consumes the first JSON value and also accepts single-quoted keys
+and strings. A null or blank input returns SQL `NULL`.
+Malformed JSON or the wrong root shape returns `NULL` for an array or map, or
+a row of null fields for a struct. A single JSON object is accepted as a
+one-element array for a root `ARRAY<STRUCT<...>>`. There is no options argument,
+corrupt-record capture (`_corrupt_record`), or support for JSON-format schema
+literals, decimal, floating-point, date, timestamp, or binary schema types.
+
+### `NAMED_STRUCT`
+
+`NAMED_STRUCT(name, value, ...)` constructs a SQL row. Supply one or more pairs
+of a non-null string literal and a value expression. Names retain their case
+and declaration order; names that differ only by case are ambiguous and rejected.
+
+### `GET_JSON_OBJECT`
+
+`GET_JSON_OBJECT(text, path)` returns the selected JSON value as a `VARCHAR`.
+For example, `GET_JSON_OBJECT('{"color":"blue"}', '$.color')` returns `blue`,
+not `"blue"`. Missing members and malformed JSON return SQL `NULL`.
+Paths can be expressions and start at `$`. Use `.key`, `['key.with.dots']`,
+zero-based `[index]` and `[*]`. Multiple wildcard matches return a compact
+JSON array; one match retains its JSON representation. For example,
+`GET_JSON_OBJECT('["a","b"]', '$[*]')` returns `["a","b"]`, whereas
+`GET_JSON_OBJECT('["a"]', '$[*]')` returns `"a"`. A missing or null object
+member has no match; selecting a JSON null by index returns the text `null`.
+Invalid paths and values selected beyond 256 levels return SQL `NULL`.
+
 ### `TO_JSON`
 
-`TO_JSON` converts a `VARIANT` value to a `VARCHAR`:
+For typed SQL rows (including `NAMED_STRUCT`), arrays, and maps, `TO_JSON`
+returns compact JSON. A row is an object in **declared field order**, and
+fields with SQL `NULL` values are omitted. Array elements and map entries
+with null values are **not** omitted. A null input produces SQL `NULL`.
+Maps require non-nullable string keys and use Feldera's map key order, not
+insertion order.
+
+```sql
+SELECT TO_JSON(NAMED_STRUCT('z', 1, 'absent', CAST(NULL AS INT), 'a', 2));
+-- {"z":1,"a":2}
+SELECT TO_JSON(ARRAY[3, CAST(NULL AS INT), 1]);
+-- [3,null,1]
+```
+
+Typed containers can nest and contain strings, booleans, integers, decimals,
+floating-point values, dates and timestamps. Decimals retain their declared
+scale. Dates use `yyyy-MM-dd`; timestamps use UTC with three fractional digits
+and a `Z` suffix, for example `2024-02-29T12:34:56.123Z`. No Spark options,
+custom formats, or session time zone conversion are applied. Other element
+types (including `TIME`, intervals, binary, and nested `VARIANT`) are not
+supported by the typed serializer. Do not cast a row to `VARIANT` before
+serialization if field order or null-field omission matters.
+
+For an input of type `VARIANT`, `TO_JSON` retains its existing behavior:
 
 - the `VARIANT` `null` value is converted to the string `null`
 - a `VARIANT` wrapping a Boolean value is converted to the respective Boolean string `true` or `false`
