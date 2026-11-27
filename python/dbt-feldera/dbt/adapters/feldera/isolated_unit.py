@@ -177,6 +177,13 @@ def run_unit_test(
         PipelineStateManager._wait_for_compilation(pipeline, timeout)
         _inspect(pipeline, {"dbt_unit_actual", "dbt_unit_expected"})
         pipeline.start()
+        if pipeline.program_info()["schema"]["inputs"]:
+            started = time.monotonic()
+            while not pipeline.stats().global_metrics.total_processed_records:
+                if time.monotonic() - started >= timeout:
+                    raise TimeoutError("Unit test clock did not advance")
+                time.sleep(0.2)
+            pipeline.pause()
         pipeline.wait_for_idle(timeout_s=timeout)
         columns = [field["name"] for field in selected]
         projection = ", ".join(quoted[name.lower()] for name in columns)

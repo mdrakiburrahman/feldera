@@ -8,6 +8,7 @@ from sqlglot.errors import ParseError
 from dbt.adapters.contracts.connection import AdapterResponse
 from dbt.adapters.feldera.impl import FelderaAdapter
 from dbt.adapters.feldera.isolated_unit import (
+    _NOW_INPUT,
     _inspect,
     _normalize_expected_rows,
     _query_only,
@@ -131,13 +132,17 @@ def _info(outputs, inputs=None):
     }
 
 
-def test_scratch_preserves_duplicates_nulls_and_cleans_up():
+@pytest.mark.parametrize("clock", [False, True])
+def test_scratch_preserves_duplicates_nulls_and_cleans_up(clock):
     pipeline = Mock()
     pipeline.status.return_value = PipelineStatus.STOPPED
-    pipeline.program_info.side_effect = [
-        _info(["dbt_unit_actual"]),
-        _info(["dbt_unit_actual", "dbt_unit_expected"]),
-    ]
+    actual_info = _info(["dbt_unit_actual"])
+    final_info = _info(["dbt_unit_actual", "dbt_unit_expected"])
+    if clock:
+        actual_info["schema"]["inputs"] = [_NOW_INPUT]
+        final_info["schema"]["inputs"] = [_NOW_INPUT]
+        pipeline.stats.return_value.global_metrics.total_processed_records = 1
+    pipeline.program_info.side_effect = [actual_info, final_info, final_info]
     pipeline.query.side_effect = [[{"id": 1}, {"id": 1}, {"id": None}], [{"id": 1}, {"id": None}]]
     with (
         patch("dbt.adapters.feldera.isolated_unit.PipelineBuilder") as builder,
@@ -148,6 +153,11 @@ def test_scratch_preserves_duplicates_nulls_and_cleans_up():
         _, table = run_unit_test(Mock(), "select 1 as id", [{"id": 1}], "", lambda *_: "select 1 as id", "", "", "", 30)
     assert len(table.rows) == 5
     pipeline.start.assert_called_once_with()
+    if clock:
+        pipeline.pause.assert_called_once_with()
+    else:
+        pipeline.pause.assert_not_called()
+    pipeline.wait_for_idle.assert_called_once_with(timeout_s=30)
     pipeline.delete.assert_called_once_with(clear_storage=True)
 
 
