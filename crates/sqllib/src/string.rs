@@ -16,7 +16,8 @@ use crate::{
 use arcstr::ArcStr;
 use core::fmt::Error;
 use feldera_macros::IsNone;
-use feldera_types::{deserialize_without_context, serialize_without_context};
+use feldera_types::serde_with_context::DeserializeWithContext;
+use feldera_types::serialize_without_context;
 use itertools::Itertools;
 use like::{Escape, Like};
 use md5::{Digest, Md5};
@@ -127,7 +128,20 @@ impl SqlString {
 }
 
 serialize_without_context!(SqlString);
-deserialize_without_context!(SqlString);
+
+impl<'de, C, AUX> DeserializeWithContext<'de, C, AUX> for SqlString {
+    #[inline(never)]
+    fn deserialize_with_context<D>(deserializer: D, _context: &'de C) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if crate::spark_json::SPARK_TEXT.get() {
+            crate::spark_json::deserialize_spark_text(deserializer)
+        } else {
+            Self::deserialize(deserializer)
+        }
+    }
+}
 
 impl Display for SqlString {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
