@@ -2,14 +2,15 @@ use crate::{InputBuffer, InputConsumer, InputReader, Parser};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
 use deltalake::logstore::object_store::{
-    GetOptions, ObjectMeta, ObjectStore, azure::MicrosoftAzureBuilder, path::Path,
+    GetOptions, ObjectMeta, ObjectStore, Result as StoreResult, azure::MicrosoftAzureBuilder,
+    path::Path,
 };
 use feldera_adapterlib::{
     format::{BufferSize, StreamSplitter},
     transport::{InputCommandReceiver, InputReaderCommand, Resume, Watermark},
 };
 use feldera_storage::tokio::TOKIO;
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt, future::BoxFuture, stream::BoxStream};
 use glob::{MatchOptions, Pattern};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -116,7 +117,7 @@ impl Config {
         let mut builder = MicrosoftAzureBuilder::new()
             .with_account(self.host.split('.').next().unwrap())
             .with_container_name(&self.workspace)
-            .with_endpoint(format!("https://{}", self.host));
+            .with_use_fabric_endpoint(true);
         if let Some(client_id) = &self.client_id {
             builder = builder.with_client_id(client_id);
         }
@@ -243,6 +244,9 @@ struct Source {
     read_offset: u64,
     splitter: StreamSplitter,
     next_poll: Instant,
+    listing: Option<BoxStream<'static, StoreResult<ObjectMeta>>>,
+    discovered: BTreeMap<String, FileVersion>,
+    read_future: Option<BoxFuture<'static, Result<bytes::Bytes>>>,
 }
 
 impl Source {
@@ -273,12 +277,16 @@ impl Source {
             read_offset: 0,
             splitter: StreamSplitter::new(parser.splitter()),
             next_poll: Instant::now(),
+            listing: None,
+            discovered: BTreeMap::new(),
+            read_future: None,
         })
     }
 
     async fn list(&mut self) -> Result<()> {
-        let mut stream = self.store.list(Some(&self.config.prefix));
-        let mut discovered = BTreeMap::new();
+        let stream = self
+            .listing
+            .get_or_insert_with(|| self.store.list(Some(&self.config.prefix)));
         while let Some(object) = stream.try_next().await.context("listing OneLake Files")? {
             if self.config.matches(&object) {
                 let path = object.location.to_string();
@@ -290,7 +298,7 @@ impl Source {
                 {
                     continue;
                 }
-                discovered.insert(
+                self.discovered.insert(
                     path,
                     FileVersion {
                         size: object.size,
@@ -301,8 +309,12 @@ impl Source {
                 );
             }
         }
-        self.pending.extend(discovered.keys().cloned());
-        self.state.files.get_or_insert_default().extend(discovered);
+        self.pending.extend(self.discovered.keys().cloned());
+        self.state
+            .files
+            .get_or_insert_default()
+            .append(&mut self.discovered);
+        self.listing = None;
         self.next_poll = Instant::now() + self.config.poll_interval;
         Ok(())
     }
@@ -343,9 +355,17 @@ impl Source {
                     start: self.read_offset,
                     end: self.read_offset.saturating_add(READ_SIZE).min(version.size),
                 };
-                let bytes = read(self.store.as_ref(), version, &range).await?;
+                // Queue/Pause commands must not repeatedly cancel a slow network request.
+                if self.read_future.is_none() {
+                    let store = self.store.clone();
+                    let version = version.clone();
+                    self.read_future =
+                        Some(async move { read(store.as_ref(), &version, &range).await }.boxed());
+                }
+                let bytes = self.read_future.as_mut().unwrap().await?;
+                self.read_future = None;
                 self.splitter.append(&bytes);
-                self.read_offset = range.end;
+                self.read_offset += bytes.len() as u64;
             } else if let Some(path) = self.pending.pop_front() {
                 self.read_offset = self.state.offsets.get(&path).copied().unwrap_or(0);
                 self.splitter.seek(self.read_offset);
@@ -514,12 +534,10 @@ pub mod test {
     use crate::test::{
         MockInputConsumer, async_wait, engine_test, parser, published_schema, run_async_on,
     };
+    use crate::transport::url::test::relation;
     use deltalake::logstore::object_store::{ObjectStoreExt, memory::InMemory};
     use feldera_adapterlib::test::{ConnectorTestEngine, InputOptions, Updates};
-    use feldera_types::{
-        config::FormatConfig,
-        program_schema::{ColumnType, Field, Relation},
-    };
+    use feldera_types::config::FormatConfig;
     use serde_json::json;
     use std::sync::Mutex;
     use wiremock::{
@@ -528,18 +546,6 @@ pub mod test {
     };
 
     const URI: &str = "abfss://workspace@onelake.dfs.fabric.microsoft.com/lakehouse/Files/inbox";
-
-    fn relation() -> Relation {
-        Relation::new(
-            "events".into(),
-            vec![
-                Field::new("id".into(), ColumnType::bigint(false)),
-                Field::new("msg".into(), ColumnType::varchar(true)),
-            ],
-            false,
-            BTreeMap::new(),
-        )
-    }
 
     fn format() -> FormatConfig {
         FormatConfig {
@@ -577,11 +583,25 @@ pub mod test {
             self.inner.replayed(amount, hash);
         }
         fn request_step(&self) {}
+        fn start_transaction(&self, label: Option<&str>) {
+            self.inner.start_transaction(label);
+        }
+        fn commit_transaction(&self) {
+            self.inner.commit_transaction();
+        }
+        fn completion_watcher(
+            &self,
+        ) -> Option<tokio::sync::watch::Receiver<feldera_types::coordination::Completion>> {
+            self.inner.completion_watcher()
+        }
+        fn update_connector_health(&self, health: feldera_types::adapter_stats::ConnectorHealth) {
+            self.inner.update_connector_health(health);
+        }
         fn extended(&self, amount: BufferSize, resume: Option<Resume>, watermarks: Vec<Watermark>) {
             self.checkpoints
                 .lock()
                 .unwrap()
-                .push(resume.unwrap().metadata);
+                .push(resume.unwrap().into_seek().unwrap());
             self.inner.extended(amount, None, watermarks);
         }
     }
@@ -608,8 +628,8 @@ pub mod test {
         run_async_on(2, async {
             crate::ensure_default_crypto_provider();
             let server = MockServer::start().await;
-            let a = "{\"id\":1,\"msg\":\"one\"}\n{\"id\":2,\"msg\":null}";
-            let b = "{\"id\":3,\"msg\":\"nested\"}";
+            let a = "{\"s\":\"one\",\"b\":true,\"i\":1}\n{\"s\":\"two\",\"b\":false,\"i\":2}";
+            let b = "{\"s\":\"nested\",\"b\":true,\"i\":3}";
             let recent = "Mon, 23 Nov 2026 00:00:00 GMT";
             let old = "Sun, 01 Nov 2026 00:00:00 GMT";
             let page1 = listing(
@@ -649,6 +669,7 @@ pub mod test {
                     ResponseTemplate::new(200)
                         .set_body_string(page)
                         .insert_header("content-type", "application/xml")
+                        .set_delay(Duration::from_millis(40))
                 })
                 .expect(2)
                 .mount(&server)
@@ -656,7 +677,7 @@ pub mod test {
             Mock::given(method("GET"))
                 .and(path("/token"))
                 .and(query_param("client_id", "test-client"))
-                .and(query_param("resource", "https://storage.azure.com/"))
+                .and(query_param("resource", "https://storage.azure.com"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "access_token": "test-token",
                     "expires_on": (Utc::now().timestamp() + 3600).to_string(),
@@ -677,7 +698,8 @@ pub mod test {
                                 "content-range",
                                 format!("bytes 0-{}/{}", body.len() - 1, body.len()),
                             )
-                            .set_body_string(body),
+                            .set_body_string(body)
+                            .set_delay(Duration::from_millis(40)),
                     )
                     .expect(1)
                     .mount(&server)
@@ -706,9 +728,10 @@ pub mod test {
             .unwrap();
             reader.extend();
             async_wait(
-                || {
+                || async {
                     reader.queue(false);
-                    consumer.inner.state().eoi && collection.len() == 3
+                    (consumer.inner.state().eoi && collection.len() == 3)
+                        || consumer.inner.get_error().is_some()
                 },
                 10000,
             )
@@ -744,7 +767,7 @@ pub mod test {
         run_async_on(2, async {
             let store = Arc::new(InMemory::new());
             let first = Path::from("lakehouse/Files/inbox/z.json");
-            let body = "{\"id\":1,\"msg\":\"first\"}";
+            let body = "{\"s\":\"first\",\"b\":true,\"i\":1}";
             store
                 .put(&first, bytes::Bytes::from_static(body.as_bytes()).into())
                 .await
@@ -770,15 +793,29 @@ pub mod test {
             let (reader, consumer, collection) = open(false, None);
             reader.extend();
             async_wait(
-                || {
+                || async {
                     reader.queue(false);
-                    consumer.inner.state().eoi && collection.len() == 1
+                    consumer.inner.state().eoi
+                        && collection.len() == 1
+                        && consumer
+                            .checkpoints
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|m| !m["chunks"].as_array().unwrap().is_empty())
                 },
                 5000,
             )
             .await
             .unwrap();
-            let checkpoint = consumer.checkpoints.lock().unwrap().last().unwrap().clone();
+            let checkpoint = consumer
+                .checkpoints
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|metadata| !metadata["chunks"].as_array().unwrap().is_empty())
+                .unwrap()
+                .clone();
             drop(reader);
             let (reader, consumer, collection) = open(false, None);
             reader.request(InputReaderCommand::Replay {
@@ -787,7 +824,7 @@ pub mod test {
             });
             reader.extend();
             async_wait(
-                || {
+                || async {
                     reader.queue(false);
                     consumer.inner.state().eoi && collection.len() == 1
                 },
@@ -804,14 +841,14 @@ pub mod test {
             store
                 .put(
                     &second,
-                    bytes::Bytes::from_static(b"{\"id\":2,\"msg\":\"late\"}").into(),
+                    bytes::Bytes::from_static(b"{\"s\":\"late\",\"b\":false,\"i\":2}").into(),
                 )
                 .await
                 .unwrap();
             let (reader, consumer, collection) = open(false, Some(checkpoint.clone()));
             reader.extend();
             async_wait(
-                || {
+                || async {
                     reader.queue(false);
                     consumer.inner.state().eoi
                 },
@@ -828,7 +865,7 @@ pub mod test {
             let (reader, consumer, collection) = open(true, Some(checkpoint));
             reader.extend();
             async_wait(
-                || {
+                || async {
                     reader.queue(false);
                     collection.len() == 1
                 },
@@ -841,7 +878,7 @@ pub mod test {
                 collection.updates().unwrap(),
                 Updates::from_json(
                     published_schema(&relation()),
-                    &[(1, "{\"id\":2,\"msg\":\"late\"}")]
+                    &[(1, "{\"s\":\"late\",\"b\":false,\"i\":2}")]
                 )
                 .unwrap()
             );
@@ -907,6 +944,35 @@ pub mod test {
                     .to_string()
                     .contains("reading immutable OneLake")
             );
+            let large_store = Arc::new(InMemory::new());
+            let row = |i| format!("{{\"s\":\"{}\",\"b\":true,\"i\":{i}}}", "x".repeat(40000));
+            let first = format!("{}\n", row(1));
+            let second = row(2);
+            large_store
+                .put(&path, bytes::Bytes::from(format!("{first}{second}")).into())
+                .await
+                .unwrap();
+            let mut source = Source::new(
+                Config::parse(URI).unwrap(),
+                large_store.clone(),
+                State::default(),
+                &parser,
+            )
+            .unwrap();
+            let (chunk, bytes) = source.next().await.unwrap().unwrap();
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), first.trim_end());
+            source.state.offsets.insert(chunk.path, chunk.end);
+            let state =
+                serde_json::from_value(serde_json::to_value(&source.state).unwrap()).unwrap();
+            let mut resumed =
+                Source::new(Config::parse(URI).unwrap(), large_store, state, &parser).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&resumed.next().await.unwrap().unwrap().1)
+                    .unwrap()
+                    .trim(),
+                second
+            );
+            assert!(resumed.next().await.unwrap().is_none());
         });
     }
 }
