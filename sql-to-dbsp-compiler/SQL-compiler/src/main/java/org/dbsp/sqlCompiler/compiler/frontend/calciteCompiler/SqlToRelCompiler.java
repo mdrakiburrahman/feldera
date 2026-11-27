@@ -155,6 +155,7 @@ import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.CustomFu
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.ExternalFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlArrayAggFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlSafeCastFunction;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SparkArithmeticFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlUserDefinedAggregationFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.optimizer.CalciteOptimizer;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
@@ -214,8 +215,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SparkArithmeticFunction;
-
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
