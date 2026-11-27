@@ -507,3 +507,11 @@ aggregation are essentially never append-only.
 
 - The two constructors `ARRAY` and `MAP` with subqueries as arguments
   have similar costs.
+
+## Spark aggregate functions
+
+| Function | Description |
+|---|---|
+| <a id="max_by"></a>`MAX_BY(value, ordering)`, `MIN_BY(value, ordering)` | Same as `ARG_MAX` and `ARG_MIN`. |
+| <a id="collect_list"></a>`COLLECT_LIST(value)`, `COLLECT_SET(value)` | Array of the non-`NULL` values, with duplicates removed for `COLLECT_SET`. |
+| <a id="count_if"></a>`COUNT_IF(predicate)` | Number of rows where `predicate` is `TRUE`. |

@@ -167,3 +167,10 @@ equal, so `ARRAY[1, NULL] = ARRAY[1, NULL]` is `true`.  `>`, `<`,
 | <a id="array_sort"></a>`ARRAY_SORT(array [, comparator])` | Sorts in ascending order with nulls last. An optional `(left, right) -> INTEGER` comparator overrides this order; it must return a negative, zero, or positive integer, never `NULL`. A null array returns `NULL`. | `ARRAY_SORT(ARRAY [4, NULL, 1])` => `[1, 4, NULL]` |
 | <a id="sort"></a>`SORT_ARRAY(` _array_ `, [` _ascendingOrder_ `])`   | Returns a new array, sorted in ascending (_ascendingOrder_ is `true`) or descending order (_ascendingOrder_ is `false`) according to the natural ordering of the array elements. The default order is ascending if ascendingOrder is not specified. Null elements are considered to be the smallest. | `SORT_ARRAY(ARRAY [4, 7, 1, null])` => `[null, 1, 4, 7]`            |
 | <a id="transform"></a>`TRANSFORM(` _array_, _function_ `)`           | _function_ is a lambda expression with an argument that has the array element type. `TRANSFORM` returns a new array constructed by applying the function to every element of _array_. If _array_ is NULL, it returns NULL                                                                 | `TRANSFORM(ARRAY[1, 2, 3], x -> x % 2)` => `[1, 0, 1]`              |
+
+## Spark array functions
+
+| Function | Description |
+|---|---|
+| <a id="element_at"></a>`ELEMENT_AT(array, index)`, `ELEMENT_AT(map, key)` | 1-based array element, counting from the end for a negative literal index, or the map value for `key`; `NULL` when absent. |
+| <a id="size"></a>`SIZE(array)` | Number of elements, or `-1` for a `NULL` array. |

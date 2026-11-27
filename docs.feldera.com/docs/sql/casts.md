@@ -42,6 +42,9 @@ the number to an integer first: `CAST(1.5 AS INTERVAL YEAR)` is
 `INTERVAL '1' YEAR`, and `CAST(-1.5 AS INTERVAL DAY)` is `INTERVAL
 '-1' DAY`.
 
+A `BOOLEAN` can be cast to `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`
+or `DECIMAL`: `TRUE` becomes 1 and `FALSE` becomes 0.
+
 Casts of strings to numeric types, `BOOLEAN`, `DATE`, `TIME`,
 `TIMESTAMP`, and `TIMESTAMP WITH TIME ZONE` first remove the
 leading and trailing characters with code points up to U+0020: the

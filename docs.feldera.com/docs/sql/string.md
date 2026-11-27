@@ -750,3 +750,12 @@ Bruce Springsteen
 
 Note that using `$2` instead of `$first` or `$1` instead of `$last`
 would produce the same result.
+
+## Spark string functions
+
+| Function | Description |
+|---|---|
+| <a id="instr"></a>`INSTR(string, substring)` | 1-based position of the first occurrence of `substring`, or 0. |
+| <a id="substring_index"></a>`SUBSTRING_INDEX(string, delimiter, count)` | Prefix before the `count`-th delimiter, or the suffix after it counting from the end when `count` is negative. |
+
+Arguments of type `CHAR` are accepted for user-defined function parameters declared `VARCHAR`; values are passed unchanged.

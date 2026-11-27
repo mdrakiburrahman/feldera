@@ -626,3 +626,23 @@ It is possible to override the default padding behavior of numeric specifiers %?
 |%-?      |Suppresses any padding including spaces and zeroes. (e.g. %j = 012, %-j = 12) |
 |%_?      |Uses spaces as a padding. (e.g. %j = 012, %_j =  12) |
 |%0?      |Uses zeroes as a padding. (e.g. %e =  9, %0e = 09) |
+
+## Spark date and time functions
+
+These functions accept Spark SQL forms and follow Spark semantics.
+Format patterns use Spark datetime pattern letters and must be string literals.
+
+| Function | Description |
+|---|---|
+| <a id="spark-date_add"></a>`DATE_ADD(date, days)`, `DATE_SUB(date, days)` | Adds or subtracts an integer number of days; an `INTERVAL` second argument is also accepted. |
+| <a id="spark-add_months"></a>`ADD_MONTHS(date, months)` | Adds months, clamping to the last day of the resulting month. |
+| <a id="spark-last_day"></a>`LAST_DAY(date)` | Last day of the month of `date`. |
+| <a id="spark-datediff"></a>`DATEDIFF(end, start)` | Number of days from `start` to `end`. |
+| <a id="spark-months_between"></a>`MONTHS_BETWEEN(t1, t2 [, roundOff])` | Months between `t1` and `t2`; fractional parts use 31-day months and are rounded to 8 digits unless `roundOff` is `FALSE`. |
+| <a id="spark-day"></a>`DAY(date)`, `WEEKOFYEAR(date)` | Day of month and ISO week of year. |
+| <a id="spark-date_part"></a>`DATE_PART('field', source)` | Same as `EXTRACT`, with the field given as a string such as `'year'`. |
+| <a id="spark-date_trunc"></a>`DATE_TRUNC('unit', timestamp)` | Truncates to `'YEAR'`, `'QUARTER'`, `'MONTH'`, `'WEEK'` (Monday), `'DAY'`, `'HOUR'`, `'MINUTE'`, `'SECOND'`, `'MILLISECOND'` or `'MICROSECOND'`, plus Spark aliases such as `'MM'` and `'YYYY'`. |
+| <a id="spark-to_date"></a>`TO_DATE(string [, format])`, `TO_TIMESTAMP(string [, format])` | Parses a date or timestamp; returns `NULL` when the string does not parse. |
+| <a id="spark-date_format"></a>`DATE_FORMAT(timestamp, format)` | Formats a date or timestamp. |
+| <a id="spark-unix_timestamp"></a>`UNIX_TIMESTAMP([source [, format]])` | Seconds since the Unix epoch; without arguments uses `NOW()`. |
+| <a id="spark-current_date"></a>`CURRENT_DATE()`, `CURRENT_TIMESTAMP()` | Same as `CAST(NOW() AS DATE)` and `NOW()`. |

@@ -10,11 +10,11 @@ trap 'rm -rf -- "$context"' EXIT
 
 delta=crates/connectors/src/integrated/delta_table
 git archive "$revision" -- deploy/enterprise-compiler.Dockerfile sql-to-dbsp-compiler \
-    crates/sqllib/Cargo.toml crates/sqllib/src/{aggregates,array,lib,spark_json,string,timestamp}.rs \
-    crates/sqllib/src/spark_json/path.rs \
+    crates/sqllib/Cargo.toml crates/sqllib/src/{aggregates,array,casts,decimal,float,lib,spark_json,string,timestamp}.rs \
+    crates/sqllib/src/spark_json/path.rs crates/fxp/src/{fixed,u256}.rs \
     "$delta.rs" "$delta"/{deletion_vector,field_id_adapter,input,merge/rewrite}.rs \
     crates/feldera-types/src/transport/delta_table.rs \
-    crates/connectors/Cargo.toml crates/connectors/src/transport/url.rs \
+    crates/connectors/Cargo.toml crates/connectors/src/controller.rs crates/connectors/src/transport/url.rs \
     crates/connectors/src/transport/url/onelake.rs | tar -x -C "$context"
 
 # Start from the release manifests; import only the added workspace dependencies
