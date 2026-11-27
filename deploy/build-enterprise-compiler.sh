@@ -10,12 +10,24 @@ trap 'rm -rf -- "$context"' EXIT
 
 delta=crates/connectors/src/integrated/delta_table
 git archive "$revision" -- deploy/enterprise-compiler.Dockerfile sql-to-dbsp-compiler \
-    crates/sqllib/Cargo.toml crates/sqllib/src/{aggregates,array,lib,spark_json,timestamp}.rs \
+    crates/sqllib/Cargo.toml crates/sqllib/src/{aggregates,array,lib,spark_json,string,timestamp}.rs \
     crates/sqllib/src/spark_json/path.rs \
     "$delta.rs" "$delta"/{deletion_vector,field_id_adapter,input,merge/rewrite}.rs \
     crates/feldera-types/src/transport/delta_table.rs \
     crates/connectors/Cargo.toml crates/connectors/src/transport/url.rs \
     crates/connectors/src/transport/url/onelake.rs | tar -x -C "$context"
+
+# Start from the release manifests; import only the added workspace dependencies
+# and the locked fancy-regex package (its transitive dependencies already exist).
+git show "$revision:Cargo.toml" | grep -E '^(fancy-regex|regex-syntax) = ' > "$context/regex-deps"
+git show "$release:Cargo.toml" | sed "/^\[workspace.dependencies\]$/r $context/regex-deps" > "$context/Cargo.toml"
+git show "$release:Cargo.lock" | sed '
+    /^name = "dbsp_connectors"$/,/^\[\[package\]\]$/s/^ "governor",$/ "glob",\n "governor",/
+    /^name = "feldera-sqllib"$/,/^\[\[package\]\]$/s/^ "regex",$/ "fancy-regex",\n "regex",\n "regex-syntax",/
+' > "$context/Cargo.lock"
+printf '\n[[package]]\n' >> "$context/Cargo.lock"
+git show "$revision:Cargo.lock" | sed -n '/^name = "fancy-regex"$/,/^$/p' >> "$context/Cargo.lock"
+rm "$context/regex-deps"
 
 manifest=crates/connectors/Cargo.toml
 sed '/^    "dep:glob",$/d; /^glob = { version = "0.3.2", optional = true }$/d' \

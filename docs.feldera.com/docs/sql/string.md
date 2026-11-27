@@ -113,9 +113,9 @@ example.
     <td><a id="rlike"></a><code>string RLIKE pattern</code> and
         <code>string NOT RLIKE pattern</code></td>
     <td>The RLIKE expression returns true if <code>string</code> matches <code>pattern</code>.
-        The pattern is a standard Rust regular expression (see <a href="#regular-expressions">Regular expressions</a>).
+        The pattern is a Rust regular expression, with additional support for look-ahead and fixed-length look-behind (see <a href="#regular-expressions">Regular expressions</a>).
         If either argument is <code>NULL</code>, the result is <code>NULL</code>.
-        If the regular expression is invalid the program will crash with an error.</td>
+        If the pattern is invalid, or the look-around matcher exceeds its backtracking limit, evaluation fails with a runtime error.</td>
     <td><code>'string' RLIKE 's..i.*'</code> => <code>TRUE</code></td>
   </tr>
   <tr>
@@ -386,7 +386,9 @@ Postgres.  Most differences come from a performance guarantee: the
 time to search a string is at most proportional to the size of the
 regular expression multiplied by the length of the string.  To keep
 this guarantee, Rust does not support some constructs, such as
-look-around and backreferences.  Other constructs are valid, but have a
+look-around and backreferences. `RLIKE` first uses this linear-time engine; for
+look-around it falls back to a [bounded backtracking matcher](https://docs.rs/fancy-regex/).
+This does not implement all Java regex semantics. Other constructs are valid, but have a
 different meaning.  See [Differences from Java regular
 expressions](#differences-from-java-regular-expressions).
 
@@ -655,8 +657,8 @@ correspond to capture groups `$1`, `$2` and `$3`, respectively.
 ### Differences from Java regular expressions
 
 Feldera uses Rust regular expressions, not Java regular expressions.
-The table below shows Java constructs that Feldera does not support.
-A regular expression that uses one of them is invalid.
+The table below shows Java constructs that the ordinary matcher does not support.
+Only `RLIKE` supports look-around.
 
 | Java construct                | Meaning in Java                                    | Alternative                                     |
 |-------------------------------|----------------------------------------------------|-------------------------------------------------|

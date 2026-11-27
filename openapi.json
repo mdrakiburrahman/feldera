@@ -10502,6 +10502,10 @@
             "nullable": true,
             "minimum": 0
           },
+          "case_insensitive_field_names": {
+            "type": "boolean",
+            "description": "Match Delta columns and nested struct fields to SQL fields without regard to case,\nincluding quoted SQL identifiers. Ambiguous matches are errors. Default: false."
+          },
           "cdc_delete_filter": {
             "type": "string",
             "description": "A predicate that determines whether the record represents a deletion.\n\nThis setting is only valid in the `cdc` mode. It specifies a predicate applied to\neach row in the Delta table to determine whether the row represents a deletion event.\nIts value must be a valid Boolean SQL expression that can be used in a query of the\nform `SELECT * from <table> WHERE <cdc_delete_filter>`.",

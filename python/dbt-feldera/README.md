@@ -179,6 +179,19 @@ payload VARCHAR,
 created_at TIMESTAMP NOT NULL
 ```
 
+For a Spark/Delta source, use `feldera_delta_source` to match column and nested
+struct field names case-insensitively. It returns one connector configuration:
+
+```sql
+{{ config(materialized='table', connectors=[feldera_delta_source('s3://bucket/orders')]) }}
+
+"OrderId" BIGINT,
+"Shipping" ROW("ZipCode" VARCHAR)
+```
+
+The default read mode is `snapshot`. Pass `mode='snapshot_and_follow'` to keep
+reading changes, and `options={...}` for additional Delta connector settings.
+
 ### `incremental` — Unsupported
 
 > [!IMPORTANT]

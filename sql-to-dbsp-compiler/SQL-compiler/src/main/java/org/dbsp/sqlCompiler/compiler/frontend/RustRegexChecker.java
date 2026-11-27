@@ -4,6 +4,7 @@ import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
 import java.math.BigInteger;
+import java.util.List;
 import java.util.regex.Pattern;
 
 /** Best-effort detection of the constructs that the Rust {@code regex} crate rejects
@@ -45,17 +46,20 @@ public final class RustRegexChecker {
     /** True when the checker cannot follow the pattern and gives no verdict */
     private boolean lost = false;
 
-    private RustRegexChecker(String pattern) {
+    private final boolean allowLookaround;
+
+    private RustRegexChecker(String pattern, boolean allowLookaround) {
         this.pattern = pattern;
+        this.allowLookaround = allowLookaround;
     }
 
     /** Describes the first construct in {@code pattern} that the Rust parser rejects
      * for sure, or returns null if the checker finds no such construct */
     @Nullable
-    public static String unsupportedConstruct(String pattern) {
+    public static String unsupportedConstruct(String pattern, boolean allowLookaround) {
         if (VERBOSE_FLAG.matcher(pattern).find())
             return null;
-        return new RustRegexChecker(pattern).scan();
+        return new RustRegexChecker(pattern, allowLookaround).scan();
     }
 
     /** The warning text for a pattern that contains the unsupported {@code construct} */
@@ -215,6 +219,14 @@ public final class RustRegexChecker {
         if (!this.pattern.startsWith("(?", start)) {
             this.openGroup(start + 1);
             return null;
+        }
+        if (this.allowLookaround) {
+            for (String opener : List.of("(?=", "(?!", "(?<=", "(?<!")) {
+                if (this.pattern.startsWith(opener, start)) {
+                    this.openGroup(start + opener.length());
+                    return null;
+                }
+            }
         }
         String problem = this.unsupportedGroup(start);
         if (problem != null)

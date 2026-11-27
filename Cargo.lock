@@ -5505,6 +5505,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4443176a9f2c162692bd3d352d745ef9413eec5782a80d8fd6f8a1ac692a07f7"
 
 [[package]]
+name = "fancy-regex"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
+dependencies = [
+ "bit-set",
+ "regex-automata 0.4.14",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastbloom"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5860,6 +5871,7 @@ dependencies = [
  "chrono-tz",
  "dbsp",
  "derive_more 1.0.0",
+ "fancy-regex",
  "feldera-fxp",
  "feldera-macros",
  "feldera-size-of",
@@ -5878,6 +5890,7 @@ dependencies = [
  "paste",
  "proptest",
  "regex",
+ "regex-syntax",
  "rkyv",
  "ryu",
  "serde",

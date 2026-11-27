@@ -47,3 +47,10 @@
 {% macro feldera__type_boolean() %}
     BOOLEAN
 {% endmacro %}
+
+{% macro feldera_delta_source(uri, mode='snapshot', options=none) %}
+    {%- set transport_config = {'case_insensitive_field_names': true} -%}
+    {%- do transport_config.update(options or {}) -%}
+    {%- do transport_config.update({'uri': uri, 'mode': mode}) -%}
+    {{ return({'transport': {'name': 'delta_table_input', 'config': transport_config}}) }}
+{% endmacro %}

@@ -118,14 +118,15 @@ docker buildx imagetools inspect --raw "$IMAGE_REPOSITORY@$MANIFEST" | jq -r '.c
 ### Use a source-built compiler with Enterprise Helm 0.391.0
 
 The compiler, not the API server, produces the pipeline binary and links its
-Delta and OneLake Files readers. `build-enterprise-compiler.sh` takes eight public
-Rust source files, the connector manifest, and the SQL compiler sources from the
+Delta and OneLake Files readers. `build-enterprise-compiler.sh` takes the reviewed public
+runtime sources and manifests, and the SQL compiler sources from the
 current **committed** revision. It builds
 the jar with the 0.391.0 Maven project version, leaving the official compiler
 executable, Enterprise crates and entrypoint in the pinned
 licensed image. It then repeats the vendor precompile with those sources.
-The released lockfile keeps all package versions and checksums; the only change
-adds the already locked `glob` package to `dbsp_connectors`' direct dependencies.
+The release lockfile keeps its existing package versions and checksums. The overlay
+adds `glob` to the connector dependencies and the bounded `fancy-regex` fallback
+to the SQL runtime; its transitive dependencies are already locked.
 This tests selected changes on the release ABI, not all of `main` on Enterprise.
 
 Run in a non-shallow clone with the public v0.391.0 commit available, using
