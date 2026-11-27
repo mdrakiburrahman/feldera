@@ -261,6 +261,20 @@ dbt seed                # push seed data
 dbt seed --full-refresh # stop, clear storage, redeploy, then push
 ```
 
+For ad-hoc queries, set `stored: true` on table models or seeds independently
+of safe seed reuse. Floating-point seed columns are submitted as JSON numbers;
+explicit `DECIMAL` columns retain their exact decimal text. Explicit boolean
+columns parse trimmed, case-insensitive `true/t/yes/y/1` and `false/f/no/n/0`;
+other strings, including empty strings, become SQL `NULL`.
+
+### Unit tests
+
+dbt unit tests run in uniquely named, connector-free scratch pipelines, not the
+workload pipeline. The adapter infers actual output types before rendering the
+expected query, preserves duplicate rows and nulls, and deletes each scratch
+pipeline after success or failure. Unit-only invocations do not deploy the
+workload pipeline.
+
 ### Safe seed reuse
 
 Set `feldera_safe_seed_reuse: true` in dbt vars to materialize seed tables and
