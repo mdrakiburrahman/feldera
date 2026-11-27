@@ -24,6 +24,7 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPLeftJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPMapIndexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNoopOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateLinearPostprocessRetainKeysOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPChainAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNegateOperator;
@@ -592,6 +593,18 @@ public class KeyAnalysis extends CircuitVisitor {
     @Override
     public void postorder(DBSPChainAggregateOperator node) {
         this.aggregate(node);
+    }
+
+    /** Emits one row for each partition and time of its input, the time with the aggregate
+     * over the window around it.  Unlike a grouped aggregate, its index, the partition, is
+     * not a key; the partition with the time is. */
+    @Override
+    public void postorder(DBSPPartitionedRollingAggregateOperator node) {
+        if (!(node.outputPort().getShape() instanceof IndexedShape shape) || shape.valueFields() == 0)
+            return;
+        List<Column> partitionAndTime = new ArrayList<>(shape.indexColumns());
+        partitionAndTime.add(Column.value(0));
+        this.set(node, Keys.of(ColumnEquivalence.NONE.keyOf(partitionAndTime)));
     }
 
     @Override
