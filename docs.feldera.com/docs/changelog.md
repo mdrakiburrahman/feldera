@@ -10,6 +10,7 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- `MIN` over window frames ignores NULL partial results, including mixed-NULL `ROWS` and `RANGE` frames.
 - dbt-feldera isolated unit tests preserve profile storage settings without
   adding storage bounds or implicitly enabling storage autoscaling.
 - With Spark compatibility, `jsonstring_as_<type>` reads non-string JSON values into `VARCHAR`

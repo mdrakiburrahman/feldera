@@ -627,7 +627,7 @@ public class AggregateCompiler implements ICompilerComponent {
             case MIN -> {
                 operation = MinMaxAggregate.Operation.Min;
                 opcode = DBSPOpcode.AGG_MIN;
-                yield "MinSemigroup";
+                yield "MinOptSemigroup";
             }
             case MAX -> {
                 opcode = DBSPOpcode.AGG_MAX;
@@ -641,7 +641,9 @@ public class AggregateCompiler implements ICompilerComponent {
         DBSPVariablePath accumulator = this.nullableResultType.var();
         DBSPExpression increment = this.incrementOperation(
                 node, opcode, this.nullableResultType, accumulator, aggregatedValue, this.filterArgument());
-        DBSPTypeUser semigroup = new DBSPTypeUser(node, SEMIGROUP, semigroupName, false, accumulator.getType());
+        DBSPType semigroupType = function.getKind() == SqlKind.MIN
+                ? accumulator.getType().withMayBeNull(false) : accumulator.getType();
+        DBSPTypeUser semigroup = new DBSPTypeUser(node, SEMIGROUP, semigroupName, false, semigroupType);
         // If there is a filter, do not use a MinMaxAggregate
         NonLinearAggregate aggregate;
         if (this.filterArgument >= 0)
