@@ -932,7 +932,7 @@ only when it is written as a [quoted identifier](identifiers.md), as in
 |---|---|
 | A | `ANY`, `ASOF` |
 | C | `CALL`, `CASE`, `CREATE`, `CROSS`, `CURRENT`, `CURSOR` |
-| D | `DATE`, `DATEADD`, `DATEDIFF`, `DATEPART`, `DATETIME`, `DATE_PART`, `DEFAULT`, `DEFINE`, `DELETE`, `DESCRIBE`, `DISTINCT`, `DROP` |
+| D | `DATEADD`, `DATEDIFF`, `DATEPART`, `DATETIME`, `DATE_PART`, `DEFAULT`, `DEFINE`, `DELETE`, `DESCRIBE`, `DISTINCT`, `DROP` |
 | E | `END-EXEC`, `EXCEPT`, `EXPLAIN` |
 | F | `FETCH`, `FOREIGN`, `FRIDAY`, `FROM`, `FULL` |
 | G | `GROUP`, `GROUPING` |

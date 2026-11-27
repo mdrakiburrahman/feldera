@@ -104,13 +104,13 @@ public class RegexWarningTests extends BaseSQLTests {
     public void rejectedPatterns() {
         for (Map.Entry<String, String> entry : REJECTED.entrySet())
             Assert.assertEquals(entry.getKey(), entry.getValue(),
-                    RustRegexChecker.unsupportedConstruct(entry.getKey()));
+                    RustRegexChecker.unsupportedConstruct(entry.getKey(), false));
     }
 
     @Test
     public void acceptedPatterns() {
         for (String pattern : ACCEPTED)
-            Assert.assertNull(pattern, RustRegexChecker.unsupportedConstruct(pattern));
+            Assert.assertNull(pattern, RustRegexChecker.unsupportedConstruct(pattern, false));
     }
 
     /** The regular expression warnings for the program, one line per warning */
@@ -129,7 +129,7 @@ public class RegexWarningTests extends BaseSQLTests {
 
     @Test
     public void warningRendered() {
-        var cc = this.getCC("CREATE TABLE T(s VARCHAR);\nCREATE VIEW V AS SELECT s RLIKE 'a(?=b)' FROM T;");
+        var cc = this.getCC("CREATE TABLE T(s VARCHAR);\nCREATE VIEW V AS SELECT s RLIKE 'a(?>b)' FROM T;");
         StringBuilder output = new StringBuilder();
         for (CompilerMessages.Message message : cc.compiler.messages.messages)
             if (message.errorType.equals(RustRegexChecker.WARNING))
@@ -137,12 +137,12 @@ public class RegexWarningTests extends BaseSQLTests {
         Assert.assertEquals("""
                 While compiling:
                     1|CREATE TABLE T(s VARCHAR);
-                    2|CREATE VIEW V AS SELECT s RLIKE 'a(?=b)' FROM T;
+                    2|CREATE VIEW V AS SELECT s RLIKE 'a(?>b)' FROM T;
                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
                 (no input file): Unsupported regular expression feature
-                (no input file):2:25: warning: Unsupported regular expression feature: Pattern 'a(?=b)' contains the look-ahead '(?='
+                (no input file):2:25: warning: Unsupported regular expression feature: Pattern 'a(?>b)' contains the atomic group '(?>'
                     1|CREATE TABLE T(s VARCHAR);
-                    2|CREATE VIEW V AS SELECT s RLIKE 'a(?=b)' FROM T;
+                    2|CREATE VIEW V AS SELECT s RLIKE 'a(?>b)' FROM T;
                                               ^^^^^^^^^^^^^^^^""", output.toString().stripTrailing());
     }
 
@@ -157,12 +157,36 @@ public class RegexWarningTests extends BaseSQLTests {
                    REGEXP_REPLACE(s, '\\1', 'x')
                 FROM T;""");
         Assert.assertEquals(List.of(
-                "3:4: warning: Unsupported regular expression feature: Pattern '(?=a)' contains the look-ahead '(?='",
-                "4:4: warning: Unsupported regular expression feature: Pattern '(?!a)' contains the look-ahead '(?!'",
-                "5:4: warning: Unsupported regular expression feature: Pattern '(?<=a)' contains the look-behind '(?<='",
                 "6:4: warning: Unsupported regular expression feature: Pattern '(?<!a)' contains the look-behind '(?<!'",
                 "7:4: warning: Unsupported regular expression feature: Pattern '\\1' contains the backreference or octal escape '\\1'"),
                 warnings);
+    }
+
+    @Test
+    public void lookaroundAndCharPatterns() {
+        var ccs = this.getCCS("""
+                CREATE FUNCTION regexp_extract(s VARCHAR, p VARCHAR, i INTEGER) RETURNS VARCHAR AS p;
+                CREATE TABLE T(s VARCHAR, p VARCHAR);
+                CREATE VIEW V AS SELECT s RLIKE '^(?!x)abc$' AS literal_match,
+                    RLIKE(s, p) AS dynamic_match, CHAR_LENGTH(regexp_extract(s, 'ab ', 1)) AS pattern_length,
+                    REGEXP_REPLACE(s, 'b', 'X') AS replaced FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES ('abc', '(?<=a)b'), ('xbc', '(?<!x)b'), (NULL, '*')", """
+                 literal_match | dynamic_match | pattern_length | replaced
+                ----------------------------------------------------------
+                 true          | true          | 3              | aXc
+                 false         | false         | 3              | xXc
+                 NULL          | NULL          | 3              |NULL""");
+    }
+
+    @Test
+    public void guardedInvalidPattern() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(g BOOLEAN NOT NULL, s VARCHAR NOT NULL);
+                CREATE VIEW V AS SELECT s FROM T WHERE NOT (g AND s RLIKE '*');""");
+        ccs.stepWeightOne("INSERT INTO T VALUES (FALSE, 'abc');", """
+                 s
+                -----
+                 abc""");
     }
 
     @Test

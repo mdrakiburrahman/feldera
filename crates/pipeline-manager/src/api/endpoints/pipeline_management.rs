@@ -1693,6 +1693,7 @@ pub(crate) async fn post_pipeline_diff(
         profile: None,
         cache: false,
         runtime_version,
+        spark_compat: false,
         use_platform_compiler: false,
     };
     let program_config = serde_json::to_value(&program_config).map_err(|e| {
@@ -1812,6 +1813,7 @@ pub(crate) async fn post_validate_program(
         profile: None,
         cache: false,
         runtime_version,
+        spark_compat: false,
         use_platform_compiler: false,
     };
     let program_config = serde_json::to_value(&program_config).map_err(|e| {

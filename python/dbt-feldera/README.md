@@ -100,6 +100,7 @@ query.
 | `api_key`             | _(none)_                | API key for authenticated Feldera instances                                                                      |
 | `schema`              | _(required)_            | Pipeline name in Feldera                                                                                         |
 | `compilation_profile` | `dev`                   | SQL compilation profile: `dev` (fast compile), `unoptimized`, or `optimized` (best runtime performance)          |
+| `spark_compat` | `false` | Enable the fork's Spark SQL semantics. The `spark_compat` project variable overrides the profile. Requires the fork's compiler, manager, and Python SDK. |
 | `workers`             | `4`                     | Number of pipeline worker threads                                                                                |
 | `timeout`             | `300`                   | Max wait (seconds) for pipeline compilation + startup                                                            |
 
@@ -177,6 +178,19 @@ event_type VARCHAR NOT NULL,
 payload VARCHAR,
 created_at TIMESTAMP NOT NULL
 ```
+
+For a Spark/Delta source, use `feldera_delta_source` to match column and nested
+struct field names case-insensitively. It returns one connector configuration:
+
+```sql
+{{ config(materialized='table', connectors=[feldera_delta_source('s3://bucket/orders')]) }}
+
+"OrderId" BIGINT,
+"Shipping" ROW("ZipCode" VARCHAR)
+```
+
+The default read mode is `snapshot`. Pass `mode='snapshot_and_follow'` to keep
+reading changes, and `options={...}` for additional Delta connector settings.
 
 ### `incremental` — Unsupported
 

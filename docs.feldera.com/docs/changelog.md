@@ -10,6 +10,10 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- SQL accepts unquoted `date` identifiers and compiles nested `IN`/`NOT IN` predicates over `CASE` expressions.
+- Opt in to nullable `ROW` fields with `--sparkCompat` or pipeline `program_config.spark_compat`. Explicit `NOT NULL` is unchanged.
+- `RLIKE` supports look-ahead and look-behind patterns, and user-defined functions accept `CHAR` arguments for `VARCHAR` parameters.
+- Delta input connectors can match column and nested field names case-insensitively with `case_insensitive_field_names`.
 - SQL supports Spark `EXPLODE` and `STACK` in projections and `LATERAL VIEW [OUTER]` clauses.
 - Added date `SEQUENCE`, `ARRAY_SORT`, `PERCENTILE_CONT`, `NAMED_STRUCT`, `FROM_JSON`, `GET_JSON_OBJECT`, and typed row/array/map support for `TO_JSON`.
 - URL inputs support read-only OneLake Files snapshots and following through ABFSS, with managed identity, recursive glob/time filtering, and checkpoint recovery.

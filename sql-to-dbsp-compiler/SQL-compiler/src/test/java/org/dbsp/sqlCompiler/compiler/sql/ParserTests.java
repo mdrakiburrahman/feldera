@@ -92,6 +92,23 @@ public class ParserTests {
     }
 
     @Test
+    public void sparkRowFieldDefaults() throws SqlParseException {
+        for (boolean sparkCompat : List.of(false, true)) {
+            var opts = new CompilerOptions();
+            opts.languageOptions.sparkCompat = sparkCompat;
+            var compiler = new SqlToRelCompiler(opts, new StderrErrorReporter());
+            var table = (SqlCreateTable) compiler.parse("CREATE TABLE t(s ROW(n ROW(x INT), y INT NOT NULL, z INT NULL))");
+            var column = (SqlExtendedColumnDeclaration) table.columnsOrForeignKeys.get(0);
+            var fields = compiler.specToRel(column.dataType, false).getFieldList();
+            var inner = fields.get(0).getType();
+            Assert.assertEquals(sparkCompat, inner.isNullable());
+            Assert.assertEquals(sparkCompat, inner.getFieldList().get(0).getType().isNullable());
+            Assert.assertFalse(fields.get(1).getType().isNullable());
+            Assert.assertTrue(fields.get(2).getType().isNullable());
+        }
+    }
+
+    @Test
     public void ddlTest() throws SqlParseException {
         SqlToRelCompiler calcite = this.getCompiler();
         String ddl = "CREATE TABLE T (\n" +
@@ -606,7 +623,7 @@ public class ParserTests {
     public void unusedKeywordTest() throws SqlParseException {
         // Calcite's grammar declares these keywords but Feldera does not reserve them:
         for (String keyword: new String[] {
-                "CONTAINS_SUBSTR", "DISCARD", "GRANT", "JSON_SCOPE",
+                "CONTAINS_SUBSTR", "DATE", "DISCARD", "GRANT", "JSON_SCOPE",
                 "PLANS", "SEED", "SEQUENCES", "TEMP" })
             this.columnNamed(keyword);
 

@@ -23,6 +23,7 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 dbsp = { workspace = true }
 feldera-types = { workspace = true }
+fancy-regex = { workspace = true }
 flate2 = { workspace = true }
 feldera-fxp = { workspace = true, features = ["dbsp"] }
 geo = { workspace = true }
@@ -37,6 +38,7 @@ once_cell = { workspace = true }
 paste = { workspace = true }
 parquet-variant = { workspace = true }
 regex = { workspace = true }
+regex-syntax = { workspace = true }
 rkyv = { workspace = true, features = ["std", "size_64", "validation", "smallvec"] }
 ryu = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

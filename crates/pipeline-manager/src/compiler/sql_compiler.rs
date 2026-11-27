@@ -687,7 +687,6 @@ pub(crate) async fn perform_sql_compilation(
     }
 
     // Program configuration
-    // Might be used in the future to pass SQL compiler flags
     let program_config = validate_program_config(program_config, true).map_err(|error| {
         SqlCompilationError::SystemError(formatdoc! {"
                 The program configuration:
@@ -788,9 +787,6 @@ pub(crate) async fn perform_sql_compilation(
     }
 
     // Call executable with arguments
-    //
-    // In the future, it might be that flags can be passed to the SQL compiler through
-    // the program_config field of the pipeline.
     let mut command = Command::new("java");
     command
         .arg("-jar")
@@ -804,6 +800,9 @@ pub(crate) async fn perform_sql_compilation(
         .arg("-je")
         .arg("--alltables")
         .arg("--ignoreOrder");
+    if program_config.spark_compat {
+        command.arg("--sparkCompat");
+    }
     if runtime_selector.is_gen2() {
         // The Gen-2 engine consumes the circuit IR and skips Rust codegen. `--gen2` emits
         // the IR and drops the primary-key columns from an indexed source's value; `--jit`

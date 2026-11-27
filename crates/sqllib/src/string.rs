@@ -338,16 +338,51 @@ pub fn like2__(value: SqlString, pattern: SqlString) -> bool {
 some_function2!(like2, SqlString, SqlString, bool);
 
 #[doc(hidden)]
-pub fn rlike__(value: SqlString, re: ParsedRegex) -> bool {
-    match re {
-        ParsedRegex::Invalid(r, e) => {
-            panic!("Invalid regular expression in RLIKE '{}': {}", r, e);
+#[derive(Debug, Clone)]
+pub enum RlikeRegex {
+    Regex(Regex),
+    Lookaround(Arc<fancy_regex::Regex>),
+}
+
+#[doc(hidden)]
+pub type ParsedRlike = Result<RlikeRegex, String>;
+
+#[doc(hidden)]
+pub fn make_rlike_(pattern: SqlString) -> ParsedRlike {
+    let pattern = pattern.str();
+    match Regex::new(pattern) {
+        Ok(re) => Ok(RlikeRegex::Regex(re)),
+        Err(error) => {
+            // Retry only lookaround; retain the ordinary engine's syntax and size limits.
+            if regex_syntax::ast::parse::Parser::new()
+                .parse(pattern)
+                .is_err_and(|e| *e.kind() == regex_syntax::ast::ErrorKind::UnsupportedLookAround)
+            {
+                return fancy_regex::Regex::new(pattern)
+                    .map(|re| RlikeRegex::Lookaround(Arc::new(re)))
+                    .map_err(|e| format!("Invalid regular expression in RLIKE '{pattern}': {e}"));
+            }
+            Err(format!(
+                "Invalid regular expression in RLIKE '{pattern}': {error}"
+            ))
         }
-        ParsedRegex::Regex(re) => re.is_match(value.str()),
     }
 }
 
-some_function2!(rlike, SqlString, ParsedRegex, bool);
+some_function1!(make_rlike, SqlString, ParsedRlike);
+
+#[doc(hidden)]
+pub fn rlike__(value: SqlString, re: ParsedRlike) -> bool {
+    match re {
+        Err(e) => panic!("{e}"),
+        Ok(RlikeRegex::Regex(re)) => re.is_match(value.str()),
+        Ok(RlikeRegex::Lookaround(re)) => re
+            .is_match(value.str())
+            .unwrap_or_else(|e| panic!("Error evaluating RLIKE '{}': {e}", re.as_str())),
+    }
+}
+
+some_function2!(rlike, SqlString, ParsedRlike, bool);
 
 #[doc(hidden)]
 pub fn like3___(value: SqlString, pattern: SqlString, escape: SqlString) -> bool {

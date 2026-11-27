@@ -574,6 +574,15 @@ pub struct DeltaTableReaderConfig {
     /// Table read mode.
     pub mode: DeltaTableIngestMode,
 
+    /// Match Delta columns and nested struct fields to SQL fields without regard to case,
+    /// including quoted SQL identifiers. Ambiguous matches are errors. Default: false.
+    #[serde(
+        default,
+        skip_serializing_if = "is_default",
+        deserialize_with = "deserialize_bool_or_string"
+    )]
+    pub case_insensitive_field_names: bool,
+
     /// While following, skip file removals and insert all live rows from each data-changing Add.
     /// Rewrites can re-emit rows that were already ingested. Takes precedence over `ignore_deletes`.
     /// Only valid in `follow` and `snapshot_and_follow`, with Change Data Feed disabled.

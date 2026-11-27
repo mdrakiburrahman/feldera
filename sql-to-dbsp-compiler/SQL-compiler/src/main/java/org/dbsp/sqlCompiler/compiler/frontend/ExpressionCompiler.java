@@ -961,14 +961,14 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
 
     /** Warn if {@code arg} is a constant pattern that the Rust regex crate rejects for sure;
      * the warning points at {@code call}, since literals carry no source position */
-    void checkRegexLiteral(CalciteObject call, DBSPExpression arg) {
+    void checkRegexLiteral(CalciteObject call, DBSPExpression arg, boolean rlike) {
         if (!arg.is(DBSPStringLiteral.class))
             return;
         Utf8String value = arg.to(DBSPStringLiteral.class).value;
         if (value == null)
             return;
         String pattern = value.toJavaString();
-        String construct = RustRegexChecker.unsupportedConstruct(pattern);
+        String construct = RustRegexChecker.unsupportedConstruct(pattern, rlike);
         if (construct != null)
             this.compiler.reportWarning(call.getPositionRange(), RustRegexChecker.WARNING,
                     RustRegexChecker.message(pattern, construct));
@@ -976,8 +976,8 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
 
     /** Parse the regular expression {@code arg} of {@code call} */
     @Nullable
-    DBSPExpression makeRegex(CalciteObject call, DBSPExpression arg) {
-        this.checkRegexLiteral(call, arg);
+    DBSPExpression makeRegex(CalciteObject call, DBSPExpression arg, boolean rlike) {
+        this.checkRegexLiteral(call, arg, rlike);
         DBSPType argType = arg.getType();
         if (!argType.is(DBSPTypeString.class)) {
             this.compiler.reportWarning(argumentPosition(call, arg),
@@ -986,9 +986,9 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
             arg = arg.cast(arg.getNode(), DBSPTypeString.varchar(arg.getType().mayBeNull),
                     DBSPCastExpression.CastType.SqlUnsafe);
         }
-        DBSPTypeUser user = new DBSPTypeUser(CalciteObject.EMPTY, USER, "ParsedRegex", argType.mayBeNull);
+        DBSPTypeUser user = new DBSPTypeUser(CalciteObject.EMPTY, USER, rlike ? "ParsedRlike" : "ParsedRegex", argType.mayBeNull);
         return new DBSPApplyExpression(CalciteObject.EMPTY,
-                "make_regex" + argType.nullableUnderlineSuffix(),
+                (rlike ? "make_rlike" : "make_regex") + argType.nullableUnderlineSuffix(),
                 user, arg);
     }
 
@@ -1125,6 +1125,10 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
 
     @Override
     public DBSPExpression visitCall(RexCall call) {
+        // A SEARCH can itself refer to an expression containing another SEARCH. Calcite
+        // expands only the outer call; visit the expansion before translating its operands.
+        if (call.getKind() == SqlKind.SEARCH)
+            return RexUtil.expandSearch(this.rexBuilder, null, call).accept(this);
         CalciteObject node = CalciteObject.create(this.context, call);
         DBSPType type = this.typeCompiler.convertType(node.getPositionRange(), call.getType(), false);
         // If type is NULL we can skip the call altogether...
@@ -1779,7 +1783,7 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                             if (i != 1)
                                 this.ensureString(ops, i);
                         }
-                        ops.set(1, this.makeRegex(node, ops.get(1)));
+                        ops.set(1, this.makeRegex(node, ops.get(1), false));
                         return compileStrictFunction(call, node, type, ops, 2, 3);
                     }
                     case "parse_date":
@@ -2041,7 +2045,7 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                 validateArgCount(node, operationName, ops.size(), 2);
                 // Calcite does not enforce the type of the arguments, why?
                 this.ensureString(ops, 0);
-                ops.set(1, this.makeRegex(node, ops.get(1)));
+                ops.set(1, this.makeRegex(node, ops.get(1), true));
                 return compileFunction(call, node, type, ops, 2);
             }
             case POSITION:
@@ -2763,7 +2767,6 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                 .append("Compiling ")
                 .appendSupplier(expression::toString)
                 .newline();
-        expression = RexUtil.expandSearch(this.rexBuilder, null, expression);
         DBSPExpression result = expression.accept(this);
         if (result == null)
             throw new InternalCompilerError("Unexpected Calcite expression " + expression,

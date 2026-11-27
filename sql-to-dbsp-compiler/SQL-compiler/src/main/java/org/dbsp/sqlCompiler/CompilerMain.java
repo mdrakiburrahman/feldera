@@ -104,6 +104,8 @@ public class CompilerMain {
         commander.setProgramName("sql-to-dbsp");
         try {
             commander.parse(argv);
+            String sparkCompat = System.getenv("FELDERA_SPARK_COMPAT");
+            this.options.languageOptions.sparkCompat |= "true".equalsIgnoreCase(sparkCompat) || "1".equals(sparkCompat);
         } catch (ParameterException ex) {
             if (ex.getMessage().contains("Only one main parameter allowed")) {
                 if (this.options.ioOptions.outputFile.isEmpty()) {

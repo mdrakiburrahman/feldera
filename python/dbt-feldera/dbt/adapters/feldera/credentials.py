@@ -33,6 +33,7 @@ class FelderaCredentials(Credentials):
     api_key: Optional[str] = None
     pipeline_name: Optional[str] = None
     compilation_profile: str = "dev"
+    spark_compat: bool = False
     workers: int = 4
     runtime_config: Optional[dict[str, Any]] = None
     timeout: int = 300
@@ -52,5 +53,6 @@ class FelderaCredentials(Credentials):
             "database",
             "schema",
             "compilation_profile",
+            "spark_compat",
             "workers",
         )

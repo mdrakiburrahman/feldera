@@ -650,6 +650,9 @@ pub enum PipelineAction {
         /// when the runtime version is set.
         #[arg(long, env = "FELDERA_USE_PLATFORM_COMPILER", default_value_t = false)]
         use_platform_compiler: bool,
+        /// Enable Spark-compatible SQL semantics.
+        #[arg(long)]
+        spark_compat: bool,
         /// The compilation profile to use.
         #[arg(default_value = "optimized")]
         profile: CompilationProfile,
@@ -1352,6 +1355,9 @@ pub enum ProgramAction {
         /// when the runtime version is set.
         #[arg(long, env = "FELDERA_USE_PLATFORM_COMPILER", default_value_t = false)]
         use_platform_compiler: bool,
+        /// Enable Spark-compatible SQL semantics.
+        #[arg(long)]
+        spark_compat: bool,
     },
     /// Retrieve the compilation status of the program.
     Status {

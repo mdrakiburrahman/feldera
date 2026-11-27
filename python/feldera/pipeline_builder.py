@@ -20,6 +20,7 @@ class PipelineBuilder:
     :param sql: The SQL code of the pipeline
     :param udf_rust: Rust code for UDFs
     :param udf_toml: Rust dependencies required by UDFs (in the TOML format)
+    :param spark_compat: Enable Spark-compatible SQL semantics.
     :param compilation_profile: The :class:`.CompilationProfile` to use
     :param runtime_config: The :class:`.RuntimeConfig` to use. Enables
         configuring the runtime behavior of the pipeline such as:
@@ -38,6 +39,7 @@ class PipelineBuilder:
         compilation_profile: CompilationProfile = CompilationProfile.OPTIMIZED,
         runtime_config: RuntimeConfig = RuntimeConfig.default(),
         runtime_version: Optional[str] = None,
+        spark_compat: bool = False,
     ):
         self.client: FelderaClient = client
         self.name: str | None = name
@@ -47,6 +49,7 @@ class PipelineBuilder:
         self.udf_rust: str = udf_rust
         self.udf_toml: str = udf_toml
         self.compilation_profile: CompilationProfile = compilation_profile
+        self.spark_compat = spark_compat
         self.runtime_config: RuntimeConfig = runtime_config
         self.runtime_version: Optional[str] = os.environ.get(
             "FELDERA_RUNTIME_VERSION", runtime_version
@@ -85,6 +88,7 @@ class PipelineBuilder:
             udf_toml=self.udf_toml,
             program_config={
                 "profile": self.compilation_profile.value,
+                "spark_compat": self.spark_compat,
                 "runtime_version": self.runtime_version,
                 "use_platform_compiler": self.use_platform_compiler,
             },
@@ -130,6 +134,7 @@ class PipelineBuilder:
             udf_toml=self.udf_toml,
             program_config={
                 "profile": self.compilation_profile.value,
+                "spark_compat": self.spark_compat,
                 "runtime_version": self.runtime_version,
                 "use_platform_compiler": self.use_platform_compiler,
             },

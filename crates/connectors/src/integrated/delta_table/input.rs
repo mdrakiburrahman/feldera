@@ -16,7 +16,8 @@ use arrow::array::{Array, ArrayData, ArrayRef, AsArray, BooleanArray, make_array
 use arrow::compute::kernels::cmp::eq;
 use arrow::compute::{filter_record_batch, is_null, not, prep_null_mask_filter};
 use arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema, SchemaRef,
+    DataType as ArrowDataType, Field as ArrowField, FieldRef, Fields, Schema as ArrowSchema,
+    SchemaRef,
 };
 use atomic::Atomic;
 use bytemuck::NoUninit;
@@ -77,7 +78,7 @@ use feldera_storage::tokio::TOKIO_DEDICATED_IO;
 use feldera_types::adapter_stats::ConnectorHealth;
 use feldera_types::config::{FtModel, PipelineConfig};
 use feldera_types::coordination::InputShard;
-use feldera_types::program_schema::{Field, Relation};
+use feldera_types::program_schema::{ColumnType, Field, Relation};
 use feldera_types::transport::delta_table::{
     DeltaTableIngestMode, DeltaTableReaderConfig, DeltaTableTransactionMode,
 };
@@ -522,25 +523,152 @@ fn child_fields(data_type: &ArrowDataType) -> Vec<&FieldRef> {
 /// metadata changes; the physical layout is untouched. Names absent from `map`
 /// carry over unchanged.
 fn relabel_array(array: &ArrayRef, map: &HashMap<String, String>) -> AnyResult<ArrayRef> {
-    Ok(make_array(relabel_array_data(array.to_data(), map)?))
+    Ok(make_array(relabel_array_data(
+        array.to_data(),
+        &relabel_data_type(array.data_type(), map),
+    )?))
 }
 
-/// Recursive core of [`relabel_array`], operating on the raw [`ArrayData`] tree.
-fn relabel_array_data(data: ArrayData, map: &HashMap<String, String>) -> AnyResult<ArrayData> {
-    let relabeled_type = relabel_data_type(data.data_type(), map);
-    let children: Vec<ArrayData> = data
+/// Retag the array and its children with field names from a schema of identical layout.
+fn relabel_array_data(data: ArrayData, renamed: &ArrowDataType) -> AnyResult<ArrayData> {
+    if data.data_type() == renamed {
+        return Ok(data);
+    }
+    let children = data
         .child_data()
         .iter()
-        .map(|child| relabel_array_data(child.clone(), map))
+        .zip(child_fields(renamed))
+        .map(|(child, field)| relabel_array_data(child.clone(), field.data_type()))
         .collect::<AnyResult<_>>()?;
     // Relabeling only renames fields; buffers, offsets, lengths, and null bitmaps
-    // carry over untouched, so the built data is structurally identical. `build`
-    // only errors on a real layout mismatch, which would be a bug here.
+    // carry over untouched. `build` only errors on a real layout mismatch.
     data.into_builder()
-        .data_type(relabeled_type)
+        .data_type(renamed.clone())
         .child_data(children)
         .build()
-        .map_err(|e| anyhow!("relabeling column-mapped field names failed: {e}"))
+        .map_err(|e| anyhow!("relabeling Delta field names failed: {e}"))
+}
+
+/// Resolve each field in its own struct, retaining the source order, types, nullability and
+/// metadata. Missing fields are left to the normal SQL default/NULL/NOT NULL handling.
+fn resolve_delta_fields(source: &Fields, sql: &[Field], path: &str) -> AnyResult<Fields> {
+    let mut wanted = HashMap::with_capacity(sql.len());
+    for field in sql {
+        let name = field.name.name();
+        if let Some(other) = wanted.insert(name.to_lowercase(), field) {
+            bail!(
+                "ambiguous SQL field names '{path}{}' and '{path}{name}'",
+                other.name.name()
+            );
+        }
+    }
+    let mut matched = HashMap::new();
+    source
+        .iter()
+        .map(|field| {
+            let folded = field.name().to_lowercase();
+            let Some(sql) = wanted.get(&folded) else {
+                return Ok(field.clone());
+            };
+            if let Some(other) = matched.insert(folded, field.name()) {
+                bail!(
+                    "ambiguous Delta field names '{path}{other}' and '{path}{}'",
+                    field.name()
+                );
+            }
+            let name = sql.name.name();
+            let resolved = resolve_delta_type(field, &sql.columntype, &format!("{path}{name}."))?;
+            Ok(if *resolved.name() == name {
+                resolved
+            } else {
+                Arc::new(resolved.as_ref().clone().with_name(name))
+            })
+        })
+        .collect()
+}
+
+fn resolve_delta_type(field: &FieldRef, sql: &ColumnType, path: &str) -> AnyResult<FieldRef> {
+    use ArrowDataType::*;
+    let ty = match field.data_type() {
+        Struct(children) if let Some(fields) = &sql.fields => {
+            Struct(resolve_delta_fields(children, fields, path)?)
+        }
+        List(child) if let Some(element) = &sql.component => {
+            List(resolve_delta_type(child, element, path)?)
+        }
+        LargeList(child) if let Some(element) = &sql.component => {
+            LargeList(resolve_delta_type(child, element, path)?)
+        }
+        FixedSizeList(child, len) if let Some(element) = &sql.component => {
+            FixedSizeList(resolve_delta_type(child, element, path)?, *len)
+        }
+        Map(entries, sorted)
+            if let (Struct(pair), Some(key), Some(value)) =
+                (entries.data_type(), &sql.key, &sql.value) =>
+        {
+            let [key_field, value_field] = &pair[..] else {
+                bail!("invalid Delta map at {path}: expected key and value fields");
+            };
+            let pair = Struct(
+                vec![
+                    resolve_delta_type(key_field, key, &format!("{path}key."))?,
+                    resolve_delta_type(value_field, value, &format!("{path}value."))?,
+                ]
+                .into(),
+            );
+            Map(
+                Arc::new(entries.as_ref().clone().with_data_type(pair)),
+                *sorted,
+            )
+        }
+        _ => return Ok(field.clone()),
+    };
+    Ok(Arc::new(field.as_ref().clone().with_data_type(ty)))
+}
+
+/// Only changed fields are recorded. The change feed can remove its metadata column
+/// before this plan is applied, so index it by logical Delta name rather than position.
+fn resolved_delta_names(
+    source: &Fields,
+    sql: &[Field],
+    case_insensitive: bool,
+) -> AnyResult<HashMap<String, FieldRef>> {
+    if !case_insensitive {
+        return Ok(HashMap::new());
+    }
+    Ok(source
+        .iter()
+        .zip(resolve_delta_fields(source, sql, "")?.iter())
+        .filter(|(old, new)| old != new)
+        .map(|(old, new)| (old.name().clone(), new.clone()))
+        .collect())
+}
+
+fn apply_delta_names(
+    batch: RecordBatch,
+    names: &HashMap<String, FieldRef>,
+) -> AnyResult<RecordBatch> {
+    if names.is_empty() {
+        return Ok(batch);
+    }
+    let (schema, mut columns, rows) = batch.into_parts();
+    let mut fields = schema.fields().to_vec();
+    for (field, column) in fields.iter_mut().zip(&mut columns) {
+        if let Some(new) = names.get(field.name()) {
+            if column.data_type() != new.data_type() {
+                *column = make_array(relabel_array_data(column.to_data(), new.data_type())?);
+            }
+            *field = new.clone();
+        }
+    }
+    Ok(RecordBatch::try_new_with_options(
+        Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        )),
+        columns,
+        &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
+    )?)
 }
 
 /// Substitute nested field names in `data_type` through `map`. Names absent from
@@ -2439,6 +2567,21 @@ impl DeltaTableInputEndpointInner {
 
         let timestamp_field = self.schema.field(timestamp_column).unwrap();
 
+        let timestamp_column = if self.config.case_insensitive_field_names {
+            let name = timestamp_field.name.name().to_lowercase();
+            let schema = self.logical_schema()?;
+            let delta_field = schema
+                .fields()
+                .iter()
+                .find(|f| f.name().to_lowercase() == name)
+                .ok_or_else(|| {
+                    anyhow!("timestamp column '{timestamp_column}' not found in Delta schema")
+                })?;
+            quote_sql_identifier(delta_field.name())
+        } else {
+            timestamp_column.clone()
+        };
+
         // The following unwraps are safe, as validated in `validate_timestamp_column`.
         let lateness = timestamp_field.lateness.as_ref().unwrap();
 
@@ -2801,7 +2944,7 @@ impl DeltaTableInputEndpointInner {
             return;
         }
 
-        if let Err(e) = self.validate_timestamp_columns() {
+        if let Err(e) = self.validate_read_schema(&table) {
             let _ = init_status_sender.send(Err(e)).await;
             return;
         }
@@ -3534,18 +3677,22 @@ impl DeltaTableInputEndpointInner {
         Ok(())
     }
 
-    /// Check at startup what a change feed read needs from the table.
-    ///
-    /// `change_feed = require` fails unless the table has `delta.enableChangeDataFeed` set.
-    /// `auto` accepts either.
-    /// Rejects a TIMESTAMP column that the table stores as anything but an
-    /// Arrow timestamp, which `delta_input_serde_config` would read as
-    /// microseconds.
-    fn validate_timestamp_columns(&self) -> Result<(), ControllerError> {
+    /// Reject ambiguous field names and incompatible TIMESTAMP types before reading rows.
+    fn validate_read_schema(&self, table: &DeltaTable) -> Result<(), ControllerError> {
         let invalid = |message: String| {
             ControllerError::invalid_transport_configuration(&self.endpoint_name, &message)
         };
-        let schema = self.logical_schema().map_err(|e| invalid(e.to_string()))?;
+        let schema = table
+            .snapshot()
+            .map_err(|e| invalid(e.to_string()))?
+            .snapshot()
+            .arrow_schema();
+        resolved_delta_names(
+            schema.fields(),
+            &self.schema.fields,
+            self.config.case_insensitive_field_names,
+        )
+        .map_err(|e| invalid(e.to_string()))?;
         self.check_used_timestamp_columns(&schema).map_err(invalid)
     }
 
@@ -3862,6 +4009,15 @@ impl DeltaTableInputEndpointInner {
             Ok(stream) => stream,
         };
 
+        let names = Arc::new(
+            resolved_delta_names(
+                stream.schema().fields(),
+                &self.schema.fields,
+                self.config.case_insensitive_field_names,
+            )
+            .map_err(|e| e.to_string())?,
+        );
+
         // We declare the connector healthy at this point.
         self.consumer
             .update_connector_health(ConnectorHealth::healthy());
@@ -3883,11 +4039,17 @@ impl DeltaTableInputEndpointInner {
             move || {
                 let polarity = polarity.clone();
                 let fields = fields.clone();
+                let names = names.clone();
                 let mut input_stream = input_stream.fork();
 
                 Box::new(move |(batch, timestamp)| {
-                    let (parsed_buffer, errors) =
-                        Self::parse_record_batch(batch, &polarity, &fields, input_stream.as_mut());
+                    let (parsed_buffer, errors) = Self::parse_record_batch(
+                        batch,
+                        &polarity,
+                        &fields,
+                        &names,
+                        input_stream.as_mut(),
+                    );
                     let staged_buffer = parsed_buffer.map(|buffer| {
                         let len = buffer.len();
                         StagedInputBuffer::new(input_stream.stage(vec![buffer]), len)
@@ -3961,6 +4123,7 @@ impl DeltaTableInputEndpointInner {
         batch: RecordBatch,
         polarity: &Polarity,
         fields: &[Field],
+        names: &HashMap<String, FieldRef>,
         input_stream: &mut dyn ArrowStream,
     ) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
         // `ChangeType` takes its polarities out of the batch, so resolve the
@@ -3989,10 +4152,12 @@ impl DeltaTableInputEndpointInner {
 
         // `delta_input_serde_config` reads timestamps as microseconds. The startup
         // check is not sufficient: the schema of the table can change later.
-        let batch = match check_timestamp_columns(fields, batch.schema_ref())
+        let batch = match apply_delta_names(batch, names)
             .map_err(|e| e.to_string())
-            .and_then(|()| timestamps_to_micros(batch, fields).map_err(|e| e.to_string()))
-        {
+            .and_then(|batch| {
+                check_timestamp_columns(fields, batch.schema_ref())?;
+                timestamps_to_micros(batch, fields).map_err(|e| e.to_string())
+            }) {
             Ok(batch) => batch,
             Err(e) => {
                 return (None, vec![ParseError::bin_envelope_error(e, &[], None)]);
@@ -4727,6 +4892,9 @@ impl DeltaTableInputEndpointInner {
                 },
             )
             .await?;
+        if self.config.case_insensitive_field_names {
+            self.validate_read_schema(&table)?;
+        }
         *self.schema_table.lock().unwrap() = Some(Arc::new(table));
         Ok(())
     }
@@ -8085,17 +8253,13 @@ mod positional_path_tests {
     use feldera_types::program_schema::{ColumnType, SqlIdentifier};
     use std::sync::{Arc, Mutex};
 
-    /// Records, for each batch that it receives, whether the batch is marked
-    /// for a read by position.
+    /// Captures the batch handed to the Arrow deserializer.
     #[derive(Clone, Default)]
-    struct Recorder(Arc<Mutex<Vec<bool>>>);
+    struct Recorder(Arc<Mutex<Vec<RecordBatch>>>);
 
     impl Recorder {
         fn record(&self, batch: &RecordBatch) -> AnyResult<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(has_positional_fields(batch.schema_ref()));
+            self.0.lock().unwrap().push(batch.clone());
             Ok(())
         }
     }
@@ -8163,12 +8327,126 @@ mod positional_path_tests {
             batch,
             &polarity,
             &fields(),
+            &HashMap::new(),
             &mut recorder,
         );
         assert!(errors.is_empty(), "{errors:?}");
         let recorded = recorder.0.lock().unwrap();
         assert_eq!(recorded.len(), 1);
-        recorded[0]
+        has_positional_fields(recorded[0].schema_ref())
+    }
+
+    fn quoted(name: &str, ty: ColumnType) -> Field {
+        Field::new(SqlIdentifier::new(name, true), ty)
+    }
+
+    #[test]
+    fn case_insensitive_field_names_reads_nested_spark_rows() {
+        use arrow::array::{ListArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(42), None]));
+        let rows: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("itemID", ArrowDataType::Int64, true)),
+                values.clone(),
+            ),
+            (
+                Arc::new(ArrowField::new("Qty", ArrowDataType::Int64, false)),
+                ids(),
+            ),
+        ]));
+        let items: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(ArrowField::new_list_field(rows.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0, 1, 2].into()),
+            rows,
+            None,
+        ));
+        let batch = batch(vec![
+            (CHANGE_TYPE_COLUMN, strings(["delete", "insert"])),
+            ("ITEMS", items),
+        ]);
+        let sql = [quoted(
+            "Items",
+            ColumnType::array(
+                true,
+                ColumnType::structure(
+                    true,
+                    &[
+                        quoted("QTY", ColumnType::bigint(false)),
+                        quoted("ItemId", ColumnType::bigint(true)),
+                    ],
+                ),
+            ),
+        )];
+        for (option, root, leaf) in [(None, "ITEMS", "itemID"), (Some(true), "Items", "ItemId")] {
+            let mut raw = serde_json::json!({"uri": "memory://orders", "mode": "snapshot"});
+            if let Some(value) = option {
+                raw["case_insensitive_field_names"] = value.into();
+            }
+            let config: DeltaTableReaderConfig = serde_json::from_value(raw).unwrap();
+            let names = resolved_delta_names(
+                batch.schema_ref().fields(),
+                &sql,
+                config.case_insensitive_field_names,
+            )
+            .unwrap();
+            let mut recorder = Recorder::default();
+            let (_, errors) = DeltaTableInputEndpointInner::parse_record_batch(
+                batch.clone(),
+                &Polarity::ChangeType,
+                &sql,
+                &names,
+                &mut recorder,
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            let recorded = recorder.0.lock().unwrap();
+            let result = &recorded[0];
+            assert_eq!(has_positional_fields(result.schema_ref()), option.is_some());
+            let rows = result
+                .column_by_name(root)
+                .unwrap()
+                .as_list::<i32>()
+                .values()
+                .as_struct();
+            assert_eq!(rows.column_by_name(leaf).unwrap().as_ref(), values.as_ref());
+            if option.is_some() {
+                assert_eq!(rows.fields()[0].name(), "QTY");
+                assert!(!rows.fields()[0].is_nullable());
+                assert_eq!(rows.column(0).as_ref(), ids().as_ref());
+            }
+        }
+    }
+
+    #[test]
+    fn case_insensitive_field_names_rejects_ambiguous_names_even_with_an_exact_match() {
+        let leaf = |name| ArrowField::new(name, ArrowDataType::Int64, true);
+        let sql = [quoted(
+            "Payload",
+            ColumnType::structure(true, &[quoted("Value", ColumnType::bigint(true))]),
+        )];
+        let source = Fields::from(vec![ArrowField::new(
+            "PAYLOAD",
+            ArrowDataType::Struct(vec![leaf("Value"), leaf("VALUE")].into()),
+            true,
+        )]);
+        let error = resolved_delta_names(&source, &sql, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("'Payload.Value' and 'Payload.VALUE'"),
+            "{error}"
+        );
+        let sql = [
+            quoted("x", ColumnType::bigint(true)),
+            quoted("X", ColumnType::bigint(true)),
+        ];
+        let error = resolved_delta_names(&Fields::from(vec![leaf("X")]), &sql, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("ambiguous SQL field names 'x' and 'X'"),
+            "{error}"
+        );
     }
 
     /// The connector reads a batch by position when the batch has all the

@@ -1382,6 +1382,11 @@ export type DeltaTableReaderConfig = {
    */
   batch_size?: number | null
   /**
+   * Match Delta columns and nested struct fields to SQL fields without regard to case,
+   * including quoted SQL identifiers. Ambiguous matches are errors. Default: false.
+   */
+  case_insensitive_field_names?: boolean
+  /**
    * A predicate that determines whether the record represents a deletion.
    *
    * This setting is only valid in the `cdc` mode. It specifies a predicate applied to
@@ -1596,6 +1601,7 @@ export type DeltaTableReaderConfig = {
     | string
     | number
     | null
+    | boolean
     | string
     | null
     | string
@@ -1608,7 +1614,6 @@ export type DeltaTableReaderConfig = {
     | null
     | string
     | null
-    | boolean
     | number
     | null
     | number
@@ -5410,6 +5415,10 @@ export type ProgramConfig = {
    * If not set (null), the runtime version will be the same as the platform version.
    */
   runtime_version?: string | null
+  /**
+   * Enable Spark-compatible SQL semantics.
+   */
+  spark_compat?: boolean
   /**
    * Use the platform SQL compiler when a non-platform `runtime_version` is specified.
    *

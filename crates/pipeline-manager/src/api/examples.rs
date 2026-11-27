@@ -55,6 +55,7 @@ fn extended_pipeline_1() -> ExtendedPipelineDescr {
             profile: Some(CompilationProfile::Optimized),
             cache: true,
             runtime_version: None,
+            spark_compat: false,
             use_platform_compiler: false,
         })
         .unwrap(),
@@ -149,6 +150,7 @@ fn extended_pipeline_2() -> ExtendedPipelineDescr {
             profile: Some(CompilationProfile::Unoptimized),
             cache: true,
             runtime_version: None,
+            spark_compat: false,
             use_platform_compiler: false,
         })
         .unwrap(),
@@ -372,6 +374,7 @@ pub(crate) fn pipeline_post_put() -> PostPutPipeline {
             profile: Some(CompilationProfile::Optimized),
             cache: true,
             runtime_version: None,
+            spark_compat: false,
             use_platform_compiler: false,
         }),
     }

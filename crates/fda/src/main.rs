@@ -1535,6 +1535,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             program_path,
             runtime_version,
             use_platform_compiler,
+            spark_compat,
             profile,
             tags,
             udf_rs,
@@ -1568,6 +1569,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                             profile: Some(profile),
                             runtime_version,
                             use_platform_compiler,
+                            spark_compat,
                         }),
                         runtime_config: None,
                         deployment_config: None,
@@ -3622,6 +3624,7 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
             profile,
             runtime_version,
             use_platform_compiler,
+            spark_compat,
         } => {
             let pp = PatchPipeline {
                 description: None,
@@ -3635,6 +3638,7 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
                     cache: true,
                     runtime_version,
                     use_platform_compiler,
+                    spark_compat,
                 }),
                 runtime_config: None,
                 deployment_config: None,

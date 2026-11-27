@@ -325,6 +325,7 @@ async fn unbundle_support_bundle(
                     .as_str()
                     .map(|s| s.to_string())
                     .or(runtime_version.clone()),
+                spark_compat: pc["spark_compat"].as_bool().unwrap_or(false),
                 use_platform_compiler: false,
             })
         } else {
@@ -332,6 +333,7 @@ async fn unbundle_support_bundle(
                 cache: true,
                 profile: Some(CompilationProfile::Optimized),
                 runtime_version: runtime_version.clone(),
+                spark_compat: false,
                 use_platform_compiler: false,
             })
         };

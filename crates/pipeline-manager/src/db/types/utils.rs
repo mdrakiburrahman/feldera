@@ -703,6 +703,7 @@ mod tests {
             profile: Some(CompilationProfile::Unoptimized),
             cache: false,
             runtime_version: None,
+            spark_compat: true,
             use_platform_compiler: false,
         };
         let value = serde_json::to_value(program_config.clone()).unwrap();

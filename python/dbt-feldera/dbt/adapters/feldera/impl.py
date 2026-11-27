@@ -444,6 +444,7 @@ class FelderaAdapter(BaseAdapter):
         udf_sql_path: str | None = None,
         udf_rust_path: str | None = None,
         udf_toml_path: str | None = None,
+        spark_compat: bool | None = None,
     ) -> str:
         """
         Deploy the assembled pipeline to Feldera.
@@ -461,6 +462,7 @@ class FelderaAdapter(BaseAdapter):
             client,
             pipeline_name,
             compilation_profile=creds.compilation_profile,
+            spark_compat=creds.spark_compat if spark_compat is None else spark_compat,
             workers=creds.workers,
             timeout=creds.timeout,
             runtime_config=creds.runtime_config,
@@ -555,6 +557,7 @@ class FelderaAdapter(BaseAdapter):
         udf_sql_path: str | None = None,
         udf_rust_path: str | None = None,
         udf_toml_path: str | None = None,
+        spark_compat: bool | None = None,
     ) -> str:
         """
         Deploy pipelines with pending seeds and push all stashed data,
@@ -591,6 +594,7 @@ class FelderaAdapter(BaseAdapter):
                 client,
                 pipeline_name,
                 compilation_profile=creds.compilation_profile,
+                spark_compat=creds.spark_compat if spark_compat is None else spark_compat,
                 workers=creds.workers,
                 timeout=creds.timeout,
                 runtime_config=creds.runtime_config,
@@ -622,6 +626,7 @@ class FelderaAdapter(BaseAdapter):
                 client,
                 pipeline_name,
                 compilation_profile=creds.compilation_profile,
+                spark_compat=creds.spark_compat if spark_compat is None else spark_compat,
                 workers=creds.workers,
                 timeout=creds.timeout,
                 full_refresh=full_refresh,

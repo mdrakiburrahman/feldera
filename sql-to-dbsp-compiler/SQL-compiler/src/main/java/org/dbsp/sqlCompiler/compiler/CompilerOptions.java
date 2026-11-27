@@ -66,6 +66,8 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         @Parameter(names = "--lenient",
                 description = "Lenient SQL validation.  If true it allows duplicate column names in a view.")
         public boolean lenient = false;
+        @Parameter(names = "--sparkCompat", description = "Use Spark-compatible SQL semantics")
+        public boolean sparkCompat = false;
         @Parameter(names = "--no-restrict-io",
                 description = "Do not restrict the types of columns allowed in tables and views")
         public boolean unrestrictedIOTypes = false;
@@ -83,6 +85,7 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
             return this.incrementalize == language.incrementalize &&
                     this.ignoreOrderBy == language.ignoreOrderBy &&
                     this.outputsAreSets == language.outputsAreSets &&
+                    this.sparkCompat == language.sparkCompat &&
                     this.unaryPlusNoop == language.unaryPlusNoop;
         }
 
@@ -94,6 +97,7 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
                     ",\n\tignoreOrderBy=" + this.ignoreOrderBy +
                     ",\n\tincrementalize=" + this.incrementalize +
                     ",\n\tlenient=" + this.lenient +
+                    ",\n\tsparkCompat=" + this.sparkCompat +
                     ",\n\toptimizationLevel=" + this.optimizationLevel +
                     ",\n\toutputsAreSets=" + this.outputsAreSets +
                     ",\n\tthrowOnError=" + this.throwOnError +
@@ -130,6 +134,9 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
                         .append(this.outputsAreSets)
                         .append("!=")
                         .append(other.outputsAreSets)
+                        .append(System.lineSeparator());
+            if (this.sparkCompat != other.sparkCompat)
+                result.append(", sparkCompat=").append(this.sparkCompat).append("!=").append(other.sparkCompat)
                         .append(System.lineSeparator());
             if (this.unaryPlusNoop != other.unaryPlusNoop)
                 result.append(", unaryPlusNoop=")

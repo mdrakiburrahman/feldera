@@ -277,6 +277,7 @@ class PipelineStateManager:
         udf_rust: str = "",
         udf_toml: str = "",
         replace: bool = False,
+        spark_compat: bool = False,
     ) -> Pipeline:
         """
         Deploy the assembled pipeline to Feldera.
@@ -324,6 +325,7 @@ class PipelineStateManager:
                         and _normalize_runtime_config(vars(existing.runtime_config()))
                         == _normalize_runtime_config(config)
                         and existing.program_config().get("profile") == compilation_profile
+                        and existing.program_config().get("spark_compat", False) == spark_compat
                     ):
                         self._deployed_sql[pipeline] = sql
                         self._pipelines[pipeline] = existing
@@ -334,6 +336,7 @@ class PipelineStateManager:
                 name=pipeline,
                 sql=sql,
                 compilation_profile=profile,
+                **({"spark_compat": True} if spark_compat else {}),
                 runtime_config=RuntimeConfig.from_dict(config),
                 udf_rust=udf_rust,
                 udf_toml=udf_toml,
@@ -362,6 +365,7 @@ class PipelineStateManager:
         udf_sql: str = "",
         udf_rust: str = "",
         udf_toml: str = "",
+        spark_compat: bool = False,
     ) -> Pipeline:
         """
         Update and redeploy an existing pipeline with new views.
@@ -408,7 +412,16 @@ class PipelineStateManager:
                 # Pipeline doesn't exist yet — fall back to full deploy
                 logger.info("Pipeline '%s' not found, falling back to full deploy", pipeline)
                 return self.deploy(
-                    client, pipeline, compilation_profile, workers, timeout, runtime_config, udf_sql, udf_rust, udf_toml
+                    client,
+                    pipeline,
+                    compilation_profile,
+                    workers,
+                    timeout,
+                    runtime_config,
+                    udf_sql,
+                    udf_rust,
+                    udf_toml,
+                    spark_compat=spark_compat,
                 )
 
             # Extract only CREATE TABLE statements from existing SQL
@@ -445,6 +458,7 @@ class PipelineStateManager:
                 and p.udf_toml() == udf_toml
                 and config_unchanged
                 and program_config.get("profile") == compilation_profile
+                and program_config.get("spark_compat", False) == spark_compat
             ):
                 self._deployed_sql[pipeline] = full_sql
                 self._pipelines[pipeline] = p
@@ -469,6 +483,7 @@ class PipelineStateManager:
 
             # Update SQL and wait for recompilation
             program_config["profile"] = compilation_profile
+            program_config["spark_compat"] = spark_compat
             p.modify(
                 sql=full_sql,
                 udf_rust=udf_rust,

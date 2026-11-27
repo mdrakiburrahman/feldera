@@ -1,0 +1,9 @@
+--- a/core/src/main/codegen/templates/Parser.jj
++++ b/core/src/main/codegen/templates/Parser.jj
+@@ -6959,5 +6959,5 @@ boolean NullableOptDefaultFalse() :
+ |
+     <NOT> <NULL> { return false; }
+ |
+-    { return false; }
++    { return ${parser.defaultRowFieldNullable!"false"}; }
+ }

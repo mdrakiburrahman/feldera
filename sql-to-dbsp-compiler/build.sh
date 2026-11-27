@@ -61,7 +61,7 @@ if [ "${CALCITE_BUILD_NEXT}" = "y" ]; then
     fi
 
     pushd "${CALCITE_BUILD_DIR}" >/dev/null
-    for name in window-expression-lineage spark-generator-grammar; do
+    for name in window-expression-lineage spark-generator-grammar row-field-nullability; do
         patch_file="${SCRIPT_DIR}/compat/${name}.patch"
         if git apply --check "${patch_file}" 2>/dev/null; then
             git apply "${patch_file}"

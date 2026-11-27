@@ -551,6 +551,9 @@ pub struct ProgramConfig {
     /// If none is specified, the compiler default compilation profile is used.
     pub profile: Option<CompilationProfile>,
 
+    /// Enable Spark-compatible SQL semantics.
+    pub spark_compat: bool,
+
     /// If `true` (default), when a prior compilation with the same checksum
     /// already exists, the output of that (i.e., binary) is used.
     /// Set `false` to always trigger a new compilation, which might take longer
@@ -627,6 +630,7 @@ impl Default for ProgramConfig {
             profile: None,
             cache: true,
             runtime_version: None,
+            spark_compat: false,
             use_platform_compiler: false,
         }
     }

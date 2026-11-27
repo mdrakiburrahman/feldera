@@ -148,6 +148,21 @@ public class BasicQueriesTests extends BaseSQLTests {
     }
 
     @Test
+    public void guardedBooleanDivision() {
+        var ccs = this.getCCS("""
+                CREATE TABLE t(i INTEGER);
+                CREATE VIEW v AS SELECT i <> 0 AND 10 / i > 1 AS a, i = 0 OR 10 / i > 1 AS b FROM t;
+                """);
+        ccs.stepWeightOne("INSERT INTO t VALUES (0), (2), (20), (NULL)", """
+                 a     | b
+                ------------
+                 false | true
+                 true  | true
+                 false | false
+                 NULL  | NULL""");
+    }
+
+    @Test
     public void testNullableCompare() {
         String query = "SELECT T.COL5 > T.COL1 FROM T";
         this.testQuery(query, new DBSPZSetExpression(

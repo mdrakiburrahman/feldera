@@ -72,6 +72,8 @@ public class ExternalFunction extends SqlFunction {
             SqlTypeName typeName = field.getType().getSqlTypeName();
             // This type checker is a bit too strict.
             checkers[i] = new ExactTypeNameChecker(typeName);
+            if (typeName == SqlTypeName.VARCHAR)
+                checkers[i] = checkers[i].or(new ExactTypeNameChecker(SqlTypeName.CHAR));
             // This type checker allows implicit casts from any type in the type family,
             // which is not great.
             // checkers[i] = OperandTypes.typeName(typeName);
