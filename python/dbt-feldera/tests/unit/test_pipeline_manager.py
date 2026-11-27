@@ -310,6 +310,23 @@ class TestPipelineReuse(unittest.TestCase):
         self.assertIs(result, self.pipeline)
         builder.assert_not_called()
 
+    def test_seed_reuse_rejects_changed_program_without_replacing(self):
+        self.pipeline.program_code.return_value = "CREATE VIEW different AS SELECT 1;"
+        with (
+            patch("dbt.adapters.feldera.pipeline_manager.Pipeline.get", return_value=self.pipeline),
+            patch("dbt.adapters.feldera.pipeline_manager.PipelineBuilder") as builder,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cold rebuild"):
+                self.manager.deploy(Mock(), "pipe", require_existing=True)
+            builder.assert_not_called()
+
+    def test_seed_creation_never_replaces(self):
+        with patch("dbt.adapters.feldera.pipeline_manager.PipelineBuilder") as builder:
+            builder.return_value.create.return_value = self.pipeline
+            self.manager.deploy(Mock(), "pipe", create_only=True)
+            builder.return_value.create.assert_called_once_with(wait=True)
+            builder.return_value.create_or_replace.assert_not_called()
+
     def test_changes_and_full_refresh_redeploy(self):
         for overrides in (
             {"udf_sql": "CREATE FUNCTION g() RETURNS INTEGER;"},
