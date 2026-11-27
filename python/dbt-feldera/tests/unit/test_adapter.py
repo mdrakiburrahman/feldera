@@ -1,10 +1,163 @@
 import unittest
-from unittest.mock import Mock
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import agate
+import pyarrow as pa
 
 from dbt.adapters.feldera.connections import FelderaConnectionManager
 from dbt.adapters.feldera.impl import FelderaAdapter
+
+
+class TestSafeSeedReuse(unittest.TestCase):
+    def test_row_multiset_preserves_duplicates_and_quotes_table_names(self):
+        batch = pa.record_batch([pa.array(["a", "a", None])], names=["CODE"])
+        pipeline = Mock()
+        pipeline.query_arrow.return_value = iter([batch])
+        expected = [{"code": "a"}, {"code": None}, {"code": "a"}]
+        self.assertTrue(FelderaAdapter._seed_rows_present(pipeline, 'seed"name', expected))
+        pipeline.query_arrow.assert_called_once_with('SELECT * FROM "seed""name"')
+
+        pipeline.query_arrow.return_value = iter([batch])
+        with self.assertRaisesRegex(RuntimeError, "cold rebuild"):
+            FelderaAdapter._seed_rows_present(pipeline, "seed", expected[:-1])
+
+    def test_timestamp_zero_precision_beyond_microseconds_is_accepted(self):
+        batch = pa.record_batch(
+            [pa.array([datetime(2013, 9, 8)], type=pa.timestamp("us"))],
+            names=["created_at"],
+        )
+        pipeline = Mock()
+        pipeline.query_arrow.return_value = iter([batch])
+        expected = [{"created_at": "2013-09-08 00:00:00.0000000"}]
+        self.assertTrue(FelderaAdapter._seed_rows_present(pipeline, "seed", expected))
+
+    def test_timestamp_normalization_preserves_timezone_offset(self):
+        batch = pa.record_batch(
+            [pa.array([datetime(2013, 9, 7, 22, tzinfo=timezone.utc)], type=pa.timestamp("us", tz="UTC"))],
+            names=["created_at"],
+        )
+        pipeline = Mock()
+        pipeline.query_arrow.return_value = iter([batch])
+        expected = [{"created_at": "2013-09-08 00:00:00.0000000+02:00"}]
+        self.assertTrue(FelderaAdapter._seed_rows_present(pipeline, "seed", expected))
+
+    def test_nonzero_excess_timestamp_precision_is_rejected(self):
+        batch = pa.record_batch(
+            [pa.array([datetime(2013, 9, 8)], type=pa.timestamp("us"))],
+            names=["created_at"],
+        )
+        pipeline = Mock()
+        pipeline.query_arrow.return_value = iter([batch])
+        expected = [{"created_at": "2013-09-08 00:00:00.0000001"}]
+        with self.assertRaisesRegex(ValueError, "exceeds us precision"):
+            FelderaAdapter._seed_rows_present(pipeline, "seed", expected)
+
+    def test_timestamp_like_string_values_are_not_normalized(self):
+        value = "2013-09-08 00:00:00.0000000"
+        batch = pa.record_batch([pa.array([value])], names=["value"])
+        pipeline = Mock()
+        pipeline.query_arrow.return_value = iter([batch])
+        self.assertTrue(FelderaAdapter._seed_rows_present(pipeline, "seed", [{"value": value}]))
+
+    def test_empty_existing_storage_requests_seed_submission(self):
+        batch = pa.record_batch([pa.array([], type=pa.int64())], names=["id"])
+        pipeline = Mock()
+        pipeline.query_arrow.return_value = iter([batch])
+        self.assertFalse(FelderaAdapter._seed_rows_present(pipeline, "seed", [{"id": 1}]))
+
+    def test_finalizer_reuses_matching_rows_and_reingests_empty_storage(self):
+        populated = pa.record_batch([pa.array([1], type=pa.int64())], names=["id"])
+        for stored_values, should_push in (([], True), ([1], False)):
+            with self.subTest(stored_values=stored_values):
+                stored = pa.record_batch([pa.array(stored_values, type=pa.int64())], names=["id"])
+                pipeline = Mock()
+                pipeline.query_arrow.side_effect = [iter([stored]), iter([populated])]
+                client = Mock()
+                adapter = Mock()
+                adapter._get_client.return_value = client
+                adapter._get_credentials.return_value = SimpleNamespace(
+                    compilation_profile="dev", spark_compat=False, workers=1, timeout=30, runtime_config={}
+                )
+                adapter._read_udfs.return_value = ("", "", "")
+                adapter._convert_agate_rows.return_value = [{"id": 1}]
+                adapter._seed_rows_present.side_effect = FelderaAdapter._seed_rows_present
+                adapter._verify_seed_rows.side_effect = FelderaAdapter._verify_seed_rows
+
+                with (
+                    patch("dbt.adapters.feldera.impl.Pipeline.get", return_value=pipeline),
+                    patch(
+                        "dbt.adapters.feldera.impl._pipeline_state.get_pending_seed_pipelines",
+                        return_value=["pipe"],
+                    ),
+                    patch(
+                        "dbt.adapters.feldera.impl._pipeline_state.pop_pending_seeds",
+                        return_value=[("seed", None, {})],
+                    ),
+                    patch("dbt.adapters.feldera.impl._pipeline_state.deploy", return_value=pipeline) as deploy,
+                    patch("dbt.adapters.feldera.impl._pipeline_state.get_pipelines_with_views", return_value=[]),
+                ):
+                    FelderaAdapter.finalize_seeds(adapter, safe_seed_reuse=True)
+
+                self.assertFalse(deploy.call_args.kwargs["replace"])
+                self.assertTrue(deploy.call_args.kwargs["require_existing"])
+                self.assertEqual(adapter.push_seed_data.call_count, int(should_push))
+                if should_push:
+                    adapter.push_seed_data.assert_called_once_with("pipe", "seed", [{"id": 1}])
+                adapter._verify_seed_rows.assert_called_once_with(pipeline, "seed", [{"id": 1}])
+
+    def test_safe_finalize_macro_refuses_failed_nodes(self):
+        from jinja2 import Environment
+
+        macro_path = Path(__file__).parents[2] / "dbt/include/feldera/macros/materializations/seed.sql"
+        source = macro_path.read_text(encoding="utf-8")
+        adapter = Mock()
+
+        def raise_compiler_error(message):
+            raise RuntimeError(message)
+
+        env = Environment(extensions=["jinja2.ext.do"])
+        env.globals.update(
+            results=[SimpleNamespace(node=SimpleNamespace(resource_type="seed"), status="error")],
+            adapter=adapter,
+            var=lambda name, default=None: name == "feldera_safe_seed_reuse" or default,
+            exceptions=SimpleNamespace(raise_compiler_error=raise_compiler_error),
+        )
+        macro = env.from_string(source).make_module().feldera_finalize_run
+        with self.assertRaisesRegex(RuntimeError, "failed or skipped node"):
+            macro()
+        adapter.finalize_seeds.assert_not_called()
+
+    def test_seed_macro_materializes_only_when_safe_reuse_is_enabled(self):
+        from jinja2 import Environment
+
+        macro_path = Path(__file__).parents[2] / "dbt/include/feldera/macros/materializations/seed.sql"
+        source = macro_path.read_text(encoding="utf-8")
+        for enabled in (False, True):
+            adapter = Mock()
+            adapter.convert_type.return_value = "BIGINT"
+            adapter.quote_seed_column.side_effect = lambda name, _: f'"{name}"'
+            adapter.register_table.return_value = ""
+            adapter.stash_seed.return_value = ""
+            model = {
+                "schema": "pipe",
+                "name": "seed",
+                "config": {"column_types": {}, "quote_columns": None},
+            }
+            table = SimpleNamespace(column_names=["id"])
+            env = Environment(extensions=["jinja2.ext.do"])
+            env.globals.update(
+                adapter=adapter,
+                var=lambda name, default=None: enabled if name == "feldera_safe_seed_reuse" else default,
+                **{"return": lambda _: ""},
+            )
+            macro = env.from_string(source).make_module().feldera__create_csv_table
+            macro(model, table)
+            sql = adapter.register_table.call_args.args[2]
+            self.assertEqual("WITH ('materialized' = 'true')" in sql, enabled)
+            self.assertEqual(adapter.stash_seed.call_count, int(enabled))
 
 
 class TestResultTable(unittest.TestCase):

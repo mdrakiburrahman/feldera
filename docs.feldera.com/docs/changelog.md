@@ -10,6 +10,8 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- The dbt-feldera adapter can safely reuse matching seed pipelines, verify seed row
+  multisets, and accept only zero timestamp fractional digits beyond declared precision.
 - SQL accepts unquoted `date` identifiers and compiles nested `IN`/`NOT IN` predicates over `CASE` expressions.
 - Opt in to nullable `ROW` fields with `--sparkCompat` or pipeline `program_config.spark_compat`. Explicit `NOT NULL` is unchanged.
 - `RLIKE` supports look-ahead and look-behind patterns, and user-defined functions accept `CHAR` arguments for `VARCHAR` parameters.

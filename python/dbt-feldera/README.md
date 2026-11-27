@@ -243,6 +243,22 @@ dbt seed                # push seed data
 dbt seed --full-refresh # stop, clear storage, redeploy, then push
 ```
 
+### Safe seed reuse
+
+Set `feldera_safe_seed_reuse: true` in dbt vars to materialize seed tables and
+reuse a running pipeline only when its program, UDFs, runtime settings, and
+compilation profile match. The adapter verifies the full seed row multiset,
+preserving duplicates. A nonempty seed is re-ingested if its stored table is
+empty; partial or conflicting data fails and requires a cold rebuild. This mode
+rejects `--full-refresh`. Enabling it for a pipeline whose seed tables were not
+materialized requires a cold rebuild first. Serialize builds and other writers
+to seed tables while checking.
+
+```yaml
+vars:
+  feldera_safe_seed_reuse: true
+```
+
 ### Summary
 
 | Materialization                    | Feldera SQL                | Best for                                                                    |
