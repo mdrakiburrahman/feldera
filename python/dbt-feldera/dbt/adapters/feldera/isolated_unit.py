@@ -125,12 +125,15 @@ def _unit_runtime_config(runtime_config):
     config.setdefault("workers", 1)
     resources = config.setdefault("resources", {})
     sizes = Resources(config=resources)
+    minimum = max(200_000_000_000, _parse_size_bytes(sizes.storage_min or "0"))
     for old_key, new_key in (("storage_mb_min", "storage_min"), ("storage_mb_max", "storage_max")):
-        if _parse_size_bytes(getattr(sizes, new_key) or "0") < 200_000_000_000:
+        floor = 200_000_000_000 if new_key == "storage_min" else minimum
+        if _parse_size_bytes(getattr(sizes, new_key) or "0") < floor:
+            megabytes = -(-floor // 1_000_000)
             if new_key in resources:
-                resources[new_key] = "200000M"
+                resources[new_key] = f"{megabytes}M"
             else:
-                resources[old_key] = 200_000
+                resources[old_key] = megabytes
     return RuntimeConfig.from_dict(config)
 
 

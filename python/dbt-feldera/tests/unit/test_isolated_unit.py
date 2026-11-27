@@ -56,6 +56,8 @@ def test_inspect_accepts_only_the_verified_intrinsic_now_input():
         ({}, {"storage_mb_min": 200000, "storage_mb_max": 200000}),
         ({"storage_mb_min": 1000, "storage_mb_max": 400000}, {"storage_mb_min": 200000, "storage_mb_max": 400000}),
         ({"storage_min": "4Gi", "storage_max": "400G"}, {"storage_min": "200000M", "storage_max": "400G"}),
+        ({"storage_min": "400G"}, {"storage_min": "400G", "storage_mb_max": 400000}),
+        ({"storage_max": "199999999999B"}, {"storage_mb_min": 200000, "storage_max": "200000M"}),
     ],
 )
 def test_scratch_runtime_inherits_storage_without_mutating_project(sizes, expected):
