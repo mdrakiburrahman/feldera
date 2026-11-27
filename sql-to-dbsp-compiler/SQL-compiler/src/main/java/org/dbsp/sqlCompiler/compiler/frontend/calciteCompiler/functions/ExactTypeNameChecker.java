@@ -23,8 +23,7 @@ record ExactTypeNameChecker(SqlTypeName typeName) implements SqlSingleOperandTyp
                                           SqlNode operand, int iFormalOperand, boolean throwOnFailure) {
         final RelDataType operandType =
                 callBinding.getValidator().getValidatedNodeType(operand);
-        return operandType.getSqlTypeName() == typeName ||
-                (typeName == SqlTypeName.VARCHAR && operandType.getSqlTypeName() == SqlTypeName.CHAR);
+        return operandType.getSqlTypeName() == typeName;
     }
 
     @Override
