@@ -10,6 +10,7 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- `CONCAT_WS` no longer inserts a separator before the first non-null string when earlier arguments are null.
 - The dbt-feldera adapter can safely reuse matching seed pipelines, verify seed row
   multisets, and accept only zero timestamp fractional digits beyond declared precision.
 - SQL accepts unquoted `date` identifiers and compiles nested `IN`/`NOT IN` predicates over `CASE` expressions.

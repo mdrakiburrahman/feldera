@@ -1706,16 +1706,10 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                     }
                     case "concat_ws": {
                         this.ensureString(ops, 0);
-                        DBSPExpression sep = ops.get(0);
-                        if (ops.size() == 1)
-                            return sep.cast(node, type, DBSPCastExpression.CastType.SqlUnsafe);
-                        DBSPExpression accumulator = DBSPStringLiteral.none(type.withMayBeNull(true));
-                        for (int i = 1; i < ops.size(); i++) {
-                            this.ensureString(ops, i);
-                            accumulator = compileFunction(
-                                    call, node, type, Linq.list(sep, accumulator, ops.get(i)), 3);
-                        }
-                        return accumulator.cast(node, type, DBSPCastExpression.CastType.SqlUnsafe);
+                        List<DBSPExpression> strings = ops.subList(1, ops.size());
+                        DBSPTypeString elementType = DBSPTypeString.varchar(Linq.any(strings, s -> s.getType().mayBeNull));
+                        DBSPExpression array = this.arrayConstructor(node, new DBSPTypeArray(elementType, false), strings);
+                        return compileFunction("array_to_string", node, type, Linq.list(array, ops.get(0)), 2, 3);
                     }
                     case "variantnull":
                         return compileFunction(

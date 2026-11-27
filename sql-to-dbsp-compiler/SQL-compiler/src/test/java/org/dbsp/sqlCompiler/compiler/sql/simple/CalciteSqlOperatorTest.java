@@ -276,6 +276,25 @@ public class CalciteSqlOperatorTest extends SqlIoTest {
     }
 
     @Test
+    public void testConcatWithSeparatorNulls() {
+        this.qst("""
+                SELECT CONCAT_WS(sep, a, b, c)
+                FROM (VALUES
+                    ('|', NULL, NULL, 'x'),
+                    ('|', NULL, NULL, NULL),
+                    (NULL, 'x', NULL, 'y'),
+                    (',', CAST('' AS VARCHAR), NULL, 'x')
+                ) AS t(sep, a, b, c);
+                 r
+                ----
+                 x
+                \s
+                NULL
+                 ,x
+                (4 rows)""");
+    }
+
+    @Test
     public void testMapContainsKey() {
         this.qst("""
                 select map_contains_key(map[1, 'a', 2, 'b'], 1);
