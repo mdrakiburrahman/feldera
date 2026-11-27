@@ -288,6 +288,14 @@ class TestPipelineReuse(unittest.TestCase):
         self.pipeline.modify.assert_not_called()
         self.pipeline.start.assert_not_called()
 
+    def test_switching_spark_compat_recompiles_without_losing_other_options(self):
+        self.pipeline.program_config.return_value = {"profile": "dev", "cache": False}
+        self.update(spark_compat=True)
+        self.assertEqual(
+            self.pipeline.modify.call_args.kwargs["program_config"],
+            {"profile": "dev", "cache": False, "spark_compat": True},
+        )
+
     def test_deploy_reuses_running_pipeline(self):
         with patch("dbt.adapters.feldera.pipeline_manager.Pipeline.get", return_value=self.pipeline):
             with patch("dbt.adapters.feldera.pipeline_manager.PipelineBuilder") as builder:

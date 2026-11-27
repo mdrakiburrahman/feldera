@@ -15,5 +15,7 @@ RUN sed -i '/^name = "dbsp_connectors"$/,/^\[\[package\]\]$/s/^ "governor",$/ "g
     && tar -czf working-dir-precompiled.tar.gz -C / home/ubuntu/working-dir \
     && rm -rf "$HOME/working-dir" "$HOME/.cargo"
 
+ENV FELDERA_SPARK_COMPAT=true
+
 ARG REVISION
 LABEL org.opencontainers.image.revision="$REVISION"

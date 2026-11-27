@@ -15121,6 +15121,11 @@
             "default": null,
             "nullable": true
           },
+          "spark_compat": {
+            "type": "boolean",
+            "description": "Enable Spark-compatible SQL semantics.",
+            "default": false
+          },
           "use_platform_compiler": {
             "type": "boolean",
             "description": "Use the platform SQL compiler when a non-platform `runtime_version` is specified.\n\nWarning: This setting is experimental and may change in the future.\nRequires the platform to run with the unstable feature `runtime_version` enabled.\n\nWhen `false` (default), the SQL compiler matching the `runtime_version` is\ndownloaded and used. When `true`, the platform's SQL compiler is used instead.\n\nSetting this to `true` avoids downloading the runtime-version-specific SQL\ncompiler JAR (e.g., when network access is unavailable or slow), at the cost\nof potentially using a mismatched SQL compiler. The Rust runtime sources are\nstill checked out and compiled from the requested `runtime_version`.\n\nHas no effect when `runtime_version` is not set or the platform does not have\nthe unstable feature `runtime_version` enabled.",

@@ -5,4 +5,4 @@ config-version: 2
 macro-paths: ["macros"]
 
 on-run-end:
-  - "{{ adapter.finalize_seeds(flags.FULL_REFRESH, var('feldera_udf_sql', none), var('feldera_udf_rust', none), var('feldera_udf_toml', none)) if execute else '' }}"
+  - "{{ adapter.finalize_seeds(flags.FULL_REFRESH, var('feldera_udf_sql', none), var('feldera_udf_rust', none), var('feldera_udf_toml', none), var('spark_compat', none)) if execute else '' }}"

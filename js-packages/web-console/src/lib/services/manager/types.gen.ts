@@ -5411,6 +5411,10 @@ export type ProgramConfig = {
    */
   runtime_version?: string | null
   /**
+   * Enable Spark-compatible SQL semantics.
+   */
+  spark_compat?: boolean
+  /**
    * Use the platform SQL compiler when a non-platform `runtime_version` is specified.
    *
    * Warning: This setting is experimental and may change in the future.

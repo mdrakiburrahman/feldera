@@ -100,6 +100,7 @@ query.
 | `api_key`             | _(none)_                | API key for authenticated Feldera instances                                                                      |
 | `schema`              | _(required)_            | Pipeline name in Feldera                                                                                         |
 | `compilation_profile` | `dev`                   | SQL compilation profile: `dev` (fast compile), `unoptimized`, or `optimized` (best runtime performance)          |
+| `spark_compat` | `false` | Enable the fork's Spark SQL semantics. The `spark_compat` project variable overrides the profile. Requires the fork's compiler, manager, and Python SDK. |
 | `workers`             | `4`                     | Number of pipeline worker threads                                                                                |
 | `timeout`             | `300`                   | Max wait (seconds) for pipeline compilation + startup                                                            |
 

@@ -109,6 +109,9 @@ Usage: sql-to-dbsp [options] Input file to compile
       Followed by a path.  Path to the runtime to use.  Used in conjunction
       with '--crates'.
       Default: <empty string>
+    --sparkCompat
+      Use Spark-compatible SQL semantics
+      Default: false
     --streaming
       Compiling a streaming program, where only inserts are allowed
       Default: false
@@ -206,6 +209,8 @@ Here is a description of the non-obvious command-line options:
 -O:  sets the optimization level.  A higher values implies more optimizations.
      Currently setting this to 0 inhibits some Calcite-level optimizations.
      The default value is "2".
+
+--sparkCompat: Use Spark-compatible SQL semantics, including nullable ROW fields by default. Explicit `NOT NULL` is preserved. Disabled by default, unless `FELDERA_SPARK_COMPAT` is `true` or `1` in the compiler process environment. The fork enterprise compiler image enables this default.
 
 --streaming: Equivalent to adding the following property to all program tables:
      `'appendOnly' = 'true'`.
