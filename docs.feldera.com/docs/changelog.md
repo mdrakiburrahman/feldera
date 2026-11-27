@@ -10,6 +10,8 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- With Spark compatibility, `jsonstring_as_<type>` reads non-string JSON values into `VARCHAR`
+  fields as JSON text instead of returning `NULL`, and `FROM_JSON` formats such text as Spark does.
 - `CONCAT_WS` no longer inserts a separator before the first non-null string when earlier arguments are null.
 - Spark compatibility mode uses fractional integer division, nullable decimal overflow
   and division by zero, non-ANSI string-to-integer casts, exact decimal `AVG`, and

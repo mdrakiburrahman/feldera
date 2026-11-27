@@ -1033,6 +1033,20 @@ public class VariantTests extends SqlIoTest {
     }
 
     @Test
+    public void jsonStringAsVarcharMismatch() {
+        this.getCCS("""
+                CREATE TABLE J(j VARCHAR);
+                CREATE TYPE rec_t AS (s VARCHAR, n INT);
+                CREATE FUNCTION jsonstring_as_rec_t(j VARCHAR) RETURNS rec_t;
+                CREATE VIEW V AS SELECT x IS NULL AS absent, x.s, x.n
+                FROM (SELECT jsonstring_as_rec_t(j) AS x FROM J);""").withStringTrim()
+                .stepWeightOne("INSERT INTO J VALUES ('{\"s\": 30, \"n\": 1}')", """
+                 absent | s | n
+                ----------------
+                 true |NULL|NULL""");
+    }
+
+    @Test
     public void issue5938() {
         // type -> Variant -> string
         this.qst("""
