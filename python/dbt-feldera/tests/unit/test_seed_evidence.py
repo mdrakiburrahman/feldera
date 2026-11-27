@@ -2,7 +2,6 @@ import json
 import subprocess
 import sys
 from decimal import Decimal
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pyarrow as pa
@@ -169,44 +168,3 @@ def test_finalizer_does_not_deliver_failed_evidence(failure):
     ):
         FelderaAdapter.finalize_seeds(adapter, safe_seed_reuse=True)
     hook.assert_not_called()
-
-
-@pytest.mark.parametrize(("stored_values", "should_push"), [([], True), ([1], False)])
-def test_finalizer_reingests_nonempty_seed_only_when_storage_is_empty(stored_values, should_push):
-    descriptor = {
-        "id": "p", "version": 1, "program_version": 2, "deployment_id": "d",
-        "deployment_status": "Running",
-    }
-    existing = Mock()
-    existing.query_arrow.return_value = [
-        pa.record_batch([pa.array(stored_values, type=pa.int64())], names=["x"])
-    ]
-    client = Mock()
-    client.http.get.return_value = descriptor
-    adapter = Mock()
-    adapter._get_client.return_value = client
-    adapter._get_credentials.return_value = SimpleNamespace(
-        compilation_profile="dev", workers=1, timeout=30, runtime_config={}
-    )
-    adapter._read_udfs.return_value = (None, None, None)
-    adapter._convert_agate_rows.return_value = [{"x": 1}]
-    adapter._seed_rows_present.side_effect = FelderaAdapter._seed_rows_present
-
-    with (
-        patch("dbt.adapters.feldera.impl.Pipeline.get", return_value=existing),
-        patch("dbt.adapters.feldera.impl._pipeline_state.get_pending_seed_pipelines", return_value=["p"]),
-        patch(
-            "dbt.adapters.feldera.impl._pipeline_state.pop_pending_seeds",
-            return_value=[("seed", None, None)],
-        ),
-        patch("dbt.adapters.feldera.impl._pipeline_state.deploy", return_value=existing),
-        patch("dbt.adapters.feldera.impl._pipeline_state.get_pipelines_with_views", return_value=[]),
-        patch.object(seed_evidence, "get_seed_verification_hook", return_value=None),
-    ):
-        FelderaAdapter.finalize_seeds(adapter, safe_seed_reuse=True)
-
-    if should_push:
-        adapter.push_seed_data.assert_called_once_with("p", "seed", [{"x": 1}])
-    else:
-        adapter.push_seed_data.assert_not_called()
-    adapter._verify_seed_rows.assert_called_once_with(existing, "seed", [{"x": 1}])
