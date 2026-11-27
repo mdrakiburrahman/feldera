@@ -1183,6 +1183,18 @@ pub fn cast_to_s_Timestamp(value: Timestamp, size: i32, fixed: bool) -> SqlResul
     limit_or_size_string(&result, size, fixed)
 }
 
+/// Spark's TIMESTAMP to string cast: trailing zeros of the fraction are dropped.
+#[doc(hidden)]
+pub fn cast_to_s_SparkTimestamp(value: Timestamp, size: i32, fixed: bool) -> SqlResult<SqlString> {
+    let result = value.to_string();
+    let result = if result.contains('.') {
+        result.trim_end_matches('0')
+    } else {
+        &result
+    };
+    limit_or_size_string(result, size, fixed)
+}
+
 #[doc(hidden)]
 pub fn cast_to_s_TimestampTz(value: TimestampTz, size: i32, fixed: bool) -> SqlResult<SqlString> {
     let result = value.to_string();
@@ -1564,6 +1576,7 @@ cast_to_string!(u16, u16);
 cast_to_string!(u32, u32);
 cast_to_string!(u64, u64);
 cast_to_string!(Timestamp, Timestamp);
+cast_to_string!(SparkTimestamp, Timestamp);
 cast_to_string!(TimestampTz, TimestampTz);
 cast_to_string!(Time, Time);
 cast_to_string!(Date, Date);

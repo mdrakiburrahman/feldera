@@ -210,6 +210,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -329,6 +330,7 @@ public class SqlToRelCompiler implements IWritesLogs {
 
     public SqlToRelCompiler(CompilerOptions options, IErrorReporter errorReporter) {
         this.options = options;
+        this.typeFactory = new CustomTypeFactory(options.languageOptions.sparkCompat);
         this.errorReporter = errorReporter;
         this.customFunctions = new CustomFunctions();
         this.definedViews = new HashSet<>();
@@ -410,6 +412,7 @@ public class SqlToRelCompiler implements IWritesLogs {
     /** A copy of 'source' which reports problems to 'errorReporter' */
     public SqlToRelCompiler(SqlToRelCompiler source, IErrorReporter errorReporter) {
         this.options = source.options;
+        this.typeFactory = new CustomTypeFactory(source.options.languageOptions.sparkCompat);
         this.parserConfig = source.parserConfig;
         this.cluster = source.cluster;
         this.converterConfig = source.converterConfig;
@@ -448,7 +451,7 @@ public class SqlToRelCompiler implements IWritesLogs {
         return this.customFunctions;
     }
 
-    public static final RelDataTypeSystem TYPE_SYSTEM = new RelDataTypeSystemImpl() {
+    public static class FelderaTypeSystem extends RelDataTypeSystemImpl {
         @Override
         public int getMaxPrecision(SqlTypeName typeName) {
             if (typeName == SqlTypeName.DECIMAL)
@@ -482,7 +485,126 @@ public class SqlToRelCompiler implements IWritesLogs {
 
         @Override
         public boolean shouldConvertRaggedUnionTypesToVarying() { return true; }
-    };
+    }
+
+    public static final RelDataTypeSystem TYPE_SYSTEM = new FelderaTypeSystem();
+
+    /** Type system implementing Spark's decimal and aggregate result types
+     * (Spark DecimalPrecision rules, spark.sql.ansi.enabled=false). */
+    public static class SparkTypeSystem extends FelderaTypeSystem {
+        static final int MAX = DBSPTypeDecimal.MAX_PRECISION;
+        static final int MINIMUM_ADJUSTED_SCALE = 6;
+
+        /** Spark DecimalType.adjustPrecisionScale */
+        static RelDataType adjust(RelDataTypeFactory factory, int precision, int scale) {
+            if (precision > MAX) {
+                int intDigits = precision - scale;
+                int minScale = Math.min(scale, MINIMUM_ADJUSTED_SCALE);
+                scale = Math.max(MAX - intDigits, minScale);
+                precision = MAX;
+            }
+            return factory.createSqlType(SqlTypeName.DECIMAL, precision, scale);
+        }
+
+        /** Precision of an exact numeric type viewed as a decimal, or -1 if not applicable */
+        static int precision(RelDataType type) {
+            return switch (type.getSqlTypeName()) {
+                case TINYINT -> 3;
+                case SMALLINT -> 5;
+                case INTEGER -> 10;
+                case BIGINT -> 20;
+                case DECIMAL -> type.getPrecision();
+                default -> -1;
+            };
+        }
+
+        static boolean applies(RelDataType type1, RelDataType type2) {
+            return precision(type1) >= 0 && precision(type2) >= 0 &&
+                    (SqlTypeUtil.isDecimal(type1) || SqlTypeUtil.isDecimal(type2));
+        }
+
+        static RelDataType nullable(RelDataTypeFactory factory, RelDataType result, RelDataType... types) {
+            boolean nullable = false;
+            for (RelDataType type: types)
+                nullable |= type.isNullable();
+            return factory.createTypeWithNullability(result, nullable);
+        }
+
+        @Override
+        public @Nullable RelDataType deriveDecimalPlusType(
+                RelDataTypeFactory factory, RelDataType type1, RelDataType type2) {
+            if (!applies(type1, type2))
+                return null;
+            int p1 = precision(type1), s1 = type1.getScale();
+            int p2 = precision(type2), s2 = type2.getScale();
+            int scale = Math.max(s1, s2);
+            return nullable(factory, adjust(factory, Math.max(p1 - s1, p2 - s2) + scale + 1, scale), type1, type2);
+        }
+
+        @Override
+        public @Nullable RelDataType deriveDecimalMultiplyType(
+                RelDataTypeFactory factory, RelDataType type1, RelDataType type2) {
+            if (!applies(type1, type2))
+                return null;
+            int p1 = precision(type1), s1 = type1.getScale();
+            int p2 = precision(type2), s2 = type2.getScale();
+            return nullable(factory, adjust(factory, p1 + p2 + 1, s1 + s2), type1, type2);
+        }
+
+        @Override
+        public @Nullable RelDataType deriveDecimalDivideType(
+                RelDataTypeFactory factory, RelDataType type1, RelDataType type2) {
+            if (!applies(type1, type2))
+                return null;
+            int p1 = precision(type1), s1 = type1.getScale();
+            int p2 = precision(type2), s2 = type2.getScale();
+            int intDigits = p1 - s1 + s2;
+            int scale = Math.max(MINIMUM_ADJUSTED_SCALE, s1 + p2 + 1);
+            return nullable(factory, adjust(factory, intDigits + scale, scale), type1, type2);
+        }
+
+        @Override
+        public @Nullable RelDataType deriveDecimalModType(
+                RelDataTypeFactory factory, RelDataType type1, RelDataType type2) {
+            if (!applies(type1, type2))
+                return null;
+            int p1 = precision(type1), s1 = type1.getScale();
+            int p2 = precision(type2), s2 = type2.getScale();
+            int scale = Math.max(s1, s2);
+            return nullable(factory, adjust(factory, Math.min(p1 - s1, p2 - s2) + scale, scale), type1, type2);
+        }
+
+        @Override
+        public RelDataType deriveSumType(RelDataTypeFactory factory, RelDataType argumentType) {
+            RelDataType result = switch (argumentType.getSqlTypeName()) {
+                case TINYINT, SMALLINT, INTEGER, BIGINT -> factory.createSqlType(SqlTypeName.BIGINT);
+                case DECIMAL -> factory.createSqlType(SqlTypeName.DECIMAL,
+                        Math.min(MAX, argumentType.getPrecision() + 10), argumentType.getScale());
+                case REAL, FLOAT, DOUBLE -> factory.createSqlType(SqlTypeName.DOUBLE);
+                default -> null;
+            };
+            if (result == null)
+                return super.deriveSumType(factory, argumentType);
+            return factory.createTypeWithNullability(result, argumentType.isNullable());
+        }
+
+        @Override
+        public RelDataType deriveAvgAggType(RelDataTypeFactory factory, RelDataType argumentType) {
+            RelDataType result = switch (argumentType.getSqlTypeName()) {
+                case TINYINT, SMALLINT, INTEGER, BIGINT, REAL, FLOAT, DOUBLE ->
+                        factory.createSqlType(SqlTypeName.DOUBLE);
+                case DECIMAL -> factory.createSqlType(SqlTypeName.DECIMAL,
+                        Math.min(MAX, argumentType.getPrecision() + 4),
+                        Math.min(MAX, argumentType.getScale() + 4));
+                default -> null;
+            };
+            if (result == null)
+                return super.deriveAvgAggType(factory, argumentType);
+            return factory.createTypeWithNullability(result, argumentType.isNullable());
+        }
+    }
+
+    public static final RelDataTypeSystem SPARK_TYPE_SYSTEM = new SparkTypeSystem();
 
     public void emptyStatement() {
         this.newlines.append("\n");
@@ -493,8 +615,8 @@ public class SqlToRelCompiler implements IWritesLogs {
         static int currentId = 0;
         public final int id;
 
-        CustomTypeFactory() {
-            super(TYPE_SYSTEM);
+        CustomTypeFactory(boolean sparkCompat) {
+            super(sparkCompat ? SPARK_TYPE_SYSTEM : TYPE_SYSTEM);
             this.id = currentId++;
         }
 
@@ -557,7 +679,7 @@ public class SqlToRelCompiler implements IWritesLogs {
 
     // A new typeFactory will be created for each program compiled.
     // Useful when compiling together many tests.
-    public final CustomTypeFactory typeFactory = new CustomTypeFactory();
+    public final CustomTypeFactory typeFactory;
 
     /** Invoked when front-end compilation is finished, to do additional validation */
     public void endCompilation(IErrorReporter reporter) {
@@ -869,13 +991,31 @@ public class SqlToRelCompiler implements IWritesLogs {
         }
     }
 
-    /** Replace calls to SqlCastIOperator which are SAFE_CASTS with calls to SqlSafeCastOperator */
+    /** Replace calls to SqlCastIOperator which are SAFE_CASTS with calls to SqlSafeCastOperator.
+     * In Spark compatibility mode a CAST to DECIMAL also becomes a SAFE_CAST,
+     * since Spark returns NULL when the value does not fit. */
     static class ReplaceSafeCasts extends SqlShuttle {
+        final boolean sparkCompat;
+
+        ReplaceSafeCasts(boolean sparkCompat) {
+            this.sparkCompat = sparkCompat;
+        }
+
+        static boolean isDecimalCast(SqlCall call) {
+            if (call.getOperator().kind != SqlKind.CAST || call.operandCount() != 2)
+                return false;
+            if (!(call.operand(1) instanceof SqlDataTypeSpec spec))
+                return false;
+            String name = spec.getTypeName().getSimple().toUpperCase(Locale.ROOT);
+            return name.equals("DECIMAL") || name.equals("NUMERIC") || name.equals("DEC");
+        }
+
         @Override
         public @org.checkerframework.checker.nullness.qual.Nullable SqlNode visit(SqlCall call) {
             SqlCall newCall = Objects.requireNonNull((SqlCall) super.visit(call));
-            if (newCall.getOperator().kind == SqlKind.SAFE_CAST) {
-                return SqlSafeCastFunction.INSTANCE.createCall(call.getParserPosition(), call.getOperandList());
+            if (newCall.getOperator().kind == SqlKind.SAFE_CAST ||
+                    (this.sparkCompat && isDecimalCast(newCall))) {
+                return SqlSafeCastFunction.INSTANCE.createCall(call.getParserPosition(), newCall.getOperandList());
             }
             return newCall;
         }
@@ -923,7 +1063,7 @@ public class SqlToRelCompiler implements IWritesLogs {
         }
         ReplacePositions replace = new ReplacePositions(!saveLines);
         node = Objects.requireNonNull(replace.visitNode(node));
-        ReplaceSafeCasts replace1 = new ReplaceSafeCasts();
+        ReplaceSafeCasts replace1 = new ReplaceSafeCasts(this.options.languageOptions.sparkCompat);
         node = Objects.requireNonNull(replace1.visitNode(node));
         ReplaceAggregates replace2 = new ReplaceAggregates();
         node = Objects.requireNonNull(replace2.visitNode(node));
