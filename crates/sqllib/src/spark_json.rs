@@ -80,7 +80,31 @@ pub fn spark_json_scalar<T: DeserializeOwned>(json: Option<&RawValue>) -> Option
 }
 
 pub fn spark_json_text(json: Option<&RawValue>) -> Option<SqlString> {
-    spark_text(json?.get()).map(SqlString::from)
+    let raw = json?.get();
+    match raw.as_bytes().first()? {
+        b'n' => None,
+        b'"' => serde_json::from_str(raw).ok(),
+        b'[' | b'{' => {
+            // RawValue is validated JSON. Strip only insignificant whitespace, retaining object
+            // member order, number precision and whitespace/escapes within quoted strings.
+            let mut out = String::with_capacity(raw.len());
+            let (mut quoted, mut escaped) = (false, false);
+            for c in raw.chars() {
+                if quoted || !c.is_ascii_whitespace() {
+                    out.push(c);
+                }
+                if escaped {
+                    escaped = false;
+                } else if quoted && c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    quoted = !quoted;
+                }
+            }
+            Some(out.into())
+        }
+        _ => Some(SqlString::from_ref(raw)),
+    }
 }
 
 thread_local! {
@@ -311,4 +335,26 @@ pub fn spark_json_write_map<T: Clone>(
         })
         .join(",");
     Some(format!("{{{members}}}").into())
+}
+
+#[cfg(test)]
+mod test {
+    use super::{from_json_string, spark_from_json_string};
+    use crate::SqlString;
+
+    #[test]
+    fn spark_coercion_does_not_leak_into_default_deserialization() {
+        assert!(from_json_string::<SqlString>("true").is_none());
+        assert_eq!(
+            spark_from_json_string::<SqlString>("true"),
+            Some(SqlString::from_ref("true"))
+        );
+        assert!(from_json_string::<SqlString>("true").is_none());
+        assert!(spark_from_json_string::<SqlString>("{").is_none());
+        assert!(from_json_string::<SqlString>("true").is_none());
+        assert_eq!(
+            from_json_string::<SqlString>("\"text\""),
+            Some(SqlString::from_ref("text"))
+        );
+    }
 }
