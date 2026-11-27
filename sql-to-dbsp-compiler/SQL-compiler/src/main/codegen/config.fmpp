@@ -517,7 +517,7 @@ data: {
 #     "CURSOR"
       "CYCLE"
       "DATA"
-#     "DATE"
+      "DATE"
       "DATETIME_DIFF"
       "DAY"
       "DAYOFWEEK"
@@ -917,6 +917,8 @@ data: {
     # Return type of method implementation should be "SqlNode".
     literalParserMethods: [
     ]
+
+    defaultRowFieldNullable: "this.conformance == org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.SqlToRelCompiler.SPARK_PARSER_CONFORMANCE"
 
     # List of methods for parsing custom data types.
     dataTypeParserMethods: [

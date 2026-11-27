@@ -238,6 +238,8 @@ import static org.apache.calcite.util.Static.RESOURCE;
  *   Optimize is called automatically from compile().
  */
 public class SqlToRelCompiler implements IWritesLogs {
+    public static final SqlConformance SPARK_PARSER_CONFORMANCE = new SqlDelegatingConformance(SqlConformanceEnum.LENIENT) {};
+
     private final CompilerOptions options;
     private final SqlParser.Config parserConfig;
     private final Catalog calciteCatalog;
@@ -348,7 +350,7 @@ public class SqlToRelCompiler implements IWritesLogs {
                 .withParserFactory(DbspParserImpl.FACTORY)
                 .withUnquotedCasing(UNQUOTED_CASING)
                 .withQuotedCasing(Casing.UNCHANGED)
-                .withConformance(SqlConformanceEnum.LENIENT);
+                .withConformance(options.languageOptions.sparkCompat ? SPARK_PARSER_CONFORMANCE : SqlConformanceEnum.LENIENT);
         this.calciteCatalog = new Catalog("schema");
         this.rootSchema = CalciteSchema.createRootSchema(false, false).plus();
         this.rootSchema.add(calciteCatalog.schemaName, this.calciteCatalog);
