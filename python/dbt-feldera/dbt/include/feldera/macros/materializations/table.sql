@@ -9,13 +9,21 @@
     {%- set pipeline_name = config.get('pipeline_name', model.schema) -%}
     {%- set table_name = this.identifier -%}
     {%- set connectors = config.get('connectors', []) -%}
+    {%- set stored = config.get('stored', false) -%}
+    {%- set table_options = [] -%}
+    {%- if stored -%}
+        {%- do table_options.append("'materialized' = 'true'") -%}
+    {%- endif -%}
+    {%- if connectors -%}
+        {%- do table_options.append("'connectors' = '" ~ (connectors | tojson) ~ "'") -%}
+    {%- endif -%}
 
     {%- set table_sql -%}
         CREATE TABLE {{ this }} (
             {{ sql }}
         )
-        {%- if connectors %}
-        WITH ('connectors' = '{{ connectors | tojson }}')
+        {%- if table_options %}
+        WITH ({{ table_options | join(', ') }})
         {%- endif %}
     {%- endset -%}
 

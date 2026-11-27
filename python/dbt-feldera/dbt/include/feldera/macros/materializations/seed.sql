@@ -14,6 +14,7 @@
     {%- set table_name = model.name -%}
     {%- set column_override = model['config'].get('column_types', {}) -%}
     {%- set quote_seed_column = model['config'].get('quote_columns', none) -%}
+    {%- set stored = model['config'].get('stored', false) -%}
 
     {# Build column definitions from agate table schema #}
     {%- set column_defs = [] -%}
@@ -30,7 +31,7 @@
         CREATE TABLE "{{ table_name }}" (
             {{ column_defs | join(', ') }}
         )
-        {% if var('feldera_safe_seed_reuse', false) %}
+        {% if stored %}
         WITH ('materialized' = 'true')
         {% endif %}
     {%- endset -%}
