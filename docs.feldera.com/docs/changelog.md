@@ -10,6 +10,8 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- dbt-feldera isolated unit tests preserve profile storage settings without
+  adding storage bounds or implicitly enabling storage autoscaling.
 - With Spark compatibility, `jsonstring_as_<type>` reads non-string JSON values into `VARCHAR`
   fields as JSON text instead of returning `NULL`. Default deserialization and `FROM_JSON` are unchanged.
 - `CONCAT_WS` no longer inserts a separator before the first non-null string when earlier arguments are null.

@@ -17,7 +17,7 @@ from feldera.enums import CompilationProfile, PipelineStatus, ProgramStatus
 from feldera.pipeline import Pipeline
 from feldera.pipeline_builder import PipelineBuilder
 from feldera.rest.errors import FelderaAPIError
-from feldera.runtime_config import Resources, RuntimeConfig, _parse_size_bytes
+from feldera.runtime_config import RuntimeConfig
 
 _NOW_INPUT = {
     "name": "now",
@@ -123,17 +123,6 @@ def _agate_type(column):
 def _unit_runtime_config(runtime_config):
     config = deepcopy(runtime_config or {})
     config.setdefault("workers", 1)
-    resources = config.setdefault("resources", {})
-    sizes = Resources(config=resources)
-    minimum = max(200_000_000_000, _parse_size_bytes(sizes.storage_min or "0"))
-    for old_key, new_key in (("storage_mb_min", "storage_min"), ("storage_mb_max", "storage_max")):
-        floor = 200_000_000_000 if new_key == "storage_min" else minimum
-        if _parse_size_bytes(getattr(sizes, new_key) or "0") < floor:
-            megabytes = -(-floor // 1_000_000)
-            if new_key in resources:
-                resources[new_key] = f"{megabytes}M"
-            else:
-                resources[old_key] = megabytes
     return RuntimeConfig.from_dict(config)
 
 
