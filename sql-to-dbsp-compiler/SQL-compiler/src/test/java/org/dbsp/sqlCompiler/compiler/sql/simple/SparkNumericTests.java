@@ -78,4 +78,105 @@ public class SparkNumericTests extends SqlIoTest {
                  129023.45
                 (1 row)""");
     }
+    @Test
+    public void integralDivisionAndOverflow() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(a BIGINT NOT NULL, b BIGINT NOT NULL, i INT NOT NULL);
+                CREATE VIEW V AS SELECT a/b AS q, a/b IS NULL AS n, i+1 AS s, i*2 AS p FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES (1,2,2147483647),(-1,2,2147483647),(1,0,1)", """
+                 q | n | s | p
+                ---------------
+                 0.5 | false | -2147483648 | -2
+                 -0.5 | false | -2147483648 | -2
+                 NULL | true | 2 | 2""");
+        this.qs("""
+                SELECT 1/2 AS q, 1/0 AS n;
+                 q | n
+                -------
+                 0.5 | NULL
+                (1 row)""");
+    }
+
+    @Test
+    public void decimalArithmeticNullability() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(a DECIMAL(38,0) NOT NULL, b DECIMAL(38,0) NOT NULL);
+                CREATE VIEW V AS SELECT a+b AS s, a-b AS d, a*b AS p, a/b AS q, a/b IS NULL AS n FROM T;""");
+        ccs.stepWeightOne("""
+                INSERT INTO T VALUES (99999999999999999999999999999999999999,1),
+                                     (1,0),(-99999999999999999999999999999999999999,2)""", """
+                 s | d | p | q | n
+                -----------------
+                 NULL | 99999999999999999999999999999999999998 | 99999999999999999999999999999999999999 | NULL | true
+                 1 | 1 | 0 | NULL | true
+                 -99999999999999999999999999999999999997 | NULL | NULL | NULL | true""");
+    }
+
+    @Test
+    public void decimalAddSubtractHalfUp() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(a DECIMAL(38,10) NOT NULL, b DECIMAL(38,10) NOT NULL);
+                CREATE VIEW V AS SELECT a+b AS s, a-b AS d FROM T;""");
+        ccs.stepWeightOne("""
+                INSERT INTO T VALUES (0.0000000005,0),(-0.0000000005,0),
+                                     (0.0000000006,0.0000000004)""", """
+                 s | d
+                -------
+                 0.000000001 | 0.000000001
+                 -0.000000001 | -0.000000001
+                 0.000000001 | 0""");
+    }
+
+    @Test
+    public void stringToIntegerNonAnsi() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(s VARCHAR NOT NULL);
+                CREATE VIEW V AS SELECT CAST(s AS TINYINT) AS b, CAST(s AS SMALLINT) AS s,
+                  CAST(s AS INT) AS i, CAST(s AS BIGINT) AS l, CAST(s AS INT) IS NULL AS n FROM T;""");
+        ccs.stepWeightOne("""
+                INSERT INTO T VALUES ('1.9'),('-1.9'),('.'),('  +12  '),('1e2'),
+                  ('128'),('32768'),('2147483648'),('9223372036854775808'),
+                  ('9223372036854775807.9'),('-2147483648.9')""", """
+                 b | s | i | l | n
+                -------------------
+                 1 | 1 | 1 | 1 | false
+                 -1 | -1 | -1 | -1 | false
+                 0 | 0 | 0 | 0 | false
+                 12 | 12 | 12 | 12 | false
+                 NULL | NULL | NULL | NULL | true
+                 NULL | 128 | 128 | 128 | false
+                 NULL | NULL | 32768 | 32768 | false
+                 NULL | NULL | NULL | 2147483648 | true
+                 NULL | NULL | NULL | NULL | true
+                 NULL | NULL | NULL | 9223372036854775807 | true
+                 NULL | NULL | -2147483648 | -2147483648 | false""");
+        this.qs("""
+                SELECT CAST('1.9' AS INT) AS i, CAST('1e2' AS INT) AS n;
+                 i | n
+                -------
+                 1 | NULL
+                (1 row)""");
+    }
+
+    @Test
+    public void decimalAverageSingleRounding() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(g INT, a DECIMAL(10,2), b DECIMAL(38,36), c DECIMAL(38,0));
+                CREATE VIEW V AS SELECT g, AVG(a) AS a, AVG(b) AS b, AVG(c) AS c,
+                  AVG(a) FILTER (WHERE a > 0) AS f, AVG(DISTINCT a) AS d FROM T GROUP BY g;""");
+        ccs.stepWeightOne("""
+                INSERT INTO T VALUES
+                  (1,1,0.123456789012345678901234567890123456,1),
+                  (1,0,0.123456789012345678901234567890123457,1),
+                  (2,1,NULL,99999999999999999999999999999999999999),
+                  (2,0,NULL,99999999999999999999999999999999999999),
+                  (2,0,NULL,NULL),
+                  (3,NULL,NULL,NULL)""", """
+                 g | a | b | c | f | d
+                ----------------------
+                 1 | 0.5 | 0.12345678901234567890123456789012345650 | 1 | 1 | 0.5
+                 2 | 0.333333 | NULL | NULL | 1 | 0.5
+                 3 | NULL | NULL | NULL | NULL | NULL""");
+    }
+
 }
