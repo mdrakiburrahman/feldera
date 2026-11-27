@@ -289,7 +289,7 @@ public class CalciteSqlOperatorTest extends SqlIoTest {
                 ----
                  x
                 \s
-                 NULL
+                NULL
                  ,x
                 (4 rows)""");
     }
