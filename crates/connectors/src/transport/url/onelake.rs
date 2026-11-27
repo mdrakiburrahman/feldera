@@ -1,4 +1,4 @@
-use crate::{InputBuffer, InputConsumer, InputReader, InputReaderCommand, Parser};
+use crate::{InputBuffer, InputConsumer, InputReader, Parser};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
 use deltalake::logstore::object_store::{
@@ -6,7 +6,7 @@ use deltalake::logstore::object_store::{
 };
 use feldera_adapterlib::{
     format::{BufferSize, StreamSplitter},
-    transport::{InputCommandReceiver, Resume, Watermark},
+    transport::{InputCommandReceiver, InputReaderCommand, Resume, Watermark},
 };
 use feldera_storage::tokio::TOKIO;
 use futures::TryStreamExt;
@@ -194,7 +194,7 @@ struct Metadata {
     chunks: Vec<Chunk>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Chunk {
     path: String,
     start: u64,
@@ -505,5 +505,408 @@ impl InputReader for Reader {
 impl Drop for Reader {
     fn drop(&mut self) {
         self.disconnect();
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+pub mod test {
+    use super::*;
+    use crate::test::{
+        MockInputConsumer, async_wait, engine_test, parser, published_schema, run_async_on,
+    };
+    use deltalake::logstore::object_store::{ObjectStoreExt, memory::InMemory};
+    use feldera_adapterlib::test::{ConnectorTestEngine, InputOptions, Updates};
+    use feldera_types::{
+        config::FormatConfig,
+        program_schema::{ColumnType, Field, Relation},
+    };
+    use serde_json::json;
+    use std::sync::Mutex;
+    use wiremock::{
+        Mock, MockServer, Request, ResponseTemplate,
+        matchers::{header, method, path, query_param},
+    };
+
+    const URI: &str = "abfss://workspace@onelake.dfs.fabric.microsoft.com/lakehouse/Files/inbox";
+
+    fn relation() -> Relation {
+        Relation::new(
+            "events".into(),
+            vec![
+                Field::new("id".into(), ColumnType::bigint(false)),
+                Field::new("msg".into(), ColumnType::varchar(true)),
+            ],
+            false,
+            BTreeMap::new(),
+        )
+    }
+
+    fn format() -> FormatConfig {
+        FormatConfig {
+            name: "json".into(),
+            config: json!({"update_format": "raw"}),
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Consumer {
+        inner: MockInputConsumer,
+        checkpoints: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl InputConsumer for Consumer {
+        fn error(&self, fatal: bool, error: anyhow::Error, tag: Option<&'static str>) {
+            self.inner.error(fatal, error, tag);
+        }
+        fn eoi(&self) {
+            self.inner.eoi();
+        }
+        fn max_batch_size(&self) -> usize {
+            self.inner.max_batch_size()
+        }
+        fn pipeline_fault_tolerance(&self) -> Option<feldera_types::config::FtModel> {
+            self.inner.pipeline_fault_tolerance()
+        }
+        fn parse_errors(&self, errors: Vec<feldera_adapterlib::format::ParseError>) {
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+        fn buffered(&self, amount: BufferSize) {
+            self.inner.buffered(amount);
+        }
+        fn replayed(&self, amount: BufferSize, hash: u64) {
+            self.inner.replayed(amount, hash);
+        }
+        fn request_step(&self) {}
+        fn extended(&self, amount: BufferSize, resume: Option<Resume>, watermarks: Vec<Watermark>) {
+            self.checkpoints
+                .lock()
+                .unwrap()
+                .push(resume.unwrap().metadata);
+            self.inner.extended(amount, None, watermarks);
+        }
+    }
+
+    fn listing(files: &[(&str, usize, &str)], marker: &str) -> String {
+        let blobs: String = files
+            .iter()
+            .map(|(name, size, modified)| {
+                format!(
+                    "<Blob><Name>lakehouse/Files/{name}</Name><Properties>\
+             <Last-Modified>{modified}</Last-Modified><Content-Length>{size}</Content-Length>\
+             <Content-Type>application/json</Content-Type><Etag>&quot;v1&quot;</Etag>\
+             </Properties></Blob>"
+                )
+            })
+            .collect();
+        format!(
+            "<EnumerationResults><Blobs>{blobs}</Blobs><NextMarker>{marker}</NextMarker></EnumerationResults>"
+        )
+    }
+
+    #[engine_test]
+    pub fn paginated_snapshot_json_and_no_mutations(engine: &dyn ConnectorTestEngine) {
+        run_async_on(2, async {
+            crate::ensure_default_crypto_provider();
+            let server = MockServer::start().await;
+            let a = "{\"id\":1,\"msg\":\"one\"}\n{\"id\":2,\"msg\":null}";
+            let b = "{\"id\":3,\"msg\":\"nested\"}";
+            let recent = "Mon, 23 Nov 2026 00:00:00 GMT";
+            let old = "Sun, 01 Nov 2026 00:00:00 GMT";
+            let page1 = listing(
+                &[
+                    ("inbox/a.json", a.len(), recent),
+                    ("inbox/_application.json.tmp", 0, recent),
+                    ("inbox/.hidden.json", 10, recent),
+                    ("inbox/sub/unfinished.json.tmp", 0, recent),
+                    ("inbox/old.json", 10, old),
+                ],
+                "page2",
+            );
+            let page2 = listing(
+                &[
+                    ("inbox/sub/b.json", b.len(), recent),
+                    ("inbox/empty.json", 0, recent),
+                    ("inbox/wrong.txt", 10, recent),
+                    ("inbox-other/leak.json", 10, recent),
+                    ("inbox/_temporary/leak.json", 10, recent),
+                ],
+                "",
+            );
+            Mock::given(method("GET"))
+                .and(path("/workspace"))
+                .and(query_param("comp", "list"))
+                .and(header("authorization", "Bearer test-token"))
+                .respond_with(move |request: &Request| {
+                    let page = if request
+                        .url
+                        .query_pairs()
+                        .any(|(k, v)| k == "marker" && v == "page2")
+                    {
+                        &page2
+                    } else {
+                        &page1
+                    };
+                    ResponseTemplate::new(200)
+                        .set_body_string(page)
+                        .insert_header("content-type", "application/xml")
+                })
+                .expect(2)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/token"))
+                .and(query_param("client_id", "test-client"))
+                .and(query_param("resource", "https://storage.azure.com/"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": "test-token",
+                    "expires_on": (Utc::now().timestamp() + 3600).to_string(),
+                    "token_type": "Bearer"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            for (name, body) in [("a.json", a), ("sub/b.json", b)] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/workspace/lakehouse/Files/inbox/{name}")))
+                    .and(header("if-match", "\"v1\""))
+                    .respond_with(
+                        ResponseTemplate::new(206)
+                            .insert_header("etag", "\"v1\"")
+                            .insert_header("last-modified", recent)
+                            .insert_header(
+                                "content-range",
+                                format!("bytes 0-{}/{}", body.len() - 1, body.len()),
+                            )
+                            .set_body_string(body),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let config = Config::parse(&format!("{URI}?glob=**%2F*.json&modified_since=2026-11-20T00%3A00%3A00Z&client_id=test-client")).unwrap();
+            let store = config
+                .builder(Some(format!("{}/token", server.uri())))
+                .with_endpoint(server.uri())
+                .with_allow_http(true)
+                .build()
+                .unwrap();
+            let collection = engine
+                .input_collection(&relation(), &InputOptions::default())
+                .unwrap();
+            let parser = parser(collection.as_ref(), &format());
+            let consumer = Consumer::default();
+            consumer.inner.on_error(Some(Box::new(|_, _| {})));
+            let reader = Reader::new(
+                config,
+                Arc::new(store),
+                Box::new(consumer.clone()),
+                Box::new(parser),
+                None,
+            )
+            .unwrap();
+            reader.extend();
+            async_wait(
+                || {
+                    reader.queue(false);
+                    consumer.inner.state().eoi && collection.len() == 3
+                },
+                10000,
+            )
+            .await
+            .unwrap();
+            assert!(
+                consumer.inner.get_error().is_none(),
+                "{:?}",
+                consumer.inner.get_error()
+            );
+            assert_eq!(
+                collection.updates().unwrap(),
+                Updates::from_json(
+                    published_schema(&relation()),
+                    &[
+                        (1, a.lines().next().unwrap()),
+                        (1, a.lines().nth(1).unwrap()),
+                        (1, b),
+                    ]
+                )
+                .unwrap()
+            );
+            drop(reader);
+            server.verify().await;
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 5);
+            assert!(requests.iter().all(|r| r.method.as_str() == "GET"));
+        });
+    }
+
+    #[engine_test]
+    pub fn checkpoint_replay_and_follow_new_paths(engine: &dyn ConnectorTestEngine) {
+        run_async_on(2, async {
+            let store = Arc::new(InMemory::new());
+            let first = Path::from("lakehouse/Files/inbox/z.json");
+            let body = "{\"id\":1,\"msg\":\"first\"}";
+            store
+                .put(&first, bytes::Bytes::from_static(body.as_bytes()).into())
+                .await
+                .unwrap();
+            let open = |follow, seek| {
+                let config =
+                    Config::parse(&format!("{URI}?follow={follow}&poll_interval_secs=1")).unwrap();
+                let collection = engine
+                    .input_collection(&relation(), &InputOptions::default())
+                    .unwrap();
+                let parser = parser(collection.as_ref(), &format());
+                let consumer = Consumer::default();
+                let reader = Reader::new(
+                    config,
+                    store.clone(),
+                    Box::new(consumer.clone()),
+                    Box::new(parser),
+                    seek,
+                )
+                .unwrap();
+                (reader, consumer, collection)
+            };
+            let (reader, consumer, collection) = open(false, None);
+            reader.extend();
+            async_wait(
+                || {
+                    reader.queue(false);
+                    consumer.inner.state().eoi && collection.len() == 1
+                },
+                5000,
+            )
+            .await
+            .unwrap();
+            let checkpoint = consumer.checkpoints.lock().unwrap().last().unwrap().clone();
+            drop(reader);
+            let (reader, consumer, collection) = open(false, None);
+            reader.request(InputReaderCommand::Replay {
+                metadata: checkpoint.clone(),
+                data: rmpv::Value::Nil,
+            });
+            reader.extend();
+            async_wait(
+                || {
+                    reader.queue(false);
+                    consumer.inner.state().eoi && collection.len() == 1
+                },
+                5000,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                collection.updates().unwrap(),
+                Updates::from_json(published_schema(&relation()), &[(1, body)]).unwrap()
+            );
+            drop(reader);
+            let second = Path::from("lakehouse/Files/inbox/a.json");
+            store
+                .put(
+                    &second,
+                    bytes::Bytes::from_static(b"{\"id\":2,\"msg\":\"late\"}").into(),
+                )
+                .await
+                .unwrap();
+            let (reader, consumer, collection) = open(false, Some(checkpoint.clone()));
+            reader.extend();
+            async_wait(
+                || {
+                    reader.queue(false);
+                    consumer.inner.state().eoi
+                },
+                5000,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                collection.len(),
+                0,
+                "snapshot recovery must not include later paths"
+            );
+            drop(reader);
+            let (reader, consumer, collection) = open(true, Some(checkpoint));
+            reader.extend();
+            async_wait(
+                || {
+                    reader.queue(false);
+                    collection.len() == 1
+                },
+                5000,
+            )
+            .await
+            .unwrap();
+            assert!(!consumer.inner.state().eoi);
+            assert_eq!(
+                collection.updates().unwrap(),
+                Updates::from_json(
+                    published_schema(&relation()),
+                    &[(1, "{\"id\":2,\"msg\":\"late\"}")]
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                store.get(&first).await.unwrap().bytes().await.unwrap(),
+                body
+            );
+            assert!(store.head(&second).await.is_ok());
+            drop(reader);
+        });
+    }
+
+    #[engine_test]
+    pub fn rejects_changed_files_and_invalid_options(engine: &dyn ConnectorTestEngine) {
+        run_async_on(2, async {
+            for suffix in [
+                "?follow=yes",
+                "?follow=true&follow=false",
+                "?poll_interval_secs=0",
+                "?glob=[",
+                "?modified_since=yesterday",
+                "?token=secret",
+            ] {
+                assert!(
+                    Config::parse(&format!("{URI}{suffix}")).is_err(),
+                    "{suffix}"
+                );
+            }
+            for uri in [
+                URI.replace("/Files/", "/Tables/"),
+                URI.replace("onelake.dfs.fabric.microsoft.com", "example.com"),
+            ] {
+                assert!(Config::parse(&uri).is_err());
+            }
+            assert!(Config::parse(&URI.replace("@onelake.", "@msit-onelake.")).is_ok());
+            let store = Arc::new(InMemory::new());
+            let path = Path::from("lakehouse/Files/inbox/a.json");
+            store
+                .put(&path, bytes::Bytes::from_static(b"{\"id\":1}").into())
+                .await
+                .unwrap();
+            let collection = engine
+                .input_collection(&relation(), &InputOptions::default())
+                .unwrap();
+            let parser = parser(collection.as_ref(), &format());
+            let mut source = Source::new(
+                Config::parse(URI).unwrap(),
+                store.clone(),
+                State::default(),
+                &parser,
+            )
+            .unwrap();
+            source.list().await.unwrap();
+            store
+                .put(&path, bytes::Bytes::from_static(b"{\"id\":2}").into())
+                .await
+                .unwrap();
+            assert!(
+                source
+                    .next()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reading immutable OneLake")
+            );
+        });
     }
 }
