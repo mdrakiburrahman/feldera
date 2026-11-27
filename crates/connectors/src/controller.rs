@@ -3857,6 +3857,13 @@ impl CircuitThread {
                 .as_ref()
                 .and_then(|request| request.seq);
             let step_selection = self.next_step_selection(coordination_request.as_ref());
+            trigger.note_checkpoint_barriers(
+                self.controller
+                    .status
+                    .input_status()
+                    .values()
+                    .any(|status| status.is_barrier()),
+            );
             let action = trigger.trigger(
                 self.last_checkpoint(),
                 self.last_checkpoint_sync(),
@@ -6266,6 +6273,21 @@ struct StepTrigger {
 
     /// Time between automatic checkpoint syncs.
     sync_interval: Option<Duration>,
+
+    /// Whether an input endpoint was a checkpoint barrier the last time
+    /// [Self::note_checkpoint_barriers] was called.
+    had_checkpoint_barriers: bool,
+
+    /// Whether this pipeline's checkpoint barriers have cleared since its last
+    /// step.
+    ///
+    /// A coordinator that steps a multihost pipeline past checkpoint barriers
+    /// sends [StepAction::Trigger] with [StepInputs::CheckpointBarriers]. If
+    /// the step that cleared this host's last barrier finishes after the
+    /// coordinator decided on that request, no input can trigger it any more,
+    /// and the host and its coordinator would wait for each other forever.
+    /// One step then reports the cleared barriers instead.
+    checkpoint_barriers_cleared: bool,
 }
 
 /// Action for the controller to take.
@@ -6359,7 +6381,19 @@ impl StepTrigger {
             min_batch_size_records,
             checkpoint_interval,
             sync_interval,
+            had_checkpoint_barriers: false,
+            checkpoint_barriers_cleared: false,
         }
+    }
+
+    /// Records whether any input endpoint is currently a checkpoint barrier.
+    fn note_checkpoint_barriers(&mut self, present: bool) {
+        if present {
+            self.checkpoint_barriers_cleared = false;
+        } else if self.had_checkpoint_barriers {
+            self.checkpoint_barriers_cleared = true;
+        }
+        self.had_checkpoint_barriers = present;
     }
 
     /// Determines when to trigger the next step, given:
@@ -6422,6 +6456,10 @@ impl StepTrigger {
                     if self.controller.status.unset_step_requested() {
                         // The `clock` connector requests steps explicitly.
                         Some(Action::Step)
+                    } else if self.checkpoint_barriers_cleared
+                        && step_selection.inputs == StepInputs::CheckpointBarriers
+                    {
+                        Some(Action::Step)
                     } else {
                         None
                     }
@@ -6483,6 +6521,7 @@ impl StepTrigger {
 
         if result == Action::Step {
             self.buffer_timeout = None;
+            self.checkpoint_barriers_cleared = false;
         }
 
         result
