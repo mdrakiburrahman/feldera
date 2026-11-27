@@ -5,6 +5,7 @@ import org.dbsp.sqlCompiler.compiler.errors.CompilationError;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPArrayExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPCastExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPTupleExpression;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPBoolLiteral;
@@ -28,10 +29,11 @@ class SparkJsonCompiler {
     private static final DBSPType ANY = DBSPTypeAny.getDefault();
 
     static DBSPExpression namedStruct(CalciteObject node, DBSPType type, List<DBSPExpression> ops) {
+        DBSPTypeTuple tuple = type.to(DBSPTypeTuple.class);
         List<DBSPExpression> values = new ArrayList<>();
         for (int i = 1; i < ops.size(); i += 2)
-            values.add(ops.get(i));
-        return new DBSPTupleExpression(node, type.to(DBSPTypeTuple.class), values);
+            values.add(ops.get(i).cast(node, tuple.getFieldType(i / 2), DBSPCastExpression.CastType.SqlUnsafe));
+        return new DBSPTupleExpression(node, tuple, values);
     }
 
     static DBSPExpression getJsonObject(CalciteObject node, DBSPExpression text, DBSPExpression path) {

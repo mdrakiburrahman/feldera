@@ -75,6 +75,14 @@ returns a structure with a `NULL` value for the `NUMBER` field using
 the first method.  Using the second method all three fields are
 deserialized.
 
+A JSON value that does not match a field's type makes the result of
+`jsonstring_as_<udt>` `NULL`. With Spark compatibility (`--sparkCompat` or
+pipeline `program_config.spark_compat`), a `VARCHAR` field, array element or map
+value instead reads a non-string JSON value as the compact JSON text that
+Spark's `from_json` produces: `30` reads as `'30'`, `1.50` as `'1.5'`, `1e7` as
+`'1.0E7'`, `true` as `'true'`, and `{"a": [1, 2 ]}` as `'{"a":[1,2]}'`. A JSON
+`null` is still SQL `NULL`.
+
 ## The `VARIANT` type
 
 Values of `VARIANT` type are dynamically-typed.
@@ -218,7 +226,8 @@ schema field names **case-sensitively**. Field names may be enclosed in backtick
 in both field lists and nested structs. Double a backtick inside a quoted name
 to represent one literal backtick. Missing fields are SQL `NULL`; extra
 fields are ignored. Null array elements and null map values are preserved.
-Non-string JSON values read into a `STRING` field are returned as JSON text.
+Non-string JSON values read into a `STRING` field are returned as compact JSON
+text, with floating-point numbers written as Spark writes them (`1.50` as `1.5`).
 A value incompatible with a declared leaf type reads as SQL `NULL` at that
 leaf. This does not implement all Spark partial-record recovery behavior for
 malformed nested values.

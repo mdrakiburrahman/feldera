@@ -218,7 +218,8 @@ public class ExternalFunction extends SqlFunction {
             List<DBSPStatement> statements = new ArrayList<>();
             if (parameterType.mayBeNull)
                 statements.add(new DBSPLetStatement("s", param.asVariable().question()));
-            DBSPExpression toStruct = new DBSPApplyExpression("from_json_string",
+            DBSPExpression toStruct = new DBSPApplyExpression(
+                    compiler.options.languageOptions.sparkCompat ? "spark_from_json_string" : "from_json_string",
                     structType.withMayBeNull(true),
                     new DBSPApplyMethodExpression("str",
                             DBSPTypeAny.getDefault(), param.asVariable()));
