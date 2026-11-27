@@ -630,6 +630,14 @@ class FelderaAdapter(BaseAdapter):
             )
 
             pending = _pipeline_state.pop_pending_seeds(pipeline_name)
+            prepared = []
+            for table_name, agate_table, column_types in pending:
+                rows = self._convert_agate_rows(agate_table, column_types)
+                stored = safe_seed_reuse and existing is not None and self._seed_rows_present(
+                    deployed, table_name, rows
+                )
+                prepared.append((table_name, rows, stored))
+
             seed_names = {table_name for table_name, _, _ in pending}
             receipt = None
             if safe_seed_reuse:
@@ -652,10 +660,9 @@ class FelderaAdapter(BaseAdapter):
                     "inputs_before": seed_evidence.summarize_inputs(initial_inputs),
                     "seeds": [],
                 }
-            for table_name, agate_table, column_types in pending:
-                rows = self._convert_agate_rows(agate_table, column_types)
+            for table_name, rows, stored in prepared:
                 ingress = None
-                if rows and (not safe_seed_reuse or existing is None):
+                if rows and not stored:
                     if receipt_hook:
                         prior_identity, prior_inputs, _ = seed_evidence.snapshot(client, pipeline_name, seed_names)
                         if prior_identity != identity:
@@ -666,12 +673,17 @@ class FelderaAdapter(BaseAdapter):
                         current_identity, current_inputs, _ = seed_evidence.snapshot(client, pipeline_name, seed_names)
                         candidates = [
                             (name, entry) for name, entry in current_inputs.items()
-                            if name not in prior_inputs and entry["stream"] == table_name
+                            if entry["stream"] == table_name
                         ]
                         if current_identity != identity or len(candidates) != 1:
                             raise RuntimeError(f"Seed '{table_name}' ingress identity is ambiguous")
                         endpoint_name, entry = candidates[0]
-                        if entry["metrics"].get("total_records") != len(rows):
+                        prior_entry = prior_inputs.get(endpoint_name)
+                        prior_count = (
+                            prior_entry["metrics"]["total_records"]
+                            if prior_entry is not None and prior_entry["stream"] == table_name else 0
+                        )
+                        if entry["metrics"]["total_records"] - prior_count != len(rows):
                             raise RuntimeError(f"Seed '{table_name}' ingress count differs")
                         ingress = {"stream": entry["stream"], "endpoint_name": endpoint_name, "completion_token": token}
                     else:
@@ -685,9 +697,7 @@ class FelderaAdapter(BaseAdapter):
                 if safe_seed_reuse:
                     if receipt_hook:
                         digest = seed_evidence.verify_and_digest(deployed, table_name, rows, descriptor)
-                        outcome = (
-                            "unchanged_reuse" if existing is not None else ("cold_nonempty" if rows else "cold_empty")
-                        )
+                        outcome = "unchanged_reuse" if stored else ("cold_nonempty" if rows else "cold_empty")
                         receipt["seeds"].append({
                             "table": table_name,
                             "outcome": outcome,
@@ -706,15 +716,30 @@ class FelderaAdapter(BaseAdapter):
                 if after_identity != identity:
                     raise RuntimeError(f"Pipeline '{pipeline_name}' changed during seed verification")
                 receipt["inputs_after"] = seed_evidence.summarize_inputs(after_inputs)
-                if existing is not None and receipt["inputs_before"] != receipt["inputs_after"]:
+                retained_seeds = {name for name, _, stored in prepared if stored}
+                before_retained = [
+                    entry for entry in receipt["inputs_before"] if entry["stream"] in retained_seeds
+                ]
+                after_retained = [
+                    entry for entry in receipt["inputs_after"] if entry["stream"] in retained_seeds
+                ]
+                if existing is not None and before_retained != after_retained:
                     raise RuntimeError(f"Pipeline '{pipeline_name}' inputs changed during seed reuse")
                 for item in receipt["seeds"]:
                     if item["ingress"] is not None:
                         endpoint = after_inputs.get(item["ingress"]["endpoint_name"])
+                        prior_count = next(
+                            (
+                                entry["total_records"] for entry in receipt["inputs_before"]
+                                if entry["endpoint_name"] == item["ingress"]["endpoint_name"]
+                            ),
+                            0,
+                        )
                         if (
                             endpoint is None
                             or endpoint["stream"] != item["table"]
-                            or endpoint["metrics"].get("total_records") != item["observed"]["row_count"]
+                            or endpoint["metrics"].get("total_records") - prior_count
+                            != item["observed"]["row_count"]
                         ):
                             raise RuntimeError(f"Seed '{item['table']}' ingress changed during verification")
                 receipts.append(receipt)
@@ -750,7 +775,7 @@ class FelderaAdapter(BaseAdapter):
         return ""
 
     @staticmethod
-    def _verify_seed_rows(pipeline: Pipeline, table_name: str, expected_rows: list) -> None:
+    def _seed_rows_present(pipeline: Pipeline, table_name: str, expected_rows: list) -> bool:
         import pyarrow as pa
         import pyarrow.compute as pc
 
@@ -773,7 +798,17 @@ class FelderaAdapter(BaseAdapter):
                     expected[values] += 1
             for row in batch.to_pylist():
                 actual[tuple(row[field.name] for field in batch.schema)] += 1
-        if (expected_rows and expected is None) or actual != (expected or Counter()):
+        if expected_rows and expected is None:
+            return False
+        if expected_rows and not actual:
+            return False
+        if actual != (expected or Counter()):
+            raise RuntimeError(f"Seed data differs for '{table_name}'; a cold rebuild is required")
+        return True
+
+    @staticmethod
+    def _verify_seed_rows(pipeline: Pipeline, table_name: str, expected_rows: list) -> None:
+        if not FelderaAdapter._seed_rows_present(pipeline, table_name, expected_rows):
             raise RuntimeError(f"Seed data differs for '{table_name}'; a cold rebuild is required")
 
     @available
