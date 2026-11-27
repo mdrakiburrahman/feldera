@@ -2,7 +2,10 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use dbsp::algebra::{F32, F64};
 use num::{Float, PrimInt, Zero};
-use num_traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedNeg, CheckedSub};
+use num_traits::{
+    CheckedAdd, CheckedDiv, CheckedMul, CheckedNeg, CheckedSub, WrappingAdd, WrappingMul,
+    WrappingSub,
+};
 use std::cmp::Ordering;
 
 use crate::{
@@ -240,6 +243,22 @@ where
 }
 
 for_all_int_operator!(plus);
+
+fn spark_wrapping_plus<T: WrappingAdd>(left: T, right: T) -> T {
+    left.wrapping_add(&right)
+}
+
+fn spark_wrapping_minus<T: WrappingSub>(left: T, right: T) -> T {
+    left.wrapping_sub(&right)
+}
+
+fn spark_wrapping_times<T: WrappingMul>(left: T, right: T) -> T {
+    left.wrapping_mul(&right)
+}
+
+for_all_int_operator!(spark_wrapping_plus);
+for_all_int_operator!(spark_wrapping_minus);
+for_all_int_operator!(spark_wrapping_times);
 
 #[doc(hidden)]
 fn fp_plus<T>(left: T, right: T) -> T

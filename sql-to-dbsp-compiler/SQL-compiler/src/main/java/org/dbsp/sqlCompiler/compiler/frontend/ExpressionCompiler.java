@@ -457,6 +457,15 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
         });
     }
 
+    DBSPExpression sparkIntegerArithmetic(CalciteObject node, DBSPType type, List<DBSPExpression> ops, String name) {
+        DBSPExpression left = ops.get(0).cast(node, type.withMayBeNull(ops.get(0).getType().mayBeNull),
+                DBSPCastExpression.CastType.SqlUnsafe);
+        DBSPExpression right = ops.get(1).cast(node, type.withMayBeNull(ops.get(1).getType().mayBeNull),
+                DBSPCastExpression.CastType.SqlUnsafe);
+        return new DBSPApplyExpression(node, "spark_wrapping_" + name + "_" +
+                left.getType().baseTypeWithSuffix() + "_" + right.getType().baseTypeWithSuffix(), type, left, right);
+    }
+
     public static boolean needCommonType(DBSPOpcode opcode, DBSPType result, DBSPType left, DBSPType right) {
         if (opcode == DBSPOpcode.CONCAT) return false;
         if (opcode == DBSPOpcode.SUB && left.is(IsDateType.class) && right.is(IsDateType.class))
@@ -1182,6 +1191,8 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
             case TIMES:
                 if (this.isSparkDecimalArithmetic(type, ops))
                     return makeBinaryExpression(node, type, DBSPOpcode.SPARK_MUL, sparkDecimalOperands(ops));
+                if (this.compiler.options.languageOptions.sparkCompat && type.is(DBSPTypeInteger.class))
+                    return this.sparkIntegerArithmetic(node, type, ops, "times");
                 return makeBinaryExpression(node, type, DBSPOpcode.MUL, ops);
             case CHECKED_DIVIDE:
             case DIVIDE:
@@ -1201,11 +1212,15 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
             case PLUS:
                 if (this.isSparkDecimalArithmetic(type, ops))
                     return makeBinaryExpression(node, type, DBSPOpcode.SPARK_ADD, sparkDecimalOperands(ops));
+                if (this.compiler.options.languageOptions.sparkCompat && type.is(DBSPTypeInteger.class))
+                    return this.sparkIntegerArithmetic(node, type, ops, "plus");
                 return makeBinaryExpressions(node, type, DBSPOpcode.ADD, ops);
             case CHECKED_MINUS:
             case MINUS:
                 if (this.isSparkDecimalArithmetic(type, ops))
                     return makeBinaryExpression(node, type, DBSPOpcode.SPARK_SUB, sparkDecimalOperands(ops));
+                if (this.compiler.options.languageOptions.sparkCompat && type.is(DBSPTypeInteger.class))
+                    return this.sparkIntegerArithmetic(node, type, ops, "minus");
                 return makeBinaryExpression(node, type, DBSPOpcode.SUB, ops);
             case LESS_THAN:
                 return makeBinaryExpression(node, type, DBSPOpcode.LT, ops);
@@ -1246,6 +1261,9 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                 if (op0type.is(DBSPTypeInteger.class) && !op0type.to(DBSPTypeInteger.class).signed) {
                     throw new CompilationError("Unary minus cannot be applied to unsigned values", node);
                 }
+                if (this.compiler.options.languageOptions.sparkCompat && type.is(DBSPTypeInteger.class))
+                    return this.sparkIntegerArithmetic(node, type, List.of(
+                            type.withMayBeNull(false).to(IsNumericType.class).getZero(), ops.get(0)), "minus");
                 return makeUnaryExpression(node, type, DBSPOpcode.NEG, ops);
             case BIT_AND:
                 return makeBinaryExpressions(node, type, DBSPOpcode.BW_AND, ops);

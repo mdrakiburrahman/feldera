@@ -835,7 +835,7 @@ public class ConvertletTable extends ReflectiveConvertletTable {
         else
             type = SqlCastFunction.deriveType(cx.getTypeFactory(), arg.getType(), dataType.deriveType(validator), false);
         if (call.getOperator() == SqlSafeCastFunction.SPARK_CAST &&
-                SqlTypeUtil.isCharacter(arg.getType()) && SqlTypeUtil.isIntType(type)) {
+                SqlTypeUtil.isCharacter(arg.getType()) && SqlSafeCastFunction.SPARK_INTEGER_CASTS.containsKey(type.getSqlTypeName())) {
             return rexBuilder.makeCall(typeFactory.createTypeWithNullability(type, true),
                     SqlSafeCastFunction.SPARK_INTEGER_CASTS.get(type.getSqlTypeName()), List.of(arg));
         }

@@ -808,9 +808,13 @@ public class SqlToRelCompiler implements IWritesLogs {
     }
 
     SqlOperatorTable createOperatorTable() {
+        List<SqlOperator> sparkOperators = new ArrayList<>();
+        if (this.options.languageOptions.sparkCompat) {
+            sparkOperators.addAll(SparkArithmeticFunction.functions());
+            sparkOperators.add(SqlSafeCastFunction.SPARK_CAST);
+        }
         return SqlOperatorTables.chain(
-                new CaseInsensitiveOperatorTable(this.options.languageOptions.sparkCompat
-                        ? SparkArithmeticFunction.functions() : List.of()),
+                new CaseInsensitiveOperatorTable(sparkOperators),
                 CalciteFunctions.INSTANCE.getFunctions(),
                 new CaseInsensitiveOperatorTable(this.customFunctions.getInitialFunctions())
         );

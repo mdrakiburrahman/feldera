@@ -35,7 +35,6 @@ import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.type.SqlOperandCountRanges;
 import org.apache.calcite.sql.type.OperandTypes;
-import java.util.Map;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeMappingRule;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -44,15 +43,15 @@ import org.apache.calcite.sql.validate.SqlValidator;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static java.util.Objects.requireNonNull;
 import static org.apache.calcite.sql.type.SqlTypeUtil.*;
 import static org.apache.calcite.sql.type.SqlTypeUtil.isMap;
 import static org.apache.calcite.util.Static.RESOURCE;
 
-/** Our modified version of SqlCastFunction which does type inference differently for the type argument.
- * Only used for the SAFE_CAST operator.
- * The Calcite SAFE_CAST operator assumes recursively that element/key/value types are all nullable. */
+/** SAFE_CAST preserves nested nullability instead of making all element/key/value types nullable.
+ * The Spark CAST marker also preserves nullable string-to-integer results through conversion. */
 public class SqlSafeCastFunction extends CustomFunctions.NonOptimizedFunction {
     public static final SqlSafeCastFunction INSTANCE = new SqlSafeCastFunction(false);
     public static final SqlSafeCastFunction SPARK_CAST = new SqlSafeCastFunction(true);
@@ -72,7 +71,7 @@ public class SqlSafeCastFunction extends CustomFunctions.NonOptimizedFunction {
             SqlTypeName.BIGINT, new SparkIntegerCast(SqlTypeName.BIGINT));
 
     private SqlSafeCastFunction(boolean sparkCast) {
-        super(sparkCast ? "CAST" : "SAFE_CAST", sparkCast ? SqlKind.CAST : SqlKind.SAFE_CAST,
+        super(sparkCast ? "$SPARK_CAST" : "SAFE_CAST", sparkCast ? SqlKind.CAST : SqlKind.SAFE_CAST,
                 returnTypeInference(sparkCast),
                 null, SqlFunctionCategory.SYSTEM, "casts#safe-casts",
                 "runtime_aggtest/illarg_tests/test_cast.py");
@@ -165,7 +164,7 @@ public class SqlSafeCastFunction extends CustomFunctions.NonOptimizedFunction {
         return opBinding -> {
             assert opBinding.getOperandCount() <= 3;
             if (sparkCast && !(SqlTypeUtil.isCharacter(opBinding.getOperandType(0)) &&
-                    SqlTypeUtil.isIntType(opBinding.getOperandType(1))))
+                    SPARK_INTEGER_CASTS.containsKey(opBinding.getOperandType(1).getSqlTypeName())))
                 return SqlStdOperatorTable.CAST.inferReturnType(opBinding);
             final RelDataType ret = deriveType(opBinding.getTypeFactory(), opBinding.getOperandType(0),
                     opBinding.getOperandType(1));

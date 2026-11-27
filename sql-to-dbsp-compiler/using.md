@@ -212,7 +212,7 @@ Here is a description of the non-obvious command-line options:
 
 --sparkCompat: Use Spark 3.5 non-ANSI SQL semantics, including nullable ROW fields by default.
      Integral `/` produces `DOUBLE`; decimal arithmetic overflow and division by zero
-     produce `NULL`, while integer arithmetic overflow wraps. String-to-integer casts
+     produce `NULL`, while scalar integer arithmetic overflow wraps. String-to-integer casts
      trim whitespace and truncate fractional digits; invalid or out-of-range values
      produce `NULL`. Decimal arithmetic and `AVG` round HALF_UP at the final result
      scale. Decimal `AVG` retains an exact sum, checks Spark's widened sum precision,

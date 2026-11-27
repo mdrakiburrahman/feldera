@@ -28,8 +28,8 @@ public final class SparkArithmeticFunction extends CustomFunctions.NonOptimizedF
     private static RelDataType inferType(SqlOperator operator, SqlOperatorBinding binding) {
         var factory = binding.getTypeFactory();
         if (operator.kind == SqlKind.DIVIDE &&
-                SqlTypeUtil.isIntType(binding.getOperandType(0)) &&
-                SqlTypeUtil.isIntType(binding.getOperandType(1))) {
+                (SqlTypeUtil.isIntType(binding.getOperandType(0)) || binding.getOperandType(0).getSqlTypeName() == SqlTypeName.NULL) &&
+                (SqlTypeUtil.isIntType(binding.getOperandType(1)) || binding.getOperandType(1).getSqlTypeName() == SqlTypeName.NULL)) {
             return factory.createTypeWithNullability(factory.createSqlType(SqlTypeName.DOUBLE), true);
         }
         RelDataType result = Objects.requireNonNull(operator.inferReturnType(binding));

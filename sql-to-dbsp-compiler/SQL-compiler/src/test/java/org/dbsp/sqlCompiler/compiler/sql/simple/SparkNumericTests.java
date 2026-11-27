@@ -3,6 +3,10 @@ package org.dbsp.sqlCompiler.compiler.sql.simple;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.sql.tools.SqlIoTest;
 import org.junit.Test;
+import org.junit.Assert;
+import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDouble;
+import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
 
 /** Numeric semantics of Spark 3.5 with spark.sql.ansi.enabled=false, enabled by --sparkCompat. */
 public class SparkNumericTests extends SqlIoTest {
@@ -221,5 +225,32 @@ public class SparkNumericTests extends SqlIoTest {
                 -------
                  0.25 | NULL
                 (1 row)""");
+    }
+
+    @Test
+    public void nullableIntegralDivisionType() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(a INT, b INT);
+                CREATE VIEW V AS SELECT a/b AS q, NULL/a AS r, b/NULL AS s FROM T;""");
+        var row = ccs.getCircuit().getSingleOutputType().to(DBSPTypeZSet.class).elementType;
+        Assert.assertTrue(row.sameType(new DBSPTypeTuple(DBSPTypeDouble.NULLABLE_INSTANCE,
+                DBSPTypeDouble.NULLABLE_INSTANCE, DBSPTypeDouble.NULLABLE_INSTANCE)));
+        ccs.stepWeightOne("INSERT INTO T VALUES (1,2),(NULL,0),(1,NULL)", """
+                 q | r | s
+                -----------
+                 0.5 | NULL | NULL
+                 NULL | NULL | NULL
+                 NULL | NULL | NULL""");
+    }
+
+    @Test
+    public void integralNegationAndSubtractionOverflow() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(a INT NOT NULL, b BIGINT NOT NULL);
+                CREATE VIEW V AS SELECT a-1 AS s, -a AS n, -b AS l FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES (-2147483648,-9223372036854775808)", """
+                 s | n | l
+                -----------
+                 2147483647 | -2147483648 | -9223372036854775808""");
     }
 }
