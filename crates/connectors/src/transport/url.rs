@@ -38,6 +38,9 @@ use tokio::{
 use tracing::{info_span, warn};
 use xxhash_rust::xxh3::Xxh3Default;
 
+#[cfg(feature = "with-deltalake")]
+mod onelake;
+
 pub(crate) struct UrlInputEndpoint {
     config: Arc<UrlInputConfig>,
 }
@@ -64,6 +67,10 @@ impl TransportInputEndpoint for UrlInputEndpoint {
         _schema: Relation,
         seek: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
+        #[cfg(feature = "with-deltalake")]
+        if self.config.path.starts_with("abfss:") {
+            return onelake::open(&self.config.path, consumer, parser, seek);
+        }
         Ok(Box::new(UrlInputReader::new(
             &self.config,
             consumer,
