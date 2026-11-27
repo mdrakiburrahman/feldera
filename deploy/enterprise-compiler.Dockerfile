@@ -4,7 +4,8 @@ FROM public.ecr.aws/feldera/compiler-server:0.391.0@sha256:df97e718f2544d95b120b
 COPY --chown=ubuntu crates/ feldera/crates/
 COPY --chown=ubuntu compiler.jar feldera/sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar
 
-RUN tar -xzf dot-cargo.tar.gz -C / \
+RUN sed -i '/^name = "dbsp_connectors"$/,/^\[\[package\]\]$/s/^ "governor",$/ "glob",\n "governor",/' feldera/Cargo.lock \
+    && tar -xzf dot-cargo.tar.gz -C / \
     && rm working-dir-precompiled.tar.gz \
     && ./compiler-server --compiler-working-directory="$HOME/working-dir" \
         --sql-compiler-path="$HOME/feldera/sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar" \

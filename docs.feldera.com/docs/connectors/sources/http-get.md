@@ -97,6 +97,81 @@ requests.put(
 ).raise_for_status()
 ```
 
+## OneLake Files (ABFSS)
+
+With the Delta/Azure feature enabled (as in the standard builds), `url_input`
+also accepts a OneLake **directory** URI:
+
+```text
+abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Files/<directory>
+```
+
+`msit-onelake.dfs.fabric.microsoft.com` is also supported. HTTP(S) URLs retain
+their existing single-file behavior. Using the existing `url_input` configuration
+allows the OneLake handler to work with the Enterprise 0.391.0 control plane;
+the generated pipeline must use a compiler image containing this handler.
+The Azure client maps the DFS URI to the corresponding `*.blob.fabric.microsoft.com`
+endpoint for Blob List/GET operations, preserving the `msit-onelake` account name.
+
+The connector recursively lists files, takes a snapshot, and optionally polls for
+new paths. It uses managed identity through IMDS. `IDENTITY_ENDPOINT` (including
+an AKS IMDS sidecar) is supported, as are `AZURE_MSI_ENDPOINT` and
+`AZURE_IDENTITY_ENDPOINT`, which take precedence. `IDENTITY_HEADER` is handled by
+the Azure object-store client. No account keys, SAS tokens or Azure CLI fallback
+are used.
+
+Directory and file components beginning with `_` or `.`, and components ending
+in `.tmp`, are always excluded. The connector only lists and reads: it never
+moves, renames, archives, tags or deletes source files.
+
+Options are URI query parameters; percent-encode their values:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `glob` | All eligible files | Case-sensitive glob relative to the requested directory. `*` matches one path component; `**` includes subdirectories. |
+| `modified_since` | No time filter | Include files whose last-modified time is on or after this RFC 3339 timestamp. |
+| `follow` | `false` | After the initial listing, keep polling for new file paths instead of ending the input. |
+| `poll_interval_secs` | `10` | Follow polling interval, from 1 to 86400 seconds. |
+| `client_id` | System-assigned identity | Optional user-assigned managed-identity client ID. |
+
+For example, ingest finalized JSON files, using Feldera's existing JSON parser:
+
+```sql
+CREATE TABLE events (id BIGINT, message VARCHAR)
+WITH ('connectors' = '[{
+    "name": "files",
+    "transport": {
+        "name": "url_input",
+        "config": {
+            "path": "abfss://workspace@onelake.dfs.fabric.microsoft.com/lakehouse/Files/events?glob=**%2F*.json&follow=true"
+        }
+    },
+    "format": {
+        "name": "json",
+        "config": {"update_format": "raw"}
+    }
+}]');
+```
+
+Use `array: true` for JSON arrays instead of individual/line-delimited records.
+Each file ends the parser's input fragment, so the final record does not need
+a trailing newline.
+
+**Source contract:** publish complete, immutable files at unique final paths.
+Files listed but not yet read must remain available with the same ETag for
+checkpoint replay. An ETag change fails the read rather than silently mixing
+versions. With `follow=true`, rewriting an already discovered path does not
+ingest it again; additions at new paths do. Files removed before they can be read
+or replayed cause an error. A directory listing is not a transactional snapshot
+of concurrent writers.
+
+Checkpoint metadata preserves the initial manifest and consumed byte offsets.
+Recovery continues that manifest rather than including later additions in a
+snapshot-only input; following discovers those additions normally. Metadata and
+in-memory path tracking grow with the number of discovered files. File bodies
+are read in bounded ranges, but a single parser record may be larger than a range.
+The connector is assigned to one host, not sharded across hosts.
+
 ## Additional resources
 
 For more information, see:

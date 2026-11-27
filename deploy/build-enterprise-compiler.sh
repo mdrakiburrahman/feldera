@@ -11,7 +11,13 @@ trap 'rm -rf -- "$context"' EXIT
 delta=crates/connectors/src/integrated/delta_table
 git archive "$revision" -- deploy/enterprise-compiler.Dockerfile sql-to-dbsp-compiler \
     "$delta.rs" "$delta"/{deletion_vector,field_id_adapter,input,merge/rewrite}.rs \
-    crates/feldera-types/src/transport/delta_table.rs | tar -x -C "$context"
+    crates/feldera-types/src/transport/delta_table.rs \
+    crates/connectors/Cargo.toml crates/connectors/src/transport/url.rs \
+    crates/connectors/src/transport/url/onelake.rs | tar -x -C "$context"
+
+manifest=crates/connectors/Cargo.toml
+sed '/^    "dep:glob",$/d; /^glob = { version = "0.3.2", optional = true }$/d' \
+    "$context/$manifest" | cmp - <(git show "$release:$manifest")
 
 # Keep the released SQL compiler version; fail if its dependencies have drifted.
 pom=sql-to-dbsp-compiler/SQL-compiler/pom.xml

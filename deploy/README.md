@@ -118,11 +118,14 @@ docker buildx imagetools inspect --raw "$IMAGE_REPOSITORY@$MANIFEST" | jq -r '.c
 ### Use a source-built compiler with Enterprise Helm 0.391.0
 
 The compiler, not the API server, produces the pipeline binary and links its
-Delta reader. `build-enterprise-compiler.sh` takes six public Rust source files
-and the SQL compiler sources from the current **committed** revision. It builds
+Delta and OneLake Files readers. `build-enterprise-compiler.sh` takes eight public
+Rust source files, the connector manifest, and the SQL compiler sources from the
+current **committed** revision. It builds
 the jar with the 0.391.0 Maven project version, leaving the official compiler
-executable, Rust lockfile, Enterprise crates and entrypoint in the pinned
+executable, Enterprise crates and entrypoint in the pinned
 licensed image. It then repeats the vendor precompile with those sources.
+The released lockfile keeps all package versions and checksums; the only change
+adds the already locked `glob` package to `dbsp_connectors`' direct dependencies.
 This tests selected changes on the release ABI, not all of `main` on Enterprise.
 
 Run in a non-shallow clone with the public v0.391.0 commit available, using
@@ -152,6 +155,10 @@ Use the same `--post-renderer` on install and upgrade. Check the `helm template`
 output: only compiler-server should use the private digest; api-server,
 kubernetes-runner and pipeline-executor stay official. Pass the Delta follow
 flags as strings through stock components (see the Delta source docs).
+OneLake Files uses the existing `url_input` transport with an ABFSS directory
+URI and query options; it does not add a transport enum that the stock control
+plane would reject. See the URL source documentation for configuration and
+the immutable-file/checkpoint contract.
 
 # How to add a new package to the Docker images
 

@@ -4459,6 +4459,7 @@ dependencies = [
  "gcloud-googleapis",
  "gcloud-metadata",
  "gcloud-pubsub",
+ "glob",
  "governor",
  "home",
  "inventory",

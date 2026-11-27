@@ -10,6 +10,7 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- URL inputs support read-only OneLake Files snapshots and following through ABFSS, with managed identity, recursive glob/time filtering, and checkpoint recovery.
 - Delta Lake sources support `ignore_deletes` to retain rows when source files expire.
 - Delta name-mapped reads resolve physical names even when writers assign different Parquet field IDs.
 - Delta file following supports `ignore_changes` to retain removals and re-ingest data-changing adds.
