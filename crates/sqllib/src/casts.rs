@@ -1754,13 +1754,14 @@ macro_rules! cast_to_i {
             cast_function!($result_type, $result_type, s, SqlString);
 
             #[doc(hidden)]
-            pub fn [< cast_to_ $result_type _SparkString >](value: SqlString) -> SqlResult<$result_type> {
+            pub fn [< spark_cast_to_ $result_type _s >](value: SqlString) -> Option<$result_type> {
                 spark_parse_integer(value.str()).and_then(|v| <$result_type>::try_from(v).ok())
-                    .ok_or_else(|| SqlRuntimeError::from_string(format!(
-                        "Error converting '{value}' to {}", tn!($result_type))))
             }
 
-            cast_function!($result_type, $result_type, SparkString, SqlString);
+            #[doc(hidden)]
+            pub fn [< spark_cast_to_ $result_type _sN >](value: Option<SqlString>) -> Option<$result_type> {
+                [< spark_cast_to_ $result_type _s >](value?)
+            }
 
             // From other integers
 

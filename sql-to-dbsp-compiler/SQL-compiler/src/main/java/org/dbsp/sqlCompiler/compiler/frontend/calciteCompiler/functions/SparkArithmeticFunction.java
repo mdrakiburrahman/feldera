@@ -10,6 +10,7 @@ import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.type.SqlTypeUtil;
 
 import javax.annotation.Nullable;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -47,5 +48,9 @@ public final class SparkArithmeticFunction extends CustomFunctions.NonOptimizedF
 
     public static @Nullable SparkArithmeticFunction replacement(SqlOperator operator) {
         return OPERATORS.get(operator);
+    }
+
+    public static List<SparkArithmeticFunction> functions() {
+        return List.copyOf(OPERATORS.values());
     }
 }

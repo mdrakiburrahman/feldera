@@ -158,6 +158,7 @@ public class ConvertletTable extends ReflectiveConvertletTable {
         registerOp(SparkGeneratorRows.STACK, SparkGeneratorRows::convertStack);
         registerOp(CAST, this::convertCast);
         registerOp(SqlSafeCastFunction.INSTANCE, this::convertCast);
+        registerOp(SqlSafeCastFunction.SPARK_CAST, this::convertCast);
         registerOp(SqlLibraryOperators.SAFE_CAST, this::convertCast);
         registerOp(SqlLibraryOperators.TRY_CAST, this::convertCast);
         registerOp(SqlLibraryOperators.INFIX_CAST, this::convertCast);
@@ -833,6 +834,11 @@ public class ConvertletTable extends ReflectiveConvertletTable {
             type = SqlSafeCastFunction.deriveType(cx.getTypeFactory(), arg.getType(), dataType.deriveType(validator));
         else
             type = SqlCastFunction.deriveType(cx.getTypeFactory(), arg.getType(), dataType.deriveType(validator), false);
+        if (call.getOperator() == SqlSafeCastFunction.SPARK_CAST &&
+                SqlTypeUtil.isCharacter(arg.getType()) && SqlTypeUtil.isIntType(type)) {
+            return rexBuilder.makeCall(typeFactory.createTypeWithNullability(type, true),
+                    SqlSafeCastFunction.SPARK_INTEGER_CASTS.get(type.getSqlTypeName()), List.of(arg));
+        }
         if (null != dataType.getCollectionsTypeName()) {
             RelDataType argComponentType = arg.getType().getComponentType();
 

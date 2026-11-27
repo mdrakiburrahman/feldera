@@ -10,6 +10,7 @@ public class SparkNumericTests extends SqlIoTest {
     public CompilerOptions testOptions() {
         CompilerOptions options = super.testOptions();
         options.languageOptions.sparkCompat = true;
+        options.languageOptions.incrementalize = true;
         return options;
     }
 
@@ -151,10 +152,11 @@ public class SparkNumericTests extends SqlIoTest {
                  NULL | NULL | NULL | 9223372036854775807 | true
                  NULL | NULL | -2147483648 | -2147483648 | false""");
         this.qs("""
-                SELECT CAST('1.9' AS INT) AS i, CAST('1e2' AS INT) AS n;
-                 i | n
-                -------
-                 1 | NULL
+                SELECT CAST('1.9' AS INT) AS i, CAST('1e2' AS INT) AS n,
+                       SAFE_CAST('1.9' AS INT) AS strict;
+                 i | n | strict
+                ----------------
+                 1 | NULL | NULL
                 (1 row)""");
     }
 

@@ -40,6 +40,7 @@ import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.rex.RexVisitorImpl;
 import org.apache.calcite.sql.SqlKind;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SparkArithmeticFunction;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlSafeCastFunction;
 import org.apache.calcite.sql.SqlSyntax;
 import org.apache.calcite.util.DateString;
 import org.apache.calcite.util.TimeString;
@@ -1172,6 +1173,9 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
             DBSPStringLiteral literal = ops.get(0).to(DBSPStringLiteral.class);
             return new DBSPStringLiteral(node, type, literal.value);
         }
+        if (call.op instanceof SqlSafeCastFunction.SparkIntegerCast)
+            return new DBSPApplyExpression(node, "spark_cast_to_" + type.withMayBeNull(false).baseTypeWithSuffix() +
+                    "_" + ops.get(0).getType().baseTypeWithSuffix(), type, ops.get(0));
         String operationName = call.op.kind.sql;
         switch (call.op instanceof SparkArithmeticFunction arithmetic ? arithmetic.operation : call.op.kind) {
             case CHECKED_TIMES:
@@ -1265,9 +1269,6 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                 }
                 DBSPCastExpression.CastType safe = call.op.kind == SqlKind.SAFE_CAST ?
                         DBSPCastExpression.CastType.SqlSafe : DBSPCastExpression.CastType.SqlUnsafe;
-                if (this.compiler.options.languageOptions.sparkCompat &&
-                        ops.get(0).getType().is(DBSPTypeString.class) && type.is(DBSPTypeInteger.class))
-                    safe = DBSPCastExpression.CastType.SqlSafe;
                 if (ops.get(0).getType().is(DBSPTypeVariant.class))
                     // Casts from variant types are always safe
                     safe = DBSPCastExpression.CastType.SqlSafe;

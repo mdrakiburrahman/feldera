@@ -34,6 +34,8 @@ import org.apache.calcite.sql.SqlWriter;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.type.SqlOperandCountRanges;
+import org.apache.calcite.sql.type.OperandTypes;
+import java.util.Map;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeMappingRule;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -54,6 +56,20 @@ import static org.apache.calcite.util.Static.RESOURCE;
 public class SqlSafeCastFunction extends CustomFunctions.NonOptimizedFunction {
     public static final SqlSafeCastFunction INSTANCE = new SqlSafeCastFunction(false);
     public static final SqlSafeCastFunction SPARK_CAST = new SqlSafeCastFunction(true);
+
+    public static final class SparkIntegerCast extends CustomFunctions.NonOptimizedFunction {
+        private SparkIntegerCast(SqlTypeName type) {
+            super("$spark_cast_" + type.name(), binding -> binding.getTypeFactory()
+                            .createTypeWithNullability(binding.getTypeFactory().createSqlType(type), true),
+                    OperandTypes.CHARACTER, SqlFunctionCategory.SYSTEM, "casts", "SparkNumericTests");
+        }
+    }
+
+    public static final Map<SqlTypeName, SparkIntegerCast> SPARK_INTEGER_CASTS = Map.of(
+            SqlTypeName.TINYINT, new SparkIntegerCast(SqlTypeName.TINYINT),
+            SqlTypeName.SMALLINT, new SparkIntegerCast(SqlTypeName.SMALLINT),
+            SqlTypeName.INTEGER, new SparkIntegerCast(SqlTypeName.INTEGER),
+            SqlTypeName.BIGINT, new SparkIntegerCast(SqlTypeName.BIGINT));
 
     private SqlSafeCastFunction(boolean sparkCast) {
         super(sparkCast ? "CAST" : "SAFE_CAST", sparkCast ? SqlKind.CAST : SqlKind.SAFE_CAST,
