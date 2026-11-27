@@ -1575,6 +1575,12 @@ public class ToRustInnerVisitor extends InnerVisitor {
         }
         functionName = "cast_to_" + destType.baseTypeWithSuffix() +
                 "_" + sourceType.baseTypeWithSuffix();
+        if (this.options.languageOptions.sparkCompat &&
+                code == DBSPTypeCode.STRING && sourceType.code == DBSPTypeCode.TIMESTAMP) {
+            // Spark omits trailing zeros of the fractional seconds
+            functionName = "cast_to_" + destType.baseTypeWithSuffix() +
+                    "_Spark" + sourceType.baseTypeWithSuffix();
+        }
 
         if ((sourceType.is(DBSPTypeLongInterval.class) && code == DBSPTypeCode.INTERVAL_LONG) ||
             (sourceType.is(DBSPTypeShortInterval.class) && code == DBSPTypeCode.INTERVAL_SHORT)) {
@@ -1937,6 +1943,8 @@ public class ToRustInnerVisitor extends InnerVisitor {
                                     expression.opcode == DBSPOpcode.DIV ||
                                     expression.opcode == DBSPOpcode.MOD ||
                                     expression.opcode == DBSPOpcode.DIV_NULL ||
+                                    expression.opcode == DBSPOpcode.SPARK_MUL ||
+                                    expression.opcode == DBSPOpcode.SPARK_DIV ||
                                     expression.opcode == DBSPOpcode.ADD_SATURATING ||
                                     expression.opcode == DBSPOpcode.SUB_SATURATING ||
                                     expression.opcode == DBSPOpcode.MUL_SATURATING ||

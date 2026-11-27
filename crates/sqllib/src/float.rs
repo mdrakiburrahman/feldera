@@ -170,6 +170,43 @@ pub fn round_d_i32(left: F64, right: i32) -> F64 {
 
 some_polymorphic_function2!(round, d, F64, i32, i32, F64);
 
+/// Spark's `ROUND` for `DOUBLE`: rounds the shortest decimal representation
+/// of `value` to `digits` digits HALF_UP, then converts back to the nearest
+/// `DOUBLE`.
+#[doc(hidden)]
+pub fn spark_round_d_i32(left: F64, right: i32) -> F64 {
+    let value = left.into_inner();
+    if !value.is_finite() {
+        return left;
+    }
+    let formatted = format!("{:e}", value.abs());
+    let (mantissa, exponent) = formatted.split_once('e').unwrap();
+    let exponent: i64 = exponent.parse().unwrap();
+    let digits: Vec<u8> = mantissa.bytes().filter(|b| *b != b'.').collect();
+    // Number of significant digits that remain after rounding.
+    let keep = exponent + 1 + right as i64;
+    if keep >= digits.len() as i64 {
+        return if value == 0.0 { F64::new(0.0) } else { left };
+    }
+    if keep < 0 {
+        return F64::new(0.0);
+    }
+    let keep = keep as usize;
+    let mut kept: u64 = digits[..keep]
+        .iter()
+        .fold(0, |acc, d| acc * 10 + (d - b'0') as u64);
+    if digits[keep] >= b'5' {
+        kept += 1;
+    }
+    if kept == 0 {
+        return F64::new(0.0);
+    }
+    let result: f64 = format!("{kept}e{}", -(right as i64)).parse().unwrap();
+    F64::new(if value < 0.0 { -result } else { result })
+}
+
+some_polymorphic_function2!(spark_round, d, F64, i32, i32, F64);
+
 #[doc(hidden)]
 #[inline(always)]
 pub fn round_f_i32(left: F32, right: i32) -> F32 {
@@ -597,9 +634,25 @@ some_polymorphic_null_function1!(finite_or_null, f, F32, F32);
 mod test {
     use super::{
         ln_d_saturating, log_d_d_saturating, log_d_saturating, log10_d_saturating, round_d_i32,
-        round_f_i32, sqrt_d_saturating, trunc_d_i32, trunc_f_i32, truncate_d_i32,
+        round_f_i32, spark_round_d_i32, sqrt_d_saturating, trunc_d_i32, trunc_f_i32,
+        truncate_d_i32,
     };
     use dbsp::algebra::{F32, F64};
+
+    #[test]
+    fn spark_round_half_up() {
+        let r = |v: f64, d: i32| spark_round_d_i32(F64::new(v), d).into_inner();
+        assert_eq!(r(0.145, 2), 0.15);
+        assert_eq!(r(-0.145, 2), -0.15);
+        assert_eq!(r(1.005, 2), 1.01);
+        assert_eq!(r(2.5, 0), 3.0);
+        assert_eq!(r(2.62e20, 2), 2.62e20);
+        assert_eq!(r(1234.5, -2), 1200.0);
+        assert_eq!(r(950.0, -3), 1000.0);
+        assert_eq!(r(0.0004, 2), 0.0);
+        assert!(r(-0.0004, 2).is_sign_positive());
+        assert!(r(f64::NAN, 2).is_nan());
+    }
 
     #[test]
     fn round_to_many_digits() {

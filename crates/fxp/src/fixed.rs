@@ -834,6 +834,57 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
         }
     }
 
+    /// Like [Self::checked_mul_generic], but rounds halfway cases away from
+    /// zero (Spark's `HALF_UP`) instead of toward zero.
+    pub fn checked_mul_generic_half_up<
+        const P1: usize,
+        const S1: usize,
+        const P2: usize,
+        const S2: usize,
+    >(
+        self,
+        other: Fixed<P1, S1>,
+    ) -> Option<Fixed<P2, S2>> {
+        Fixed::<P2, S2>::try_new_with_exponent(
+            I256::from_product(self.0, other.0)
+                .narrowing_div_half_up(pow10((S0 + S1).saturating_sub(S2)))?,
+            S2.saturating_sub(S0 + S1) as i32,
+        )
+    }
+
+    /// Like [Self::checked_div_generic], but rounds halfway cases away from
+    /// zero (Spark's `HALF_UP`) instead of toward zero.
+    pub fn checked_div_generic_half_up<
+        const P1: usize,
+        const S1: usize,
+        const P2: usize,
+        const S2: usize,
+    >(
+        self,
+        other: Fixed<P1, S1>,
+    ) -> Option<Fixed<P2, S2>> {
+        if other == 0 {
+            None
+        } else if S0 > S1 + S2 {
+            match checked_pow10((S0 - S1 - S2) as u32).and_then(|p| other.0.checked_mul(p)) {
+                Some(divisor) => {
+                    Fixed::<P2, S2>::try_new(I256::from(self.0).narrowing_div_half_up(divisor)?)
+                }
+                // The divisor exceeds twice the dividend, so the result rounds to zero.
+                None => Some(Fixed::ZERO),
+            }
+        } else {
+            let shift_left = S1 + S2 - S0;
+            if shift_left > 38 {
+                None
+            } else {
+                Fixed::<P2, S2>::try_new(
+                    I256::from_product(self.0, pow10(shift_left)).narrowing_div_half_up(other.0)?,
+                )
+            }
+        }
+    }
+
     /// Compute `self + other`, rounding toward zero, panicking if overflow
     /// occurs.
     pub fn strict_add_generic<
@@ -941,8 +992,15 @@ impl<const P: usize, const S: usize> TryFrom<f32> for Fixed<P, S> {
 }
 
 impl<const P: usize, const S: usize> From<Fixed<P, S>> for f64 {
+    /// Returns the `f64` nearest to `value`.
     fn from(value: Fixed<P, S>) -> Self {
-        value.0 as f64 / Fixed::<P, S>::scale() as f64
+        // IEEE division of two exactly representable operands is correctly
+        // rounded; otherwise parse the exact decimal representation.
+        if value.0.unsigned_abs() <= 1u128 << f64::MANTISSA_DIGITS && S <= 22 {
+            value.0 as f64 / Fixed::<P, S>::scale() as f64
+        } else {
+            value.to_string().parse().unwrap()
+        }
     }
 }
 
@@ -1701,6 +1759,39 @@ mod test {
         assert_eq!(f(0.0).powi(1), f(0.0));
         assert_eq!(f(0.0).checked_powi(0), None);
         assert_eq!(f(0.0).checked_powi(-1), None);
+    }
+
+    #[test]
+    fn to_f64_nearest() {
+        for s in [
+            "129023.45",
+            "-129023.45",
+            "0.1",
+            "99999999999999999999.123456789012345678",
+        ] {
+            let a = Fixed::<38, 18>::from_str(s).unwrap();
+            assert_eq!(f64::from(a), s.parse::<f64>().unwrap());
+        }
+    }
+
+    #[test]
+    fn half_up_mul_div() {
+        let d = |s: &str| Fixed::<38, 2>::from_str(s).unwrap();
+        let q: Fixed<38, 6> = d("1").checked_div_generic_half_up(d("3")).unwrap();
+        assert_eq!(q.to_string(), "0.333333");
+        let q: Fixed<38, 6> = d("2").checked_div_generic_half_up(d("3")).unwrap();
+        assert_eq!(q.to_string(), "0.666667");
+        let q: Fixed<38, 6> = d("-2").checked_div_generic_half_up(d("3")).unwrap();
+        assert_eq!(q.to_string(), "-0.666667");
+        let q: Fixed<38, 0> = Fixed::<38, 18>::from_str("5")
+            .unwrap()
+            .checked_div_generic_half_up(Fixed::<10, 0>::from_str("2").unwrap())
+            .unwrap();
+        assert_eq!(q.to_string(), "3");
+        let p: Fixed<38, 2> = d("0.05").checked_mul_generic_half_up(d("0.5")).unwrap();
+        assert_eq!(p.to_string(), "0.03");
+        let p: Fixed<38, 2> = d("-0.05").checked_mul_generic_half_up(d("0.5")).unwrap();
+        assert_eq!(p.to_string(), "-0.03");
     }
 
     #[test]

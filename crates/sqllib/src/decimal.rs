@@ -83,6 +83,58 @@ pub fn div_SqlDecimal_SqlDecimal<
 
 some_polymorphic_function2!(div [const P0: usize, const S0: usize, const P1: usize, const S1: usize, const P2: usize, const S2: usize], SqlDecimal, SqlDecimal<P0, S0>, SqlDecimal, SqlDecimal<P1, S1>, SqlDecimal<P2, S2>);
 
+/// Spark decimal multiplication: rounds HALF_UP to the result scale.
+#[doc(hidden)]
+pub fn spark_times_SqlDecimal_SqlDecimal<
+    const P0: usize,
+    const S0: usize,
+    const P1: usize,
+    const S1: usize,
+    const P2: usize,
+    const S2: usize,
+>(
+    left: SqlDecimal<P0, S0>,
+    right: SqlDecimal<P1, S1>,
+) -> SqlDecimal<P2, S2> {
+    left.checked_mul_generic_half_up::<P1, S1, P2, S2>(right)
+        .unwrap_or_else(|| {
+            panic!(
+                "Overflow in multiplication {}*{} cannot be represented as DECIMAL({P2}, {S2})",
+                left, right
+            )
+        })
+}
+
+some_polymorphic_function2!(spark_times [const P0: usize, const S0: usize, const P1: usize, const S1: usize, const P2: usize, const S2: usize], SqlDecimal, SqlDecimal<P0, S0>, SqlDecimal, SqlDecimal<P1, S1>, SqlDecimal<P2, S2>);
+
+/// Spark decimal division: rounds HALF_UP to the result scale.
+#[doc(hidden)]
+pub fn spark_div_SqlDecimal_SqlDecimal<
+    const P0: usize,
+    const S0: usize,
+    const P1: usize,
+    const S1: usize,
+    const P2: usize,
+    const S2: usize,
+>(
+    left: SqlDecimal<P0, S0>,
+    right: SqlDecimal<P1, S1>,
+) -> SqlDecimal<P2, S2> {
+    left.checked_div_generic_half_up::<P1, S1, P2, S2>(right)
+        .unwrap_or_else(|| {
+            if right == SqlDecimal::<P1, S1>::ZERO {
+                panic!("Attempt to divide by zero: {}/{}", left, right)
+            } else {
+                panic!(
+                    "Overflow in division {}/{} cannot be represented as DECIMAL({P2}, {S2})",
+                    left, right
+                )
+            }
+        })
+}
+
+some_polymorphic_function2!(spark_div [const P0: usize, const S0: usize, const P1: usize, const S1: usize, const P2: usize, const S2: usize], SqlDecimal, SqlDecimal<P0, S0>, SqlDecimal, SqlDecimal<P1, S1>, SqlDecimal<P2, S2>);
+
 #[doc(hidden)]
 pub fn div_null_SqlDecimal_SqlDecimal<
     const P0: usize,

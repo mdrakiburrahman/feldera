@@ -430,6 +430,31 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
     }
 
     @SuppressWarnings("unused")
+    /** True if a DECIMAL multiplication or division should use Spark's HALF_UP rounding. */
+    boolean isSparkDecimalArithmetic(DBSPType type, List<DBSPExpression> ops) {
+        if (!this.compiler.options.languageOptions.sparkCompat || !type.is(DBSPTypeDecimal.class))
+            return false;
+        return Linq.all(ops, o -> o.getType().is(DBSPTypeDecimal.class) || o.getType().is(DBSPTypeInteger.class));
+    }
+
+    /** Casts integer operands to the DECIMAL type Spark uses for them. */
+    static List<DBSPExpression> sparkDecimalOperands(List<DBSPExpression> ops) {
+        return Linq.map(ops, o -> {
+            DBSPType t = o.getType();
+            if (!t.is(DBSPTypeInteger.class))
+                return o;
+            int precision = switch (t.to(DBSPTypeInteger.class).getWidth()) {
+                case 8 -> 3;
+                case 16 -> 5;
+                case 32 -> 10;
+                case 64 -> 20;
+                default -> 38;
+            };
+            return o.cast(o.getNode(), new DBSPTypeDecimal(t.getNode(), precision, 0, t.mayBeNull),
+                    DBSPCastExpression.CastType.SqlUnsafe);
+        });
+    }
+
     public static boolean needCommonType(DBSPOpcode opcode, DBSPType result, DBSPType left, DBSPType right) {
         if (opcode == DBSPOpcode.CONCAT) return false;
         if (opcode == DBSPOpcode.SUB && left.is(IsDateType.class) && right.is(IsDateType.class))
@@ -1150,9 +1175,13 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
         switch (call.op.kind) {
             case CHECKED_TIMES:
             case TIMES:
+                if (this.isSparkDecimalArithmetic(type, ops))
+                    return makeBinaryExpression(node, type, DBSPOpcode.SPARK_MUL, sparkDecimalOperands(ops));
                 return makeBinaryExpression(node, type, DBSPOpcode.MUL, ops);
             case CHECKED_DIVIDE:
             case DIVIDE:
+                if (this.isSparkDecimalArithmetic(type, ops))
+                    return makeBinaryExpression(node, type, DBSPOpcode.SPARK_DIV, sparkDecimalOperands(ops));
                 return makeBinaryExpression(node, type, DBSPOpcode.DIV, ops);
             case MOD:
                 return makeBinaryExpression(node, type, DBSPOpcode.MOD, ops);
@@ -1379,6 +1408,10 @@ public class ExpressionCompiler extends RexVisitorImpl<DBSPExpression>
                                     DBSPCastExpression.CastType.SqlUnsafe);
                         }
 
+                        if (opName.equals("round") && leftType.is(DBSPTypeDouble.class) &&
+                                this.compiler.options.languageOptions.sparkCompat)
+                            // Spark rounds the shortest decimal representation HALF_UP
+                            return compilePolymorphicFunction(true, "spark_round", node, type, Linq.list(left, right), 2);
                         return compilePolymorphicFunction(true, call, node, type, Linq.list(left, right), 2);
                     }
                     case "abs": {

@@ -83,11 +83,16 @@ impl U256 {
     ///
     /// Algorithm from H. S. Warren, _Hacker's Delight, 2nd Ed._, Fig. 9-3.
     pub fn narrowing_div(self, v: u128) -> Option<u128> {
+        self.narrowing_div_rem(v).map(|(q, _)| q)
+    }
+
+    /// Like [Self::narrowing_div], but also returns the remainder.
+    pub fn narrowing_div_rem(self, v: u128) -> Option<(u128, u128)> {
         let Self(u1, u0) = self;
         if v == 0 {
             None
         } else if u1 == 0 {
-            Some(u0 / v)
+            Some((u0 / v, u0 % v))
         } else if u1 >= v {
             None
         } else {
@@ -128,13 +133,13 @@ impl U256 {
                 }
             }
 
-            // We don't currently need the remainder; this is how to calculate it:
-            //
-            // ```ignore
-            // let _remainder = (un21 * BASE + un0 - q0 * v) >> s;
-            // ```
+            let remainder = un21
+                .wrapping_mul(BASE)
+                .wrapping_add(un0)
+                .wrapping_sub(q0.wrapping_mul(v))
+                >> s;
 
-            Some(q1 * BASE + q0)
+            Some((q1 * BASE + q0, remainder))
         }
     }
 
@@ -221,6 +226,20 @@ impl I256 {
             .narrowing_div(v.unsigned_abs())?
             .try_into()
             .ok()?;
+        if self.negative != (v < 0) {
+            Some(-result)
+        } else {
+            Some(result)
+        }
+    }
+
+    /// Like [Self::narrowing_div], but rounds halfway cases away from zero
+    /// instead of truncating.
+    pub fn narrowing_div_half_up(self, v: i128) -> Option<i128> {
+        let d = v.unsigned_abs();
+        let (q, r) = self.value.narrowing_div_rem(d)?;
+        let q = if r >= d - r { q.checked_add(1)? } else { q };
+        let result: i128 = q.try_into().ok()?;
         if self.negative != (v < 0) {
             Some(-result)
         } else {
