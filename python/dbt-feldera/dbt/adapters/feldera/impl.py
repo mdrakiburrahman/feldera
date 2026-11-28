@@ -759,7 +759,7 @@ class FelderaAdapter(BaseAdapter):
 
     def _read_udfs(self, sql_path: str | None, rust_path: str | None, toml_path: str | None) -> tuple[str, str, str]:
         def read_file(path: str | None) -> str:
-            return (Path(self.config.project_root) / path).read_text(encoding="utf-8") if path else ""
+            return (Path(self.config.project_root) / path).read_bytes().decode("utf-8") if path else ""
 
         return read_file(sql_path), read_file(rust_path), read_file(toml_path)
 
